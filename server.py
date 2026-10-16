@@ -485,7 +485,8 @@ class Handler(BaseHTTPRequestHandler):
             self._send_error_json(f"{exc.__class__.__name__}: {friendly(exc)}", 502)
 
     def log_message(self, fmt, *args) -> None:
-        sys.stderr.write("[http] %s\n" % (fmt % args))
+        ua = (self.headers.get("User-Agent") or "")[:70]
+        sys.stderr.write("[http] %s | %s\n" % (fmt % args, ua))
 
     # -- API -------------------------------------------------------------- #
     def _api_health(self) -> None:

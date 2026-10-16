@@ -247,45 +247,68 @@
       : 'server.py is not reachable — direct URLs, HLS files and embeds still work';
   }
 
-  async function boot() {
-    document.body.appendChild(panel);
+  let probeTimer = null;
 
-    // Probe a few origins: a configured backend first, then same-origin,
-    // then the usual localhost ports. The first healthy one wins.
+  function registerResolver() {
+    window.ViewerResolvers = window.ViewerResolvers || [];
+    if (!window.ViewerResolvers.includes(resolver)) window.ViewerResolvers.push(resolver);
+  }
+
+  // Probe a few origins: a configured backend first, then same-origin,
+  // then the usual localhost ports. The first healthy one wins. If none answer
+  // we keep retrying, so a slow/restarted server eventually comes back online.
+  async function checkBackend() {
     const configured = configuredBase();
     const candidates = [configured, '', 'http://127.0.0.1:8080', 'http://localhost:8080'];
     const unique = [...new Set(candidates)];
-    let lastErr = null;
+    const tried = [];
+
     for (const base of unique) {
+      const label = base || (typeof location !== 'undefined' ? location.origin : 'same-origin');
       try {
         const h = await getJsonAt(base, '/api/health', 8000);
         if (h && h.ok) {
+          const wasOffline = !state.online;
           state.base = base;
           state.online = true;
-          if (base) { try { localStorage.setItem('viewer.backend', base); } catch (_) {} }
           state.ytDlp = h.ytDlpVersion;
+          if (base) { try { localStorage.setItem('viewer.backend', base); } catch (_) {} }
           if (h.ytDlpAvailable === false) {
             statusChip('yt-dlp missing', false);
             note('server.py is reachable but yt-dlp is not installed — '
                  + 'run: pip install -U yt-dlp, then restart server.py');
           } else {
             statusChip(`yt-dlp ${h.ytDlpVersion || 'online'}`, true);
+            if (wasOffline) note(`Backend online at ${label}`);
           }
-          break;
+          if (probeTimer) { clearInterval(probeTimer); probeTimer = null; }
+          registerResolver();
+          return true;
         }
+        tried.push(`${label} → not ok`);
       } catch (err) {
-        lastErr = err;
+        tried.push(`${label} → ${(err && err.message) || err}`);
       }
     }
-    if (!state.online) {
-      state.online = false;
-      statusChip('backend offline', false);
-      if (lastErr) console.info('[viewer] backend probe failed:', lastErr.message || lastErr);
+
+    state.online = false;
+    statusChip('backend offline', false);
+    note('Backend offline. Tried: ' + tried.join(' | '));
+    if (!probeTimer) probeTimer = setInterval(checkBackend, 5000);
+    return false;
+  }
+
+  async function boot() {
+    document.body.appendChild(panel);
+
+    const chip = document.querySelector('#backendChip');
+    if (chip) {
+      chip.style.cursor = 'pointer';
+      chip.title = 'Click to re-check the backend';
+      chip.addEventListener('click', checkBackend);
     }
 
-    // Register last: app.js checks this array only when it needs help.
-    window.ViewerResolvers = window.ViewerResolvers || [];
-    if (state.online) window.ViewerResolvers.push(resolver);
+    checkBackend();
   }
 
   function note(msg) {
