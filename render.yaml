@@ -3,8 +3,26 @@ services:
     name: video-viewer-backend
     runtime: python
     plan: free
-    buildCommand: pip install -r requirements.txt
+    buildCommand: pip install --no-cache-dir -r requirements.txt
+    # server.py reads PORT/HOST itself; --host 0.0.0.0 is what Render needs.
     startCommand: python3 server.py --host 0.0.0.0 --port $PORT
+    healthCheckPath: /api/health
+    autoDeploy: true
     envVars:
       - key: PYTHON_VERSION
-        value: 3.12.3
+        value: "3.12.3"
+      # Shared secret so the public URL is not an open extractor for anyone.
+      # Set VIEWER_TOKEN in the dashboard, then put the same value in config.js.
+      - key: VIEWER_TOKEN
+        sync: false
+      - key: VIEWER_CACHE_DIR
+        value: /tmp/viewer-cache
+      - key: VIEWER_TTL
+        value: "900"
+      # Cookies for age/geo-gated sites (commit this file as cookies.txt).
+      # - key: YTDLP_COOKIES
+      #   value: /opt/render/project/src/cookies.txt
+      - key: YTDLP_IMPERSONATE
+        value: chrome
+      - key: VIEWER_BLOCK_PRIVATE
+        value: "1"

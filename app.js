@@ -238,11 +238,18 @@
     srcEl.textContent = title;
     setDocumentTitle(title + ' — Viewer');
 
-    if (stream.kind === 'hls') return playHls(stream.url);
+    destroyHls();
+    showMedia();
+    // Switching quality re-applies this: drop the previous captions/poster first.
+    video.querySelectorAll('track').forEach((t) => t.remove());
+    video.removeAttribute('poster');
+    (meta && meta.subtitles || []).forEach((s) => addTrack(s.url, s.label));
+
+    if (stream.kind === 'hls') {
+      return playHls(stream.proxied && stream.proxyUrl ? stream.proxyUrl : stream.url);
+    }
     if (stream.kind === 'merge') {
       // A single stream with both tracks, remuxed on the fly by yt-dlp+ffmpeg.
-      destroyHls();
-      showMedia();
       currentKind = 'native';
       lastAttempt = null;
       video.src = stream.proxyUrl;
@@ -251,13 +258,7 @@
       return;
     }
 
-    destroyHls();
-    showMedia();
     currentKind = 'native';
-
-    // Captions, if the backend found any.
-    (meta && meta.subtitles || []).forEach((s) => addTrack(s.url, s.label));
-
     lastAttempt = { src: stream.url, proxyUrl: stream.proxyUrl, proxied: !!stream.proxied };
     retried = false;
     video.src = stream.proxied ? stream.proxyUrl : stream.url;
@@ -268,6 +269,8 @@
 
   /* Exposed for ytdlp.js: re-apply a different format of the same link. */
   window.ViewerApply = playResolved;
+  /* Exposed for ytdlp.js: jump straight to another link (playlist entries). */
+  window.ViewerPlay = play;
 
   function showMedia() {
     dropzone.hidden = true;

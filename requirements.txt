@@ -1,2 +1,8 @@
-yt-dlp
-imageio-ffmpeg
+# Core extractor used by server.py
+yt-dlp>=2025.1.1
+imageio-ffmpeg>=0.5.1
+# curl-cffi lets yt-dlp impersonate a real browser (--impersonate chrome),
+# which is what gets past the Cloudflare/Datadome checks many 18+ and social
+# sites put in front of their media CDNs. server.py detects it automatically and
+# silently skips --impersonate when it is not installed.
+curl_cffi>=0.7.0; platform_python_implementation != "PyPy"

@@ -1,23 +1,28 @@
-/* ytdlp.js — optional bridge to server.py + yt-dlp.
+/* ytdlp.js — bridge between the page and the viewer backend (server.py + yt-dlp).
  *
  * Registers a resolver with window.ViewerResolvers, which app.js calls whenever
- * a link is not something the browser can play by itself (YouTube, Vimeo, a
- * page with an embedded player, an unknown extension…).
+ * a link is not something the browser can play by itself (YouTube, TikTok, a
+ * page with an embedded player, an unknown extension…, playlists and channels).
  *
  * The resolver turns a page URL into { stream, meta }:
- *   stream = { kind: 'direct'|'hls', url, proxyUrl, proxied }
- *   meta   = { title, duration, thumbnail, subtitles: [{url, label}] }
+ *   stream = { kind: 'direct'|'hls'|'merge', url, proxyUrl, proxied }
+ *   meta   = { title, duration, thumbnail, playlist, subtitles: [{url, label}] }
  *
- * If the server is not running, nothing here throws and the page still plays
- * direct URLs, HLS and embeds on its own.
+ * Probing order for the backend: ?backend=…, window.VIEWER_BACKEND, the saved
+ * choice, same origin, then the usual localhost ports.
+ *
+ * If no backend answers, nothing here throws and the page still plays direct
+ * URLs, HLS files and embeds on its own.
  */
 (function () {
   'use strict';
 
   const state = {
-    base: '',               // same-origin when served by server.py, else ''
+    base: '',               // '' = same origin, otherwise the backend URL
+    token: '',
     online: false,
     ytDlp: null,            // version string when found
+    ffmpeg: false,
     modes: new Map(),       // page URL → chosen format id
     lastInfo: null,
   };
@@ -34,7 +39,8 @@
     try {
       const res = await fetch(base + path, {
         signal: ctrl.signal,
-        headers: { Accept: 'application/json' },
+        cache: 'default',                 // the backend sends ETag + max-age
+        headers: { Accept: 'application/json', ...authHeaders() },
       });
       const text = await res.text();
       let json = null;
@@ -46,25 +52,52 @@
     }
   }
 
-  async function getJson(path, timeoutMs) {
+  function getJson(path, timeoutMs) {
     return getJsonAt(state.base, path, timeoutMs);
   }
 
-  const info = (url) => getJson('/api/info?url=' + encodeURIComponent(url), 90000);
-  const health = () => getJson('/api/health', 2500);
+  const info = (url, fresh) =>
+    getJson('/api/info?url=' + encodeURIComponent(url) + (fresh ? '&fresh=1' : ''), 90000);
 
-  /** Where is the yt-dlp backend? Priority: ?backend=…, window.VIEWER_BACKEND, saved choice. */
+  /** Where is the yt-dlp backend? Priority: ?backend=…, window.VIEWER_BACKEND, saved. */
   function configuredBase() {
     let q = '';
     try { q = new URLSearchParams(location.search).get('backend') || ''; } catch (_) {}
     let stored = '';
     try { stored = localStorage.getItem('viewer.backend') || ''; } catch (_) {}
-    return String(q || window.VIEWER_BACKEND || stored || '').trim().replace(/\/+$/, '');
+    const raw = String(q || window.VIEWER_BACKEND || stored || '').trim();
+    return raw.replace(/\/+$/, '');
   }
 
-  const mergeUrl = (pageUrl) => `${state.base}/api/merge?url=${encodeURIComponent(pageUrl)}`;
+  /** Token for token-protected backends: ?token=…, window.VIEWER_TOKEN, saved. */
+  function configuredToken() {
+    let q = '';
+    try { q = new URLSearchParams(location.search).get('token') || ''; } catch (_) {}
+    let stored = '';
+    try { stored = localStorage.getItem('viewer.token') || ''; } catch (_) {}
+    return String(q || window.VIEWER_TOKEN || stored || '').trim();
+  }
+
+  function authHeaders() {
+    return state.token ? { 'X-Viewer-Token': state.token } : {};
+  }
+
+  /** Appended to every URL a <video>/hls.js/<track> has to fetch. */
+  function withToken(url) {
+    return state.token ? url + (url.includes('?') ? '&' : '?') +
+      'token=' + encodeURIComponent(state.token) : url;
+  }
+
+  /* Media URLs — the page/format pair is enough: the backend re-resolves the
+   * CDN link (and re-extracts it if the signed URL has expired). */
+  const mergeUrl = (pageUrl) =>
+    withToken(`${state.base}/api/merge?url=${encodeURIComponent(pageUrl)}`);
   const playUrl = (pageUrl, fmt) =>
-    `${state.base}/api/play?url=${encodeURIComponent(pageUrl)}&fmt=${encodeURIComponent(fmt)}`;
+    withToken(`${state.base}/api/play?url=${encodeURIComponent(pageUrl)}` +
+      `&fmt=${encodeURIComponent(fmt)}&proxy=1`);
+  const hlsUrl = (pageUrl, fmt) =>
+    withToken(`${state.base}/api/hls?url=${encodeURIComponent(pageUrl)}` +
+      `&fmt=${encodeURIComponent(fmt)}`);
 
   /** Turn a chosen format into something app.js can put in <video src>. */
   function buildStream(fmt, pageUrl) {
@@ -72,18 +105,28 @@
       return { kind: 'merge', url: fmt.url, proxyUrl: mergeUrl(pageUrl), proxied: true };
     }
     if (fmt.kind === 'hls') {
-      return { kind: 'hls', url: fmt.url, proxyUrl: null, proxied: false };
+      // Adaptive streams only work when every segment can be re-fetched with the
+      // right headers — i.e. through /api/hls, which rewrites the playlist.
+      const proxied = !!fmt.needsProxy;
+      return {
+        kind: 'hls', url: fmt.url,
+        proxyUrl: proxied ? hlsUrl(pageUrl, fmt.id) : null,
+        proxied,
+      };
     }
     return {
       kind: 'direct', url: fmt.url,
-      proxyUrl: playUrl(pageUrl, fmt.id) + '&proxy=1',
-      // CDNs that demand extra headers (Referer/Cookie) will refuse the
-      // browser's plain request, so pipe those straight through the backend.
+      proxyUrl: playUrl(pageUrl, fmt.id),
+      // CDNs that demand extra headers (Referer/Cookie) refuse the browser's
+      // plain request, so those go straight through the backend.
       proxied: !!fmt.needsProxy,
     };
   }
 
   function buildMeta(data, fmt) {
+    const playlist = data.playlist && data.playlist.entries
+      ? data.playlist.entries.filter((e) => e && e.url)
+      : null;
     return {
       title: data.title,
       duration: data.duration,
@@ -91,8 +134,10 @@
       isLive: data.isLive,
       extractor: data.extractor,
       formatLabel: fmt.label,
+      playlist: playlist && playlist.length ? playlist : null,
       subtitles: (data.subtitles || []).slice(0, 6).map((s) => ({
-        url: `${state.base}/api/subsrc?url=${encodeURIComponent(data.url)}&lang=${encodeURIComponent(s.raw_lang)}`,
+        url: withToken(`${state.base}/api/subsrc?url=${encodeURIComponent(data.url)}` +
+          `&lang=${encodeURIComponent(s.raw_lang)}`),
         label: s.lang,
       })),
     };
@@ -100,10 +145,17 @@
 
   /* ------------------------------------------------------------ resolver -- */
 
-  async function resolver(pageUrl) {
-    const data = await info(pageUrl);
+  async function resolver(pageUrl, fresh) {
+    const data = await info(pageUrl, fresh);
 
     if (data && data.extractable === false) {
+      // A playlist still deserves its entry list, even with nothing to play.
+      if (data.playlist && data.playlist.entries && data.playlist.entries.length) {
+        renderPanel(data, null);
+        note(`Playlist “${data.playlist.title || pageUrl}” — ${data.playlist.count} entries. `
+           + 'Pick one below.');
+        return null;
+      }
       showBadNews(pageUrl, data.reason || 'yt-dlp could not extract anything playable.');
       return null;
     }
@@ -134,6 +186,18 @@
     state.lastInfo = { reason: why, url: pageUrl };
   }
 
+  /** Play a playlist entry (re-resolves that entry's own page URL). */
+  async function playEntry(entry) {
+    if (!entry || !entry.url) return;
+    try {
+      const r = await resolver(entry.url);
+      if (r) window.ViewerApply(r);
+      else if (window.ViewerPlay) window.ViewerPlay(entry.url);
+    } catch (err) {
+      showBadNews(entry.url, (err && err.message) || String(err));
+    }
+  }
+
   /* ---------------------------------------------------------------- UI -- */
 
   function clearError() {
@@ -145,7 +209,8 @@
     if (meta && text) meta.textContent = text;
   }
 
-  function renderPanel(data) {
+  function renderPanel(data, chosenFmt) {
+    const current = chosenFmt === null ? null : pick(data);
     const fmts = (data.formats || []).filter((f) => f.kind !== 'dash').slice(0, 14);
 
     panel.innerHTML = '';
@@ -153,69 +218,102 @@
 
     const head = document.createElement('div');
     head.className = 'yt-head';
+    const pl = data.playlist && data.playlist.count > 1
+      ? `<span class="yt-tag">playlist · ${data.playlist.count}</span>` : '';
     head.innerHTML = `
       <span class="yt-title" title="${esc(data.title || data.url)}">${esc(data.title || prettyUrl(data.url))}</span>
+      ${pl}
       ${data.extractor ? `<span class="yt-tag">${esc(data.extractor)}</span>` : ''}
       ${data.isLive ? '<span class="yt-tag live">LIVE</span>' : ''}
       ${data.duration ? `<span class="yt-tag">${fmtTime(data.duration)}</span>` : ''}
       ${data.duration ? '' : '<span class="yt-tag">unknown length</span>'}`;
     panel.appendChild(head);
 
-    if (!fmts.length) {
+    if (fmts.length) {
+      const row = document.createElement('div');
+      row.className = 'yt-row';
+      row.append(label('Quality'));
+
+      fmts.forEach((f) => {
+        const b = document.createElement('button');
+        b.type = 'button';
+        b.className = 'yt-fmt' + (current && f.id === current.id ? ' active' : '');
+        b.title = f.needsProxy ? 're-fetched through the backend (CDN needs headers)'
+                               : 'played straight from the CDN';
+        b.innerHTML = `${esc(f.label)}${f.sizeHuman ? ` <em>${esc(f.sizeHuman)}</em>` : ''}`;
+        b.addEventListener('click', () => {
+          state.modes.set(data.url, f.id);
+          row.querySelectorAll('.yt-fmt').forEach((x) => x.classList.remove('active'));
+          b.classList.add('active');
+          resolver(data.url).then((r) => { if (r) window.ViewerApply(r); }).catch(() => {});
+        });
+        row.appendChild(b);
+      });
+
+      const proxy = document.createElement('button');
+      proxy.type = 'button';
+      proxy.className = 'yt-proxy';
+      proxy.title = 'Re-fetch this stream through the server '
+                  + '(use when direct playback is blocked or the link expired)';
+      proxy.textContent = 'Force proxy';
+      proxy.addEventListener('click', () => {
+        const f = current || pick(data);
+        const built = buildStream(f, data.url);
+        if (built.kind === 'hls') built.url = hlsUrl(data.url, f.id);
+        window.ViewerApply({ stream: { ...built, proxied: true }, meta: buildMeta(data, f) });
+      });
+      row.appendChild(proxy);
+
+      const hide = document.createElement('button');
+      hide.type = 'button';
+      hide.className = 'yt-close';
+      hide.textContent = '×';
+      hide.title = 'Hide this row';
+      hide.addEventListener('click', () => { panel.hidden = true; });
+      head.appendChild(hide);
+
+      panel.appendChild(row);
+    } else {
       const warn = document.createElement('div');
       warn.className = 'yt-warn';
-      warn.textContent = 'yt-dlp offered no browser-playable format for this link.';
+      warn.textContent = data.reason
+        || 'yt-dlp offered no browser-playable format for this link.';
       panel.appendChild(warn);
-      return;
     }
 
-    const row = document.createElement('div');
-    row.className = 'yt-row';
-    row.append(label('Quality'));
-
-    fmts.forEach((f) => {
-      const b = document.createElement('button');
-      b.type = 'button';
-      b.className = 'yt-fmt' + (f.id === pick(data).id ? ' active' : '');
-      b.innerHTML = `${esc(f.label)}${f.sizeHuman ? ` <em>${esc(f.sizeHuman)}</em>` : ''}`;
-      b.addEventListener('click', () => {
-        state.modes.set(data.url, f.id);
-        row.querySelectorAll('.yt-fmt').forEach((x) => x.classList.remove('active'));
-        b.classList.add('active');
-        // re-resolve with the new choice
-        resolver(data.url).then((r) => {
-          if (r) window.ViewerApply(r);
-        }).catch(() => {});
-      });
-      row.appendChild(b);
-    });
-
-    const proxy = document.createElement('button');
-    proxy.type = 'button';
-    proxy.className = 'yt-proxy';
-    proxy.title = 'Re-fetch this stream through the server (use when direct playback is blocked)';
-    proxy.textContent = 'Force proxy';
-    proxy.addEventListener('click', () => {
-      const f = pick(data);
-      const built = buildStream(f, data.url);
-      window.ViewerApply({ stream: { ...built, proxied: true }, meta: buildMeta(data, f) });
-    });
-    row.appendChild(proxy);
-
-    const hide = document.createElement('button');
-    hide.type = 'button';
-    hide.className = 'yt-close';
-    hide.textContent = '×';
-    hide.title = 'Hide this row';
-    hide.addEventListener('click', () => { panel.hidden = true; });
-    head.appendChild(hide);
-
-    panel.appendChild(row);
-    if (data.reason) {
+    if (data.reason && fmts.length) {
       const warn = document.createElement('div');
       warn.className = 'yt-warn';
       warn.textContent = data.reason;
       panel.appendChild(warn);
+    }
+
+    // Playlist / channel listing — click an entry to play just that item.
+    const entries = (data.playlist && data.playlist.entries || [])
+      .filter((e) => e && e.url).slice(0, 300);
+    if (entries.length > 1) {
+      const list = document.createElement('div');
+      list.className = 'yt-list';
+      const head2 = document.createElement('div');
+      head2.className = 'yt-label';
+      head2.textContent = `${data.playlist.count || entries.length} entries`;
+      list.appendChild(head2);
+      entries.forEach((e, i) => {
+        const b = document.createElement('button');
+        b.type = 'button';
+        b.className = 'yt-item';
+        b.title = e.url;
+        b.innerHTML = `<span class="yt-idx">${e.duration ? fmtTime(e.duration) : (i + 1)}</span>`
+                    + `<span class="yt-name">${esc(e.title)}</span>`;
+        b.addEventListener('click', () => {
+          const input = document.getElementById('urlInput');
+          if (input) input.value = e.url;          // keep the box in sync
+          b.classList.add('active');
+          playEntry(e);
+        });
+        list.appendChild(b);
+      });
+      panel.appendChild(list);
     }
   }
 
@@ -237,14 +335,12 @@
 
   /* ----------------------------------------------------------- bootstrap -- */
 
-  function statusChip(text, ok) {
+  function statusChip(text, ok, title) {
     const chip = document.querySelector('#backendChip');
     if (!chip) return;
     chip.textContent = text;
     chip.dataset.state = ok ? 'on' : 'off';
-    chip.title = ok
-      ? `server.py is running${state.ytDlp ? ` · yt-dlp ${state.ytDlp}` : ''}`
-      : 'server.py is not reachable — direct URLs, HLS files and embeds still work';
+    chip.title = title;
   }
 
   let probeTimer = null;
@@ -254,17 +350,20 @@
     if (!window.ViewerResolvers.includes(resolver)) window.ViewerResolvers.push(resolver);
   }
 
-  // Probe a few origins: a configured backend first, then same-origin,
-  // then the usual localhost ports. The first healthy one wins. If none answer
-  // we keep retrying, so a slow/restarted server eventually comes back online.
+  // Probe a few origins: a configured backend first, then same-origin, then the
+  // usual localhost ports. The first healthy one wins. If none answer we keep
+  // retrying, so a slow/restarted server eventually comes back online.
   async function checkBackend() {
     const configured = configuredBase();
+    const state0 = configuredToken();
     const candidates = [configured, '', 'http://127.0.0.1:8080', 'http://localhost:8080'];
     const unique = [...new Set(candidates)];
     const tried = [];
 
     for (const base of unique) {
       const label = base || (typeof location !== 'undefined' ? location.origin : 'same-origin');
+      const saved = state0;
+      state.token = saved;
       try {
         const h = await getJsonAt(base, '/api/health', 8000);
         if (h && h.ok) {
@@ -272,13 +371,29 @@
           state.base = base;
           state.online = true;
           state.ytDlp = h.ytDlpVersion;
+          state.ffmpeg = !!(h.features && h.features.merge);
           if (base) { try { localStorage.setItem('viewer.backend', base); } catch (_) {} }
+          if (h.tokenRequired && !state.token) {
+            state.token = '';
+            statusChip('token needed', false,
+              'This backend requires a token — add ?token=… (or window.VIEWER_TOKEN)');
+            tried.push(`${label} → token required`);
+            continue;
+          }
+          if (h.tokenRequired && state.token) {
+            try { localStorage.setItem('viewer.token', state.token); } catch (_) {}
+          }
           if (h.ytDlpAvailable === false) {
-            statusChip('yt-dlp missing', false);
+            statusChip('yt-dlp missing', false,
+              'server.py is reachable but yt-dlp is not installed — '
+              + 'run: pip install -U yt-dlp, then restart server.py');
             note('server.py is reachable but yt-dlp is not installed — '
                  + 'run: pip install -U yt-dlp, then restart server.py');
           } else {
-            statusChip(`yt-dlp ${h.ytDlpVersion || 'online'}`, true);
+            const bits = [`yt-dlp ${h.ytDlpVersion || 'online'}`];
+            if (state.ffmpeg) bits.push('ffmpeg');
+            statusChip(bits.join(' · '), true,
+              `backend ${label} · ${(h.features && h.features.proxy) ? 'proxy on' : ''}`);
             if (wasOffline) note(`Backend online at ${label}`);
           }
           if (probeTimer) { clearInterval(probeTimer); probeTimer = null; }
@@ -292,7 +407,8 @@
     }
 
     state.online = false;
-    statusChip('backend offline', false);
+    statusChip('backend offline', false,
+      'server.py is not reachable — direct URLs, HLS files and embeds still work');
     note('Backend offline. Tried: ' + tried.join(' | '));
     if (!probeTimer) probeTimer = setInterval(checkBackend, 5000);
     return false;
@@ -308,6 +424,7 @@
       chip.addEventListener('click', checkBackend);
     }
 
+    // A backend URL saved earlier can be stale — keep probing in the background.
     checkBackend();
   }
 

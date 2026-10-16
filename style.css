@@ -197,6 +197,24 @@ button:hover,.file-btn:hover{background:#232c37;border-color:#3a4553}
 .yt-proxy{margin-left:auto}
 .yt-warn{flex:1 1 100%;color:#ffcf9f;font-size:12px}
 
+/* playlist / channel entries */
+.yt-list{
+  flex:1 1 100%;display:flex;flex-direction:column;gap:2px;
+  max-height:190px;overflow-y:auto;padding-top:2px;
+}
+.yt-list .yt-label{margin:2px 0 3px}
+.yt-item{
+  display:flex;align-items:center;gap:9px;width:100%;text-align:left;
+  padding:4px 8px;font-size:12.5px;font-weight:450;border:1px solid transparent;
+  background:transparent;
+}
+.yt-item:hover{border-color:var(--border);background:var(--bg-raised)}
+.yt-idx{
+  flex:0 0 auto;min-width:46px;color:var(--muted);
+  font-family:ui-monospace,Menlo,monospace;font-size:11px;
+}
+.yt-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+
 /* ---------- backend chip ---------- */
 #backendChip{
   padding:4px 9px;border-radius:99px;font-size:11.5px;font-weight:600;white-space:nowrap;

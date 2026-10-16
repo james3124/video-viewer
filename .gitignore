@@ -7,3 +7,8 @@ __pycache__/
 /data/
 *.part
 viewer-subs/
+# The vendored yt-dlp binary: ~3 MB per serverless function. `pip install yt-dlp`
+# (see requirements.txt) provides it on every host; `python3 server.py --install`
+# re-downloads it locally when you want a standalone copy.
+bin/yt-dlp
+cookies.txt

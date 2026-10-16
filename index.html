@@ -49,7 +49,7 @@
       <path d="M4 3h16a1 1 0 0 1 1 1v16a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1zm6 4v10l7-5-7-5z"/>
     </svg>
     <h2>Paste any video link</h2>
-    <p>Direct files (mp4, webm, ogv, mov, m4v), HLS streams (.m3u8), YouTube, Vimeo, Twitch, TikTok, Twitter, Reddit and ~1000 more via yt-dlp — or drop a file here.</p>
+    <p>Direct files (mp4, webm, ogv, mov, m4v), HLS streams (.m3u8), YouTube, Vimeo, Twitch, TikTok, Twitter, Reddit and ~1000 more via yt-dlp — playlists and channels included — or drop a file here.</p>
     <div class="examples">
       <span>Try:</span>
       <button class="ex" data-url="https://test-videos.co.uk/vids/bigbuckbunny/mp4/h264/720/Big_Buck_Bunny_720_10s_30MB.mp4">Big Buck Bunny</button>
@@ -86,7 +86,7 @@
     <li><kbd>&gt;</kbd> / <kbd>&lt;</kbd> — playback speed · <kbd>C</kbd> — captions on/off</li>
     <li>Click the video to pause/play · double&#8209;click for fullscreen</li>
   </ul>
-  <p class="muted">Streams blocked by CORS can't be re-piped by a browser-only page — try a different link or a CORS-friendly host.</p>
+  <p class="muted">Streams blocked by CORS, or whose CDN demands a Referer/Cookie, are re-fetched by the backend — pick another quality or hit <em>Force proxy</em> if playback stalls. Playlists and channels show a clickable entry list.</p>
   <button id="closeHelp">Close</button>
 </dialog>
 
