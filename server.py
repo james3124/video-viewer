@@ -93,21 +93,33 @@ def install_yt_dlp(dest: str = LOCAL_BIN, url: str = RELEASE_URL) -> str:
     return dest
 
 
-def yt_dlp_ok() -> bool:
-    if not YT_DLP:
-        return False
-    proc = subprocess.run([YT_DLP, "--version"], capture_output=True,
-                          text=True, timeout=15)
-    return proc.returncode == 0
+_STATUS_CACHE: dict = {"at": 0.0, "version": None, "ok": False}
 
+
+def _yt_dlp_status() -> tuple[str | None, bool]:
+    """Cached `yt-dlp --version` — spawning it takes ~1-3 s, too slow for /api/health."""
+    now = time.time()
+    if now - _STATUS_CACHE["at"] < 60:
+        return _STATUS_CACHE["version"], _STATUS_CACHE["ok"]
+    version, ok = None, False
+    if YT_DLP:
+        try:
+            proc = subprocess.run([YT_DLP, "--version"], capture_output=True,
+                                  text=True, timeout=15)
+            version = (proc.stdout or "").strip() or None
+            ok = proc.returncode == 0
+        except Exception:  # noqa: BLE001
+            ok = False
+    _STATUS_CACHE.update(at=now, version=version, ok=ok)
+    return version, ok
+
+
+def yt_dlp_ok() -> bool:
+    return _yt_dlp_status()[1]
 
 
 def yt_dlp_version() -> str | None:
-    if not YT_DLP:
-        return None
-    proc = subprocess.run([YT_DLP, "--version"], capture_output=True,
-                          text=True, timeout=30)
-    return (proc.stdout or "").strip() or None
+    return _yt_dlp_status()[0]
 
 
 def run_yt_dlp(args: list[str], timeout: int = 90) -> tuple[int, str, str]:

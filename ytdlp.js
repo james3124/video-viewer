@@ -258,7 +258,7 @@
     let lastErr = null;
     for (const base of unique) {
       try {
-        const h = await getJsonAt(base, '/api/health', 2500);
+        const h = await getJsonAt(base, '/api/health', 8000);
         if (h && h.ok) {
           state.base = base;
           state.online = true;
