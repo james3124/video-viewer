@@ -162,6 +162,24 @@ curl -s https://your-app.vercel.app/api/health
 > YouTube and HLS usually work there, but other hosts may not. For full yt-dlp
 > power, run the backend somewhere with a normal IP.
 
+### Vercel is blocked by most media hosts
+
+Vercel serves from datacenter IP ranges that YouTube, Pornhub and most
+Cloudflare-fronted sites block outright. Extraction then fails with
+`Redirection detected` / `Sign in to confirm you're not a bot`, and no code
+change fixes that — it is the IP, not the app. The backend names the platform
+in `/api/health` → `platform`, and appends it to extraction failures so the page
+says so instead of failing silently.
+
+What actually works, in order:
+
+1. **Backend on a VPS / Fly.io / a home connection** — the real fix. Same
+   `render.yaml`, same commands, no code changes.
+2. **Cookies** (`VIEWER_COOKIES_B64`) — necessary anyway for age gates and
+   logins, and enough on their own for some hosts.
+3. **Vercel** — fine for YouTube *with* cookies, and fine as a static frontend
+   in front of a backend hosted elsewhere.
+
 ### Full backend elsewhere (recommended)
 
 Any host that runs a long-lived process — Render (`render.yaml` is ready-made),

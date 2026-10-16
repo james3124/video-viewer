@@ -149,6 +149,10 @@
       resolve(clean).then((resolved) => {
         if (!resolved) {                       // no backend / not extractable
           if (kind === 'embed') return playEmbed(clean);
+          // The backend is up and already explained itself in the error box:
+          // trying to play the page URL as media only produces a bogus
+          // "codec error" on top of a real, already-reported reason.
+          if (window.ViewerLastFailure) return;
           return playNative(clean);
         }
         playResolved(resolved);

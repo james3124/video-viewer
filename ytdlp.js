@@ -23,6 +23,7 @@
     online: false,
     ytDlp: null,            // version string when found
     ytDlpMode: null,        // 'module' | 'binary' | 'none' — how it is invoked
+    platform: null,        // 'Vercel' | 'Render' | … from /api/health
     ffmpeg: false,
     modes: new Map(),       // page URL → chosen format id
     lastInfo: null,
@@ -147,6 +148,7 @@
   /* ------------------------------------------------------------ resolver -- */
 
   async function resolver(pageUrl, fresh) {
+    window.ViewerLastFailure = '';
     const data = await info(pageUrl, fresh);
 
     if (data && data.extractable === false) {
@@ -182,8 +184,12 @@
   }
 
   function showBadNews(pageUrl, why) {
-    clearError();
-    setStatus(why + ' Falling back to the browser player.');
+    // The backend is online and just told us *why* it could not resolve this.
+    // app.js checks this flag to avoid "playing" a web page as if it were media.
+    window.ViewerLastFailure = why;
+    const box = document.getElementById('errors');
+    if (box) { box.hidden = false; box.textContent = 'yt-dlp: ' + why; }
+    setStatus(why);
     state.lastInfo = { reason: why, url: pageUrl };
   }
 
@@ -373,6 +379,7 @@
           state.online = true;
           state.ytDlp = h.ytDlpVersion;
           state.ytDlpMode = h.ytDlpMode;
+          state.platform = h.platform;
           state.ffmpeg = !!(h.features && h.features.merge);
           if (base) { try { localStorage.setItem('viewer.backend', base); } catch (_) {} }
           if (h.tokenRequired && !state.token) {
@@ -396,6 +403,9 @@
             if (state.ffmpeg) bits.push('ffmpeg');
             statusChip(bits.join(' · '), true,
               `backend ${label} · yt-dlp via ${state.ytDlpMode || 'binary'}`
+              + (state.platform && state.platform !== 'self-hosted'
+                  ? ` · running on ${state.platform} (its IP range is often blocked by media hosts)`
+                  : '')
               + ' · click to re-check');
             if (wasOffline) note(`Backend online at ${label}`);
           }

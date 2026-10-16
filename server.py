@@ -155,6 +155,31 @@ def impersonate_target(profile: str):
 notice: list[str] = []
 
 
+def detect_platform() -> str:
+    """Where is this running? Datacenter IP ranges get blocked by hosts that
+    happily serve a home connection, so it is worth naming."""
+    if env("VERCEL", "VERCEL_ENV"):
+        return "Vercel"
+    if env("RENDER"):
+        return "Render"
+    if env("RAILWAY_ENVIRONMENT"):
+        return "Railway"
+    if env("FLY_APP_NAME", "FLY_REGION"):
+        return "Fly.io"
+    if env("AWS_LAMBDA_FUNCTION_NAME", "AWS_EXECUTION_ENV", "VERCEL_AWS_LAMBDA_FUNCTION_NAME"):
+        return "AWS Lambda"
+    if env("NETLIFY"):
+        return "Netlify"
+    if env("DYNO"):
+        return "Heroku"
+    if env("KOYEB_APP_ID", "HYPERDX_SERVICE_TOKEN"):
+        return "Koyeb"
+    return ""
+
+
+PLATFORM = detect_platform()
+
+
 def note(msg: str) -> None:
     if msg not in notice:
         notice.append(msg)
@@ -670,6 +695,16 @@ def _extract(url: str, playlist: bool = False) -> dict:
     raise RuntimeError(with_hint(friendly(last)))
 
 
+def clean_reason(text: str) -> str:
+    """Drop yt-dlp's wiki boilerplate so the answer is one sentence, not a dump."""
+    text = re.sub(r"\s+", " ", text or "").strip()
+    if not text:
+        return ""
+    kept = [s.strip() for s in re.split(r"(?<=[.!?])\s+", text)
+            if s and "http" not in s]
+    return " ".join(kept).strip(" .—-") or text[:400]
+
+
 def _host_of(url: str) -> str:
     try:
         return urllib.parse.urlparse(url).hostname or url[:40]
@@ -682,28 +717,45 @@ def _host_of(url: str) -> str:
 # user with a bare yt-dlp error.
 _HINTS = (
     (("sign in to confirm", "cloudflare", "cf-mitigated", "datadome", "captcha",
-      "are you a robot", "bot check", "access denied", "forbidden"),
-     "this host is behind a bot check — it needs curl_cffi (--impersonate chrome) "
-     "and/or a non-datacenter IP; Vercel/Render ranges are often blocked outright"),
+      "are you a robot", "bot check", "access denied", "forbidden",
+      "redirection detected", "how do i pass cookies"),
+     "this host is fingerprinting or blocking the server — install curl_cffi "
+     "(YTDLP_IMPERSONATE=chrome) and/or run the backend from a non-datacenter IP"),
     (("login", "log in", "sign in", "premium", "member", "subscribe", "paid", "ppv"),
-     "this host wants an account — export cookies from a logged-in browser and set "
-     "YTDLP_COOKIES=/path/cookies.txt"),
+     "this host wants an account or a cookie — export cookies.txt from a browser "
+     "that is already logged in and set VIEWER_COOKIES_B64 (see the README)"),
     (("age", "verify", "consent", "parental", "are you over"),
      "this host shows an age/consent gate — cookies from a browser that passed it "
-     "fix it (YTDLP_COOKIES)"),
+     "fix it (VIEWER_COOKIES_B64)"),
     (("geo", "in your country", "not available in", "region", "blocked in"),
      "this host is region-locked — use a proxy via YTDLP_ARGS='--proxy …' or cookies "
      "from the right region"),
+)
+
+# Nothing a server can do about these, so never blame the platform either.
+_TERMINAL_HINTS = (
     (("private", "removed", "deleted", "terminated", "unavailable"),
-     "this video is private, removed or region-locked — nothing a server can do"),
+     "this video is private, removed or gone — nothing a server can do"),
 )
 
 
+def _matches(text_low: str, needle: str) -> bool:
+    """Word-boundary match, so 'age' does not fire on 'webpage'."""
+    return re.search(r"\b" + re.escape(needle).replace(r"\ ", r"\s+"), text_low) is not None
+
+
 def with_hint(reason: str) -> str:
-    """Append the one action that usually fixes this failure."""
-    low = (reason or "").lower()
+    """Say what failed *and* the one action that fixes it."""
+    reason = clean_reason(reason)
+    low = reason.lower()
+    where = (f" (your backend runs on {PLATFORM}, whose IP ranges these hosts block "
+             f"outright — a VPS, Fly.io or a home connection usually works)"
+             if PLATFORM else "")
     for needles, hint in _HINTS:
-        if any(n in low for n in needles):
+        if any(_matches(low, n) for n in needles):
+            return f"{reason} — {hint}{where}"
+    for needles, hint in _TERMINAL_HINTS:
+        if any(_matches(low, n) for n in needles):
             return f"{reason} — {hint}"
     return reason
 
@@ -1444,6 +1496,7 @@ class Handler(BaseHTTPRequestHandler):
                 "cache": True,
             },
             "tokenRequired": bool(TOKEN),
+            "platform": PLATFORM or "self-hosted",
             "cache": {"dir": CACHE_DIR, "entries": len(_MEM), **STATS},
             "notices": notice[-4:],
         }, cache="no-store")
