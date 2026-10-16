@@ -205,14 +205,43 @@ def install_yt_dlp(dest: str = LOCAL_BIN, url: str = RELEASE_URL) -> str:
 
 _STATUS_CACHE: dict = {"at": 0.0, "version": None, "ok": False}
 
+# How to reach yt-dlp: "auto" prefers the Python module (fast, no subprocess,
+# works in sandboxes), "binary" forces the console script, "module" forces the
+# import. See https://github.com/yt-dlp/yt-dlp — both ship from requirements.txt.
+YTDLP_MODE = env("VIEWER_YTDLP_MODE", default="auto").lower()
+HAS_YTDLP_PY = _has_module("yt_dlp")
+_YTDLP_PY = None
+
+
+def ytdlp_module():
+    """The imported `yt_dlp` module, or None. Imported lazily (it is heavy)."""
+    global _YTDLP_PY
+    if _YTDLP_PY is None and HAS_YTDLP_PY:
+        try:
+            import yt_dlp
+            _YTDLP_PY = yt_dlp
+        except Exception:  # noqa: BLE001
+            _YTDLP_PY = False
+    return _YTDLP_PY or None
+
 
 def _yt_dlp_status() -> tuple[str | None, bool]:
-    """Cached `yt-dlp --version` — spawning it takes ~1-3 s, too slow for /api/health."""
+    """Cached "is yt-dlp usable, and which way" — must be fast for /api/health.
+
+    Two ways to reach yt-dlp, and both are checked:
+      * the `yt-dlp` console script (spawns a process — needs PATH + subprocess),
+      * the `yt_dlp` Python module (just an import — also works where PATH or
+        process spawning is unavailable, e.g. inside serverless sandboxes).
+    """
     now = time.time()
     if now - _STATUS_CACHE["at"] < 60:
         return _STATUS_CACHE["version"], _STATUS_CACHE["ok"]
     version, ok = None, False
-    if YT_DLP:
+    mod = ytdlp_module()
+    if mod is not None:
+        version = getattr(getattr(mod, "version", None), "__version__", None)
+        ok = True
+    elif YT_DLP:
         try:
             proc = subprocess.run([YT_DLP, "--version"], capture_output=True,
                                   text=True, timeout=15)
@@ -230,6 +259,22 @@ def yt_dlp_ok() -> bool:
 
 def yt_dlp_version() -> str | None:
     return _yt_dlp_status()[0]
+
+
+def ytdlp_mode() -> str:
+    """How extraction will run here: 'module', 'binary' or 'none'.
+
+    'auto' (default) prefers the Python module: no subprocess, no PATH. The
+    preference is always downgraded gracefully — a missing script falls back to
+    the module and vice versa, so this only reports 'none' when yt-dlp really
+    is not installed anywhere.
+    """
+    has_module = ytdlp_module() is not None
+    if YTDLP_MODE == "binary" and YT_DLP:
+        return "binary"
+    if has_module:
+        return "module"
+    return "binary" if YT_DLP else "none"
 
 
 _BASE_ARGS: list[str] | None = None
@@ -269,13 +314,20 @@ def base_ytdlp_args() -> list[str]:
 
 
 def ytdlp_cmd(args: list[str]) -> list[str]:
-    return [YT_DLP, *base_ytdlp_args(), *EXTRA_ARGS, *args]
+    """Command line for the subprocess paths (merge, subtitle conversion).
+
+    Prefers the console script, falls back to `python -m yt_dlp` when PATH does
+    not have it (some sandboxes) — both work.
+    """
+    if YT_DLP:
+        return [YT_DLP, *base_ytdlp_args(), *EXTRA_ARGS, *args]
+    if ytdlp_module() is not None:
+        return [sys.executable, "-m", "yt_dlp", *base_ytdlp_args(), *EXTRA_ARGS, *args]
+    raise RuntimeError("yt-dlp is not installed on this server")
 
 
 def run_yt_dlp(args: list[str], timeout: int | None = None) -> tuple[int, str, str]:
     """Run yt-dlp from an arg list (no shell → no command injection)."""
-    if not YT_DLP:
-        raise RuntimeError("yt-dlp is not installed on this server")
     proc = subprocess.run(ytdlp_cmd(args), capture_output=True, text=True,
                           timeout=timeout or YTDLP_TIMEOUT)
     return proc.returncode, proc.stdout, proc.stderr
@@ -397,8 +449,120 @@ def ytdlp_reason(stderr: str) -> str:
     return best.removeprefix("ERROR:").strip()[:400]
 
 
+class _QuietLog:
+    """yt-dlp logger that keeps the last complaint instead of printing it."""
+
+    def __init__(self) -> None:
+        self.last = ""
+
+    def _keep(self, msg) -> None:
+        text = str(msg).strip()
+        if text:
+            self.last = text[-400:]
+
+    def debug(self, msg):
+        pass
+
+    def info(self, msg):
+        self._keep(msg)
+
+    def warning(self, msg):
+        self._keep(msg)
+
+    def error(self, msg):
+        self._keep(msg)
+
+
+def _extra_module_opts() -> dict:
+    """Map the allow-listed YTDLP_ARGS to YoutubeDL options (rest is ignored)."""
+    out: dict = {}
+    tokens, i = list(EXTRA_ARGS), 0
+    simple = {"--proxy": "proxy", "--username": "username", "--password": "password",
+              "--extractor-args": "extractor_args", "--geo-bypass-country": "geo_bypass_country"}
+    while i < len(tokens):
+        flag = tokens[i]
+        if flag == "--cookies" and i + 1 < len(tokens):
+            out["cookiefile"] = tokens[i + 1]
+            i += 2
+            continue
+        if flag == "--referer" and i + 1 < len(tokens):
+            out.setdefault("http_headers", {})["Referer"] = tokens[i + 1]
+            i += 2
+            continue
+        if flag in simple and i + 1 < len(tokens):
+            out[simple[flag]] = tokens[i + 1]
+            i += 2
+            continue
+        i += 1
+    return out
+
+
+def _module_opts(playlist: bool = False) -> dict:
+    """YoutubeDL options mirroring base_ytdlp_args()."""
+    opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "noprogress": True,
+        "skip_download": True,
+        "socket_timeout": SOCKET_TIMEOUT,
+        "retries": 5,
+        "fragment_retries": 10,
+        "extractor_retries": 3,
+        "file_access_retries": 3,
+        "cachedir": YTDLP_DIR,
+        "age_limit": AGE_LIMIT or None,
+        "impersonate": IMPERSONATE or None,
+        "noplaylist": not playlist,
+        "extract_flat": "in_playlist" if playlist else False,
+    }
+    if COOKIES and os.path.isfile(COOKIES):
+        opts["cookiefile"] = COOKIES
+    opts.update(_extra_module_opts())
+    return {k: v for k, v in opts.items() if v is not None}
+
+
+def _module_extract(url: str, playlist: bool = False) -> dict:
+    """Extract in-process — no subprocess, no PATH, works in serverless sandboxes."""
+    mod = ytdlp_module()
+    plans: list[dict] = []
+    if playlist:
+        plans.append({"noplaylist": False, "extract_flat": "in_playlist"})
+    plans.append({"noplaylist": True, "extract_flat": False})
+    if not playlist:
+        plans.append({"noplaylist": False, "extract_flat": "in_playlist"})
+
+    detail = ""
+    for extra in plans:
+        log = _QuietLog()
+        opts = _module_opts()
+        opts.update(extra)
+        opts["logger"] = log
+        try:
+            with mod.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+        except Exception as exc:  # noqa: BLE001
+            text = friendly(exc)
+            if text.startswith("ERROR:"):
+                text = text[6:].strip()
+            detail = text or detail
+            continue
+        if isinstance(info, dict) and (info.get("formats") or info.get("entries")
+                                       or info.get("url")):
+            return info
+        detail = (log.last or detail
+                  or f"yt-dlp found no downloadable formats for {url} — it may be "
+                     f"private, region-locked, deleted or live-only")
+    raise RuntimeError(detail or f"yt-dlp could not extract {url}")
+
+
 def _extract(url: str, playlist: bool = False) -> dict:
-    """`yt-dlp -J` with a short ladder of fallbacks (single video → playlist → …)."""
+    """`yt-dlp -J` equivalent, with a short ladder of fallbacks."""
+    if ytdlp_mode() == "module":
+        return _module_extract(url, playlist=playlist)
+    return _subprocess_extract(url, playlist=playlist)
+
+
+def _subprocess_extract(url: str, playlist: bool = False) -> dict:
     plans: list[list[str]] = []
     flat = ["-J", "--yes-playlist", "--flat-playlist", url]
     if playlist:
@@ -766,7 +930,7 @@ def resolve_target(page: str, fmt: str = "", fresh: bool = False) -> dict:
     if is_private_url(page):
         raise ValueError("Refusing to fetch a private/loopback address")
     looks_like_media = bool(MEDIA_EXT_RE.search(page))
-    if not fmt and (not YT_DLP or looks_like_media):
+    if not fmt and (ytdlp_mode() == "none" or looks_like_media):
         return {"url": page, "headers": {}, "kind": "direct", "id": None}
 
     info = get_info(page, fresh=fresh, playlist=PLAYLIST_PROBE)
@@ -795,7 +959,7 @@ def resolve_target(page: str, fmt: str = "", fresh: bool = False) -> dict:
 
 def resolve_headers(page: str, fmt: str = "") -> dict:
     """Headers the CDN wants — best effort, never raises."""
-    if not valid_url(page) or not YT_DLP:
+    if not valid_url(page) or ytdlp_mode() == "none":
         return {}
     try:
         return resolve_target(page, fmt).get("headers") or {}
@@ -1110,17 +1274,22 @@ class Handler(BaseHTTPRequestHandler):
 
     # -- API ---------------------------------------------------------------- #
     def _api_health(self) -> None:
+        mode = ytdlp_mode()
         self._send_json({
             "ok": True,
             "backend": True,
             "version": VERSION,
-            "ytDlpAvailable": bool(YT_DLP) and yt_dlp_ok(),
+            "ytDlpAvailable": mode != "none",
+            "ytDlpMode": mode,                    # module | binary | none
             "ytDlpVersion": yt_dlp_version(),
+            "ytDlpBinary": YT_DLP,                # the console script, if any
+            "ytDlpModule": HAS_YTDLP_PY,          # importable as `import yt_dlp`
+            "python": sys.version.split()[0],
             "ffmpegAvailable": FFMPEG is not None,
             "features": {
                 "proxy": True,
                 "hls": True,
-                "merge": FFMPEG is not None,
+                "merge": FFMPEG is not None and mode != "none",
                 "playlists": PLAYLIST_PROBE,
                 "cookies": bool(COOKIES),
                 "impersonate": IMPERSONATE or None,
@@ -1138,7 +1307,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_error_json("Only http(s) URLs can be extracted", 400)
         if is_private_url(url):
             return self._send_error_json("Refusing to fetch a private/loopback address", 400)
-        if not YT_DLP:
+        if ytdlp_mode() == "none":
             return self._send_json({
                 "ok": True, "url": url, "extractable": False,
                 "reason": "yt-dlp is not installed on the server. "
@@ -1276,7 +1445,8 @@ class Handler(BaseHTTPRequestHandler):
                             reject_html=reject_html)
                 return
             except Expired:
-                if attempt or not allow_refresh or not YT_DLP or not valid_url(page):
+                if (attempt or not allow_refresh or ytdlp_mode() == "none"
+                        or not valid_url(page)):
                     raise
                 retried = resolve_target(page, fmt, fresh=True)   # may raise → 502
                 if retried["url"] == target["url"] and not retried.get("headers"):
@@ -1399,7 +1569,7 @@ class Handler(BaseHTTPRequestHandler):
                 break
             except urllib.error.HTTPError as exc:
                 if (attempt or exc.code not in EXPIRY_CODES or not allow_refresh
-                        or not (YT_DLP and valid_url(page))):
+                        or not (ytdlp_mode() != "none" and valid_url(page))):
                     return self._send_error_json(f"Upstream returned {exc.code}", 502)
                 try:                        # signed playlist URL → refresh it
                     target = resolve_target(page, fmt, fresh=True)
@@ -1457,7 +1627,7 @@ class Handler(BaseHTTPRequestHandler):
         sort = q.get("sort", "") or "vcodec:h264:vp9:av1,+res:1080"
         if not valid_url(page):
             return self._send_error_json("Missing/invalid ?url=", 400)
-        if FFMPEG is None or not YT_DLP:
+        if FFMPEG is None or ytdlp_mode() == "none":
             return self._send_error_json(
                 "Merging needs both yt-dlp and ffmpeg available on the server", 501)
 
@@ -1742,10 +1912,12 @@ def main() -> None:
     ensure_dirs()
     if FFMPEG is None:
         note("ffmpeg not found — merging separate video+audio tracks will fail")
-    if not YT_DLP:
+    if ytdlp_mode() == "none":
         note("yt-dlp NOT found → only direct media URLs will play. "
              "Fix with:  python3 server.py --install   (downloads from "
              "github.com/yt-dlp/yt-dlp)  or  pip install -U yt-dlp")
+    else:
+        note(f"yt-dlp {yt_dlp_version() or '?'} via {ytdlp_mode()}")
     if IMPERSONATE:
         note(f"impersonating {IMPERSONATE} (curl_cffi)")
     if TOKEN:

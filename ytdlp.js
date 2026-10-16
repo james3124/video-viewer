@@ -22,6 +22,7 @@
     token: '',
     online: false,
     ytDlp: null,            // version string when found
+    ytDlpMode: null,        // 'module' | 'binary' | 'none' — how it is invoked
     ffmpeg: false,
     modes: new Map(),       // page URL → chosen format id
     lastInfo: null,
@@ -371,6 +372,7 @@
           state.base = base;
           state.online = true;
           state.ytDlp = h.ytDlpVersion;
+          state.ytDlpMode = h.ytDlpMode;
           state.ffmpeg = !!(h.features && h.features.merge);
           if (base) { try { localStorage.setItem('viewer.backend', base); } catch (_) {} }
           if (h.tokenRequired && !state.token) {
@@ -393,7 +395,8 @@
             const bits = [`yt-dlp ${h.ytDlpVersion || 'online'}`];
             if (state.ffmpeg) bits.push('ffmpeg');
             statusChip(bits.join(' · '), true,
-              `backend ${label} · ${(h.features && h.features.proxy) ? 'proxy on' : ''}`);
+              `backend ${label} · yt-dlp via ${state.ytDlpMode || 'binary'}`
+              + ' · click to re-check');
             if (wasOffline) note(`Backend online at ${label}`);
           }
           if (probeTimer) { clearInterval(probeTimer); probeTimer = null; }

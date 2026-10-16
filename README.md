@@ -100,6 +100,7 @@ instance answers `429` instead of forking itself to death.
 | `VIEWER_HTTP_CACHE` | `1` | `ETag`/`Cache-Control` on API responses |
 | `VIEWER_PLAYLIST_PROBE` | `1` | also look for playlist/channel entries |
 | `VIEWER_AGE_LIMIT` | `18` | yt-dlp `--age-limit` |
+| `VIEWER_YTDLP_MODE` | `auto` | `auto` uses the `yt_dlp` Python module (no subprocess, no PATH dependency), `binary`/`module` force one. Both are checked, so this reports "missing" only if neither exists |
 | `YTDLP_COOKIES` | *(empty)* | path to `cookies.txt` |
 | `YTDLP_IMPERSONATE` | `chrome` if `curl_cffi` is present | yt-dlp `--impersonate` |
 | `YTDLP_ARGS` | *(empty)* | extra raw yt-dlp flags |
@@ -115,6 +116,17 @@ other formats still play. If `ffmpeg` is not on the `PATH`, `imageio-ffmpeg`
 
 Import the repo at <https://vercel.com/new>, framework preset **Other**, no
 build step. `/api/*` is handled by the Python functions in `api/`.
+
+`requirements.txt` is installed automatically — **no environment variables are
+needed**. yt-dlp runs as an imported Python module there, which needs neither
+`PATH` nor process spawning.
+
+Check what a deployment actually has with one request:
+
+```bash
+curl -s https://your-app.vercel.app/api/health
+# ytDlpAvailable, ytDlpMode (module|binary), ytDlpVersion, python, features, cache
+```
 
 > **Heads-up:** Vercel's function limits (payload, duration, cold starts) mean
 > YouTube and HLS usually work there, but other hosts may not. For full yt-dlp
