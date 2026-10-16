@@ -53,6 +53,15 @@
   const info = (url) => getJson('/api/info?url=' + encodeURIComponent(url), 90000);
   const health = () => getJson('/api/health', 2500);
 
+  /** Where is the yt-dlp backend? Priority: ?backend=…, window.VIEWER_BACKEND, saved choice. */
+  function configuredBase() {
+    let q = '';
+    try { q = new URLSearchParams(location.search).get('backend') || ''; } catch (_) {}
+    let stored = '';
+    try { stored = localStorage.getItem('viewer.backend') || ''; } catch (_) {}
+    return String(q || window.VIEWER_BACKEND || stored || '').trim().replace(/\/+$/, '');
+  }
+
   const mergeUrl = (pageUrl) => `${state.base}/api/merge?url=${encodeURIComponent(pageUrl)}`;
   const playUrl = (pageUrl, fmt) =>
     `${state.base}/api/play?url=${encodeURIComponent(pageUrl)}&fmt=${encodeURIComponent(fmt)}`;
@@ -68,7 +77,9 @@
     return {
       kind: 'direct', url: fmt.url,
       proxyUrl: playUrl(pageUrl, fmt.id) + '&proxy=1',
-      proxied: false,
+      // CDNs that demand extra headers (Referer/Cookie) will refuse the
+      // browser's plain request, so pipe those straight through the backend.
+      proxied: !!fmt.needsProxy,
     };
   }
 
@@ -186,7 +197,8 @@
     proxy.textContent = 'Force proxy';
     proxy.addEventListener('click', () => {
       const f = pick(data);
-      window.ViewerApply({ stream: { ...stream, proxied: true }, meta: buildMeta(data, f) });
+      const built = buildStream(f, data.url);
+      window.ViewerApply({ stream: { ...built, proxied: true }, meta: buildMeta(data, f) });
     });
     row.appendChild(proxy);
 
@@ -238,9 +250,10 @@
   async function boot() {
     document.body.appendChild(panel);
 
-    // Probe a few origins: same-origin first, then the usual localhost ports.
-    const candidates = ['', 'http://127.0.0.1:8080', 'http://localhost:8080'];
-    // de-duplicate (when the page is already served from one of them)
+    // Probe a few origins: a configured backend first, then same-origin,
+    // then the usual localhost ports. The first healthy one wins.
+    const configured = configuredBase();
+    const candidates = [configured, '', 'http://127.0.0.1:8080', 'http://localhost:8080'];
     const unique = [...new Set(candidates)];
     let lastErr = null;
     for (const base of unique) {
@@ -249,6 +262,7 @@
         if (h && h.ok) {
           state.base = base;
           state.online = true;
+          if (base) { try { localStorage.setItem('viewer.backend', base); } catch (_) {} }
           state.ytDlp = h.ytDlpVersion;
           if (h.ytDlpAvailable === false) {
             statusChip('yt-dlp missing', false);
