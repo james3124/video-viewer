@@ -330,6 +330,44 @@ def main() -> int:
         check("subs: vtt endpoint sends a cacheable response",
               st == 200 and body.startswith(b"WEBVTT")
               and "max-age" in hd.get("Cache-Control", ""), hd.get("Cache-Control", ""))
+    # 12 — codec inference (yt-dlp null vs "none") ---------------------------
+        null_codecs = server.browsable_formats({"formats": [
+            {"format_id": "1080p", "ext": "mp4", "protocol": "https",
+             "url": "https://cdn.test/a.mp4", "vcodec": None, "acodec": None,
+             "height": 1080},
+            {"format_id": "audio", "ext": "m4a", "protocol": "https",
+             "url": "https://cdn.test/a.m4a", "vcodec": "none", "acodec": "mp4a.40.2"},
+            {"format_id": "vonly", "ext": "mp4", "protocol": "https",
+             "url": "https://cdn.test/v.mp4", "vcodec": "h264", "acodec": "none",
+             "height": 720},
+            {"format_id": "hls", "ext": "mp4", "protocol": "m3u8_native",
+             "url": "https://cdn.test/m.m3u8", "vcodec": "avc1.640015",
+             "acodec": "mp4a.40.2", "height": 1080},
+        ]})
+        by_id = {f["id"]: f for f in null_codecs}
+        check("codecs: null + height is a muxed progressive file",
+              by_id["1080p"]["hasVideo"] and by_id["1080p"]["hasAudio"])
+        check("codecs: such a format is labelled as video",
+              "1080p" in by_id["1080p"]["label"] and "audio" not in by_id["1080p"]["label"])
+        check("codecs: vcodec 'none' is still audio-only",
+              not by_id["audio"]["hasVideo"] and by_id["audio"]["hasAudio"])
+        check("codecs: acodec 'none' is still video-only",
+              by_id["vonly"]["hasVideo"] and not by_id["vonly"]["hasAudio"])
+        check("codecs: default prefers the muxed file over HLS",
+              server.best_format(null_codecs)["id"] == "1080p")
+
+        # 13 — error messages are actionable -------------------------------
+        check("errors: wiki boilerplate stripped",
+              "http" not in server.with_hint(
+                  "Sign in to confirm you're not a bot. See https://example.test/faq "
+                  "for how to pass cookies."))
+        check("errors: bot check gets the IP hint",
+              "curl_cffi" in server.with_hint("Sign in to confirm you're not a bot"))
+        not_found = "[generic] x: Unable to download webpage: HTTP Error 404"
+        check("errors: 'webpage' does not trigger the age-gate hint",
+              server.with_hint(not_found) == not_found)   # no hint appended at all
+        check("errors: removed videos are not blamed on the platform",
+              "IP ranges" not in server.with_hint("This video has been removed"))
     finally:
         backend.shutdown()
         cdn.shutdown()

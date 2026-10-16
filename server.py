@@ -921,6 +921,7 @@ def _chunks(resp, prefix: bytes = b""):
 
 MERGE_ID = "__merge__"      # synthetic format id for the ffmpeg-stitched stream
 MUXED_OK_EXT = ("mp4", "m4v", "webm", "mov", "mkv")
+AUDIO_EXTS = {"m4a", "mp3", "aac", "opus", "ogg", "oga", "wav", "flac", "weba"}
 
 
 def merge_offer(fmts: list[dict], page_url: str) -> dict | None:
@@ -958,6 +959,16 @@ def _clean_headers(raw: dict | None) -> dict:
             if k and v and str(k).lower() in HEADER_WHITELIST}
 
 
+def _codec_state(value) -> str:
+    """'yes' | 'no' | 'unknown' — yt-dlp uses null for "did not report"."""
+    if value is None:
+        return "unknown"
+    text = str(value).strip().lower()
+    if text in ("", "none"):
+        return "no" if text else "unknown"
+    return "yes"
+
+
 def browsable_formats(info: dict) -> list[dict]:
     """Slim, browser-usable view over whatever yt-dlp reported."""
     fmts, seen = [], set()
@@ -968,8 +979,16 @@ def browsable_formats(info: dict) -> list[dict]:
             return
         proto = (f.get("protocol") or "").lower()
         ext = (f.get("ext") or "").lower()
-        has_video = (f.get("vcodec") or "none") not in ("none", "")
-        has_audio = (f.get("acodec") or "none") not in ("none", "")
+        sized = bool(f.get("height") or f.get("width"))
+        # Several extractors (Pornhub and others) report vcodec/acodec as null
+        # even for perfectly playable progressive files. null means "unknown";
+        # only the string "none" means the track is genuinely absent. Calling
+        # every codec-less format audio-only hid the best stream on the site and
+        # pushed the default onto HLS, which needs hls.js in the browser.
+        v_state, a_state = _codec_state(f.get("vcodec")), _codec_state(f.get("acodec"))
+        has_video = v_state == "yes" or (v_state == "unknown" and sized)
+        has_audio = (a_state == "yes"
+                     or (a_state == "unknown" and (sized or ext in AUDIO_EXTS)))
 
         if "m3u8" in proto or ext == "m3u8":
             kind, label = "hls", "HLS (adaptive stream)"
