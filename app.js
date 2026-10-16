@@ -110,6 +110,291 @@
 
   function setDocumentTitle(t) { document.title = t; }
 
+  /* ------------------------------------------------------------------ *
+   *  Player controls
+   *
+   *  Seek bar, skip buttons and a "jump to time" field, because keyboard
+   *  shortcuts alone are no way to land on 3:21 of a 15 minute video.
+   * ------------------------------------------------------------------ */
+  const ctl = {
+    root: document.getElementById('controls'),
+    wrap: document.getElementById('seekWrap'),
+    played: document.getElementById('seekPlayed'),
+    buffer: document.getElementById('seekBuffer'),
+    knob: document.getElementById('seekKnob'),
+    seek: document.getElementById('seek'),
+    tip: document.getElementById('seekTip'),
+    play: document.getElementById('ctlPlay'),
+    back: document.getElementById('ctlBack'),
+    fwd: document.getElementById('ctlFwd'),
+    time: document.getElementById('ctlTime'),
+    timeIn: document.getElementById('ctlTimeInput'),
+    mute: document.getElementById('ctlMute'),
+    vol: document.getElementById('ctlVolume'),
+    rate: document.getElementById('ctlRate'),
+    cc: document.getElementById('ctlCC'),
+    pip: document.getElementById('ctlPip'),
+    full: document.getElementById('ctlFull'),
+  };
+
+  const ICON = {
+    play: '<svg viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>',
+    pause: '<svg viewBox="0 0 24 24"><path d="M6 5h4v14H6zM14 5h4v14h-4z"/></svg>',
+    vol: '<svg viewBox="0 0 24 24"><path d="M3 9v6h4l5 5V4L7 9H3zm13.5 3a4.5 4.5 0 0 0-2.5-4v8a4.5 4.5 0 0 0 2.5-4z"/></svg>',
+    mute: '<svg viewBox="0 0 24 24"><path d="M3 9v6h4l5 5V4L7 9H3zm18.5 1.6L20 9.1l-2.6 2.6L14.8 9 13.4 10.4l2.6 2.6L13.4 15.6 15 17.2l2.6-2.6L20 17.2l1.4-1.4-2.6-2.6 2.7-2.6z"/></svg>',
+    full: '<svg viewBox="0 0 24 24"><path d="M4 9V4h5v2H6v3H4zm11-5h5v5h-2V6h-3V4zM4 15h2v3h3v2H4v-5zm14 0h2v5h-5v-2h3v-3z"/></svg>',
+    unfull: '<svg viewBox="0 0 24 24"><path d="M9 4v3H6v2H4V4h5zm6 0h5v5h-2V6h-3V4zM4 15h2v3h3v2H4v-5zm14 0h2v5h-5v-2h3v-3z"/></svg>',
+  };
+
+  const VOL_KEY = 'viewer.volume';
+  const SKIP = 10;
+  let scrubbing = false;
+  let ctlTimer = null;
+
+  const clock = (s) => {
+    if (!isFinite(s) || s < 0) s = 0;
+    const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = Math.floor(s % 60);
+    return (h ? h + ':' + String(m).padStart(2, '0') : String(m)) + ':' + String(sec).padStart(2, '0');
+  };
+
+  const duration = () => (isFinite(video.duration) && video.duration > 0 ? video.duration : 0);
+
+  function bufferedEnd() {
+    try {
+      const b = video.buffered;
+      for (let i = 0; i < b.length; i++) {
+        if (b.start(i) <= video.currentTime + 0.25) return b.end(i);
+      }
+      return b.length ? b.end(b.length - 1) : 0;
+    } catch (_) { return 0; }
+  }
+
+  function seekTo(seconds, keepState = true) {
+    const total = duration();
+    if (!total) return;
+    const target = Math.max(0, Math.min(total - 0.15, seconds));
+    try { video.currentTime = target; } catch (_) { /* not seekable yet */ }
+    syncControls();
+    if (keepState && video.paused) status('Paused');
+  }
+
+  /** "3:21", "1:54", "1:02:03" or "194" → seconds. */
+  function parseClock(text) {
+    const raw = String(text || '').trim().replace(',', '.');
+    if (!raw) return null;
+    if (/^\d+(\.\d+)?$/.test(raw)) return parseFloat(raw);
+    if (!/^\d{1,2}(:\d{1,2}){1,2}(\.\d+)?$/.test(raw)) return null;
+    const parts = raw.split(':').map(parseFloat);
+    if (parts.some((n) => !isFinite(n))) return null;
+    return parts.reduce((acc, n) => acc * 60 + n, 0);
+  }
+
+  function syncControls() {
+    if (!ctl.root || ctl.root.hidden) return;
+    const total = duration();
+    const now = video.currentTime || 0;
+    const editing = !ctl.timeIn.hidden;
+
+    if (!scrubbing && !editing) {
+      if (total) ctl.seek.value = String(now);
+      const pct = total ? Math.min(100, (now / total) * 100) : 0;
+      ctl.played.style.width = pct + '%';
+      ctl.knob.style.left = pct + '%';
+      ctl.time.textContent = clock(now) + ' / ' + (total ? clock(total) : '–:––');
+    }
+    ctl.buffer.style.width = (total ? Math.min(100, (bufferedEnd() / total) * 100) : 0) + '%';
+    ctl.seek.disabled = !total;
+    if (total) ctl.seek.max = String(total);
+
+    ctl.play.innerHTML = video.paused ? ICON.play : ICON.pause;
+    ctl.play.classList.toggle('on', !video.paused);
+    ctl.mute.innerHTML = (video.muted || !video.volume) ? ICON.mute : ICON.vol;
+    ctl.mute.classList.toggle('on', video.muted);
+    ctl.vol.value = String(video.muted ? 0 : video.volume);
+    if (ctl.rate.value !== String(video.playbackRate)) {
+      ctl.rate.value = String([...ctl.rate.options].some((o) => +o.value === video.playbackRate)
+        ? video.playbackRate : 1);
+    }
+    const tracks = video.textTracks.length;
+    ctl.cc.disabled = !tracks;
+    ctl.cc.classList.toggle('on', captionsOn && tracks > 0);
+    ctl.pip.disabled = !document.pictureInPictureEnabled;
+    ctl.full.innerHTML = (document.fullscreenElement || document.webkitFullscreenElement)
+      ? ICON.unfull : ICON.full;
+  }
+
+  function wakeControls() {
+    if (!ctl.root || ctl.root.hidden) return;
+    ctl.root.classList.remove('idle');
+    clearTimeout(ctlTimer);
+    if (!video.paused) ctlTimer = setTimeout(() => ctl.root.classList.add('idle'), 2600);
+  }
+
+  function showControls() {
+    if (!ctl.root) return;
+    ctl.root.hidden = false;
+    ctl.play.innerHTML = ICON.play;
+    ctl.mute.innerHTML = ICON.vol;
+    ctl.full.innerHTML = ICON.full;
+    syncControls();
+    wakeControls();
+  }
+
+  function hideControls() {
+    if (!ctl.root) return;
+    clearTimeout(ctlTimer);
+    ctl.root.hidden = true;
+    ctl.root.classList.remove('idle');
+  }
+
+  /** Seek from a pointer event on the bar (click or drag). */
+  function seekFromPointer(ev) {
+    const total = duration();
+    if (!total) return;
+    const rect = ctl.seek.getBoundingClientRect();
+    const ratio = Math.max(0, Math.min(1, (ev.clientX - rect.left) / rect.width));
+    seekTo(ratio * total);
+  }
+
+  function previewTime(ev) {
+    const total = duration();
+    if (!total) return;
+    const rect = ctl.seek.getBoundingClientRect();
+    const ratio = Math.max(0, Math.min(1, (ev.clientX - rect.left) / rect.width));
+    ctl.tip.hidden = false;
+    ctl.tip.textContent = clock(ratio * total);
+    ctl.tip.style.left = Math.round(rect.width * ratio) + 'px';
+  }
+
+  function openTimeField() {
+    const total = duration();
+    if (!total) return;
+    ctl.timeIn.value = clock(video.currentTime || 0);
+    ctl.timeIn.hidden = false;
+    ctl.time.hidden = true;
+    ctl.timeIn.focus();
+    ctl.timeIn.select();
+  }
+
+  function closeTimeField(commit) {
+    if (ctl.timeIn.hidden) return;
+    const text = ctl.timeIn.value;
+    ctl.timeIn.hidden = true;
+    ctl.time.hidden = false;
+    if (commit) {
+      const seconds = parseClock(text);
+      if (seconds === null) error(`"${text}" is not a time — try 3:21, 1:54 or 194`);
+      else { clearError(); seekTo(seconds); }
+    }
+    ctl.time.focus();
+    syncControls();
+  }
+
+  function wireControls() {
+    if (!ctl.root) return;
+
+    ctl.play.addEventListener('click', () => togglePlay());
+    ctl.back.addEventListener('click', () => { seekTo(video.currentTime - SKIP); wakeControls(); });
+    ctl.fwd.addEventListener('click', () => { seekTo(video.currentTime + SKIP); wakeControls(); });
+    ctl.time.addEventListener('click', openTimeField);
+    ctl.timeIn.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') { e.preventDefault(); closeTimeField(true); }
+      else if (e.key === 'Escape') { e.preventDefault(); closeTimeField(false); }
+    });
+    ctl.timeIn.addEventListener('blur', () => closeTimeField(true));
+
+    // Seek bar: pointer drag + keyboard, with live readout while scrubbing.
+    ctl.seek.addEventListener('pointerdown', (e) => {
+      scrubbing = true;
+      ctl.wrap.classList.add('live');
+      ctl.seek.setPointerCapture(e.pointerId);
+      seekFromPointer(e);
+    });
+    ctl.seek.addEventListener('input', () => {
+      scrubbing = true;
+      const total = duration();
+      const now = +ctl.seek.value;
+      if (total) {
+        ctl.played.style.width = Math.min(100, (now / total) * 100) + '%';
+        ctl.knob.style.left = Math.min(100, (now / total) * 100) + '%';
+        ctl.time.textContent = clock(now) + ' / ' + clock(total);
+      }
+    });
+    const endScrub = () => {
+      if (!scrubbing) return;
+      scrubbing = false;
+      ctl.wrap.classList.remove('live');
+      seekTo(+ctl.seek.value);
+    };
+    ctl.seek.addEventListener('change', endScrub);
+    ctl.seek.addEventListener('pointerup', endScrub);
+    ctl.seek.addEventListener('pointercancel', endScrub);
+    ctl.seek.addEventListener('keydown', (e) => {
+      const jump = { ArrowLeft: -5, ArrowRight: 5, ArrowDown: -10, ArrowUp: 10 }[e.key];
+      if (jump === undefined) return;
+      e.preventDefault();
+      seekTo(video.currentTime + jump);
+    });
+    ctl.wrap.addEventListener('mousemove', previewTime);
+    ctl.wrap.addEventListener('mouseleave', () => { ctl.tip.hidden = true; });
+    ctl.wrap.addEventListener('pointerdown', (e) => {
+      if (e.target === ctl.seek) return;      // the range handles its own drags
+      seekFromPointer(e);
+    });
+
+    ctl.mute.addEventListener('click', () => { video.muted = !video.muted; wakeControls(); });
+    ctl.vol.addEventListener('input', () => {
+      video.volume = +ctl.vol.value;
+      video.muted = video.volume === 0;
+      try { localStorage.setItem(VOL_KEY, String(video.volume)); } catch (_) {}
+      wakeControls();
+    });
+    ctl.rate.addEventListener('change', () => {
+      video.playbackRate = +ctl.rate.value;
+      status('Speed ' + video.playbackRate + '×');
+      wakeControls();
+    });
+    ctl.cc.addEventListener('click', () => {
+      captionsOn = !captionsOn;
+      applyCaptionState();
+      wakeControls();
+    });
+    ctl.pip.addEventListener('click', () => pipBtn.click());
+    ctl.full.addEventListener('click', toggleFullscreen);
+
+    // Keep the bar in step with the element.
+    const events = ['timeupdate', 'progress', 'durationchange', 'loadedmetadata',
+                    'play', 'playing', 'pause', 'seeked', 'seeking', 'volumechange',
+                    'ratechange', 'waiting', 'ended', 'emptied'];
+    events.forEach((name) => video.addEventListener(name, () => {
+      if (name === 'play' || name === 'playing' || name === 'pause' || name === 'ended') {
+        wakeControls();
+      }
+      syncControls();
+    }));
+    document.addEventListener('fullscreenchange', syncControls);
+    document.addEventListener('webkitfullscreenchange', syncControls);
+
+    // Any interaction brings the bar back.
+    ['mousemove', 'touchstart', 'pointerdown', 'keydown'].forEach((name) =>
+      stage.addEventListener(name, wakeControls, { passive: true }));
+    ctl.root.addEventListener('pointerenter', () => clearTimeout(ctlTimer));
+    ctl.root.addEventListener('pointerleave', wakeControls);
+
+    // Restore the last volume.
+    try {
+      const saved = parseFloat(localStorage.getItem(VOL_KEY) || '');
+      if (isFinite(saved)) { video.volume = Math.max(0, Math.min(1, saved)); video.muted = !saved; }
+    } catch (_) { /* private mode */ }
+  }
+
+  function togglePlay() {
+    if (!video.currentSrc && !video.src) return;
+    if (video.paused) video.play().catch(() => status('Paused — press ▶ to start'));
+    else video.pause();
+    wakeControls();
+  }
+
   function validateUrl(raw) {
     const u = String(raw || '').trim();
     if (!u) return null;
@@ -229,6 +514,7 @@
     embed.hidden = false;
     embed.src = embedUrlOf(src);
     currentKind = 'embed';
+    hideControls();                 // the iframe brings its own controls
     setDocumentTitle('Embed — ' + prettyName(src));
     clearError();
     status('Embedded player · start server.py for the direct yt-dlp stream');
@@ -281,6 +567,7 @@
     video.hidden = false;
     embed.hidden = true;
     embed.removeAttribute('src');
+    showControls();
   }
 
   function addTrack(url, label) {
@@ -499,6 +786,7 @@
     if (e.metaKey || e.ctrlKey || e.altKey) return;
 
     const k = e.key;
+    wakeControls();
     if (currentKind === 'embed') {
       if (k === 'f' || k === 'F') toggleFullscreen();
       if (k === 'o' || k === 'O') { urlInput.focus(); urlInput.select(); }
@@ -508,7 +796,7 @@
     switch (k) {
       case ' ': case 'k': case 'K':
         e.preventDefault();
-        if (video.paused) video.play().catch(() => {}); else video.pause();
+        togglePlay();
         return;
       case 'ArrowRight': seekBy(5); return;
       case 'ArrowLeft':  seekBy(-5); return;
@@ -542,7 +830,9 @@
   function seekBy(seconds) {
     if (!video.seekable.length && !isFinite(video.duration)) return;
     const end = video.duration || video.seekable.end(video.seekable.length - 1);
-    video.currentTime = Math.max(0, Math.min(end, video.currentTime + seconds));
+    seekTo(video.currentTime + seconds);
+    status(Math.round(video.currentTime) + ' / ' + (isFinite(end) ? Math.round(end) : '?') + 's');
+    wakeControls();
   }
 
   let flashTimer;
@@ -557,6 +847,9 @@
    *  Boot: ?url=… / #url=…, with or without backend
    * ------------------------------------------------------------------ */
   function boot() {
+    wireControls();
+    hideControls();
+
     const urls = [];
     new URLSearchParams(location.search).getAll('url')
       .concat(location.hash.slice(1) ? [location.hash.slice(1)] : [])

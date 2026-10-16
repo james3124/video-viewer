@@ -215,6 +215,167 @@ button:hover,.file-btn:hover{background:#232c37;border-color:#3a4553}
 }
 .yt-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 
+/* ---------- player controls ---------- */
+#controls{
+  position:absolute;
+  left:0;
+  right:0;
+  bottom:0;
+  z-index:4;
+  display:flex;
+  flex-direction:column;
+  gap:2px;
+  padding:26px 12px 10px;
+  background:linear-gradient(transparent,rgba(0,0,0,.72) 38%,rgba(0,0,0,.9));
+  transition:opacity .18s ease;
+  user-select:none;
+  -webkit-user-select:none;
+  touch-action:none;
+}
+#controls[hidden]{display:none!important}
+#controls.idle{opacity:0;pointer-events:none}
+
+/* --- seek bar --- */
+#seekWrap{
+  position:relative;
+  height:18px;
+  margin:0 2px 4px;
+  cursor:pointer;
+}
+#seekTrack{
+  position:absolute;
+  left:0;right:0;top:8px;
+  height:4px;
+  border-radius:99px;
+  background:rgba(255,255,255,.22);
+  overflow:hidden;
+  transition:height .12s ease,top .12s ease;
+}
+#seekWrap:hover #seekTrack,#seekWrap:focus-within #seekTrack{height:7px;top:6px}
+#seekBuffer{position:absolute;inset:0;width:0;background:rgba(255,255,255,.3)}
+#seekPlayed{
+  position:absolute;left:0;top:0;bottom:0;width:0;
+  background:linear-gradient(90deg,#2f7fd6,var(--accent));
+}
+#seekKnob{
+  position:absolute;
+  top:50%;
+  left:0;
+  width:13px;height:13px;
+  margin:-6.5px 0 0 -6.5px;
+  border-radius:50%;
+  background:#fff;
+  box-shadow:0 1px 4px rgba(0,0,0,.6);
+  opacity:0;
+  transition:opacity .12s ease;
+  pointer-events:none;
+}
+#seekWrap:hover #seekKnob,#seekWrap:focus-within #seekKnob{opacity:1}
+/* the real input sits on top, transparent: gives us touch + keyboard + a11y */
+#seek{
+  position:absolute;
+  inset:0;
+  width:100%;
+  height:100%;
+  margin:0;
+  opacity:0;
+  cursor:pointer;
+  background:transparent;
+  -webkit-appearance:none;
+  appearance:none;
+}
+#seek::-webkit-slider-thumb{-webkit-appearance:none;width:18px;height:18px}
+#seek::-moz-range-thumb{width:18px;height:18px;border:0;background:transparent}
+#seekWrap.live{--seek-live:1}
+#seekWrap.live #seekTrack{height:7px;top:6px}
+#seekTip{
+  position:absolute;
+  bottom:22px;
+  transform:translateX(-50%);
+  padding:2px 7px;
+  border-radius:6px;
+  background:rgba(10,14,20,.95);
+  border:1px solid var(--border);
+  font-size:11.5px;
+  font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
+  white-space:nowrap;
+  pointer-events:none;
+}
+#seekTip[hidden]{display:none}
+
+/* --- button row --- */
+#ctlRow{display:flex;align-items:center;gap:5px;flex-wrap:wrap}
+.ctl{
+  display:inline-flex;
+  align-items:center;
+  justify-content:center;
+  gap:4px;
+  min-width:34px;
+  height:30px;
+  padding:0 8px;
+  background:transparent;
+  border:1px solid transparent;
+  border-radius:8px;
+  color:var(--text);
+  font-size:12px;
+  font-weight:650;
+  cursor:pointer;
+}
+.ctl:hover:not(:disabled){background:rgba(255,255,255,.14)}
+.ctl:disabled{opacity:.35;cursor:default}
+.ctl svg{width:18px;height:18px;fill:currentColor;display:block}
+.ctl.on{color:var(--accent);background:rgba(74,158,255,.16)}
+.ctl-clock{
+  font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
+  font-size:12.5px;
+  font-weight:500;
+  letter-spacing:.2px;
+  padding:0 6px;
+}
+.ctl-sep{width:1px;height:18px;background:rgba(255,255,255,.18);margin:0 3px}
+.ctl-spacer{flex:1 1 auto}
+.ctl-select{
+  padding:0 6px;
+  background:rgba(255,255,255,.1);
+  border:1px solid transparent;
+  border-radius:8px;
+  color:var(--text);
+  font:inherit;
+  font-size:12px;
+  font-weight:650;
+  cursor:pointer;
+}
+.ctl-select:hover{background:rgba(255,255,255,.18)}
+.ctl-select option{background:#161b22;color:var(--text)}
+#ctlVolume{
+  width:74px;
+  accent-color:var(--accent);
+  background:transparent;
+  cursor:pointer;
+}
+#ctlTimeInput{
+  width:104px;
+  height:30px;
+  padding:0 8px;
+  background:rgba(10,14,20,.95);
+  border:1px solid var(--accent);
+  border-radius:8px;
+  color:var(--text);
+  font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
+  font-size:12.5px;
+  text-align:center;
+}
+#ctlTimeInput[hidden]{display:none!important}
+
+/* Phones: keep the essentials, drop the fiddly bits. */
+@media (max-width:640px){
+  #controls{padding:22px 8px 8px}
+  #ctlVolume{display:none}
+  .ctl-select{font-size:11.5px;padding:0 4px}
+  .ctl-clock{font-size:11.5px}
+  #ctlPip{display:none}
+}
+
 /* ---------- backend chip ---------- */
 #backendChip{
   padding:4px 9px;border-radius:99px;font-size:11.5px;font-weight:600;white-space:nowrap;

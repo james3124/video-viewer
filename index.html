@@ -66,6 +66,48 @@
   <!-- iframe player (YouTube / Vimeo / embeds) -->
   <iframe id="embed" hidden allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; fullscreen" allowfullscreen referrerpolicy="strict-origin-when-cross-origin"></iframe>
 
+  <!-- player controls -->
+  <div id="controls" hidden>
+    <div id="seekWrap" title="Click or drag to seek">
+      <div id="seekTrack"><div id="seekBuffer"></div><div id="seekPlayed"></div></div>
+      <div id="seekKnob"></div>
+      <input type="range" id="seek" min="0" max="100" step="1" value="0" aria-label="Seek">
+      <div id="seekTip" hidden></div>
+    </div>
+
+    <div id="ctlRow">
+      <button id="ctlPlay" class="ctl" title="Play / pause  (Space)"></button>
+      <button id="ctlBack" class="ctl" title="Back 10 s  (← / J)">−10</button>
+      <button id="ctlFwd" class="ctl" title="Forward 10 s  (→ / L)">+10</button>
+      <button id="ctlTime" class="ctl ctl-clock" title="Click, then type a time to jump there — 3:21, 1:54, 1:02:03 or 194">0:00 / 0:00</button>
+      <input id="ctlTimeInput" type="text" inputmode="numeric" autocomplete="off" spellcheck="false" hidden>
+
+      <span class="ctl-sep"></span>
+
+      <button id="ctlMute" class="ctl" title="Mute  (M)"></button>
+      <input id="ctlVolume" type="range" min="0" max="1" step="0.01" value="1" aria-label="Volume" title="Volume">
+
+      <select id="ctlRate" class="ctl ctl-select" title="Playback speed  (&gt; / &lt;)" aria-label="Playback speed">
+        <option value="0.25">0.25×</option>
+        <option value="0.5">0.5×</option>
+        <option value="0.75">0.75×</option>
+        <option value="1" selected>1×</option>
+        <option value="1.25">1.25×</option>
+        <option value="1.5">1.5×</option>
+        <option value="1.75">1.75×</option>
+        <option value="2">2×</option>
+        <option value="3">3×</option>
+        <option value="4">4×</option>
+      </select>
+
+      <span class="ctl-spacer"></span>
+
+      <button id="ctlCC" class="ctl" title="Subtitles  (C)">CC</button>
+      <button id="ctlPip" class="ctl" title="Picture-in-picture  (P)">PiP</button>
+      <button id="ctlFull" class="ctl" title="Fullscreen  (F)"></button>
+    </div>
+  </div>
+
   <div id="errors" hidden></div>
 </main>
 
@@ -87,6 +129,7 @@
     <li>Click the video to pause/play · double&#8209;click for fullscreen</li>
   </ul>
   <p class="muted">Streams blocked by CORS, or whose CDN demands a Referer/Cookie, are re-fetched by the backend — pick another quality or hit <em>Force proxy</em> if playback stalls. Playlists and channels show a clickable entry list.</p>
+  <p class="muted">Drag the bar to any point, hit <kbd>−10</kbd>/<kbd>+10</kbd>, or <strong>click the time</strong> and type <kbd>3:21</kbd> to jump straight there.</p>
   <button id="closeHelp">Close</button>
 </dialog>
 

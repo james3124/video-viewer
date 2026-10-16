@@ -92,6 +92,30 @@ Failures come with the one action that usually fixes them:
 Hosts behind Cloudflare frequently block Vercel/Render IP ranges outright — if
 `tools/site_check.py` fails there but succeeds on a VPS, that is the reason.
 
+## Player controls
+
+The video element has no native `controls`; the page draws its own bar:
+
+| Control | What it does |
+| --- | --- |
+| Seek bar | click or drag anywhere to jump; shows buffered range, hover tooltip, auto-hides after 2.6 s of playback |
+| **Click the time** | opens a field — type `3:21`, `1:54`, `1:02:03` or `194` and press <kbd>Enter</kbd> to jump exactly there (garbage is refused with a message) |
+| `−10` / `+10` | skip back/forward ten seconds (also <kbd>←</kbd><kbd>→</kbd> and <kbd>J</kbd><kbd>L</kbd>) |
+| Volume + mute | remembered in `localStorage` per browser |
+| Speed | 0.25×–4×, in sync with the <kbd>&lt;</kbd>/<kbd>&gt;</kbd> shortcuts |
+| `CC` | subtitles, disabled automatically when there are no tracks |
+| `PiP`, fullscreen | picture-in-picture and fullscreen; the bar follows into fullscreen because it lives inside the stage |
+
+Everything is keyboard reachable: the seek bar is a real `<input type="range">`
+(transparent, on top of the drawn bar), so <kbd>←</kbd>/<kbd>→</kbd> move 5 s and
+<kbd>↑</kbd>/<kbd>↓</kbd> 10 s when it has focus.
+
+Run the DOM test after touching `app.js` or the markup:
+
+```bash
+npm install jsdom && node tools/ui_check.js     # 26 checks
+```
+
 ## Caching
 
 | Layer | Where | Default |
