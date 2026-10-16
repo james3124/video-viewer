@@ -58,11 +58,39 @@ their CDN demands a `Referer`, a session `Cookie` or an exact UA:
 Extra bits that help on hostile networks:
 
 - `--impersonate chrome` (automatic when `curl_cffi` is installed) gets past
-  Cloudflare/DataDome checks that block datacenter IPs.
+  Cloudflare/DataDome checks that block datacenter IPs. It is retried without
+  impersonation if a host rejects it, then switched off if it keeps failing.
 - `--age-limit 18` handles age-gated YouTube; `--cookies cookies.txt` unlocks
   members-only and region-locked hosts.
 - Retries, socket timeouts and a shared yt-dlp cache directory are always on.
 - Playlists, channels and profile pages are detected and listed in the UI.
+
+### When a host still will not play
+
+Whether a host works is a property of the **server's IP**, not of the page, so
+run the probe on the machine that runs `server.py`:
+
+```bash
+python3 tools/site_check.py                     # edge + extraction per host
+python3 tools/site_check.py https://host/video  # just that one
+```
+
+It prints, per host: whether the edge answers or throws a bot challenge, how many
+formats yt-dlp found, how many of those need the proxy, which headers they need,
+and the error otherwise — structure only, never titles or media.
+
+Failures come with the one action that usually fixes them:
+
+| Message contains | What it means | Fix |
+| --- | --- | --- |
+| `bot check`, `cloudflare`, `datadome`, `captcha` | the host is fingerprinting the client | `curl_cffi` installed (`--impersonate chrome`), cookies, or a non-datacenter IP |
+| `login`, `premium`, `members`, `subscribe` | account wall | export `cookies.txt` from a logged-in browser → `YTDLP_COOKIES` |
+| `age`, `consent`, `verify` | age/consent gate | cookies from a browser that passed the gate |
+| `in your country`, `region`, `geo` | region lock | `YTDLP_ARGS='--proxy …'` or cookies from the right region |
+| `private`, `removed`, `unavailable` | the video itself is gone | nothing a server can do |
+
+Hosts behind Cloudflare frequently block Vercel/Render IP ranges outright — if
+`tools/site_check.py` fails there but succeeds on a VPS, that is the reason.
 
 ## Caching
 
@@ -102,7 +130,8 @@ instance answers `429` instead of forking itself to death.
 | `VIEWER_AGE_LIMIT` | `18` | yt-dlp `--age-limit` |
 | `VIEWER_YTDLP_MODE` | `auto` | `auto` uses the `yt_dlp` Python module (no subprocess, no PATH dependency), `binary`/`module` force one. Both are checked, so this reports "missing" only if neither exists |
 | `YTDLP_COOKIES` | *(empty)* | path to `cookies.txt` |
-| `YTDLP_IMPERSONATE` | `chrome` if `curl_cffi` is present | yt-dlp `--impersonate` |
+| `YTDLP_IMPERSONATE` | `chrome` if `curl_cffi` is present, `off` to disable | yt-dlp `--impersonate` |
+| `VIEWER_IMPERSONATE_FAILURES` | `3` | failures in a row before impersonation is switched off |
 | `YTDLP_ARGS` | *(empty)* | extra raw yt-dlp flags |
 | `YTDLP_IPV4` | `0` | `--force-ipv4` (some hosts break on IPv6) |
 

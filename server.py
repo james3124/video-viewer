@@ -123,8 +123,30 @@ YTDLP_DIR = os.path.join(CACHE_DIR, "yt-dlp")
 
 HAS_CURL_CFFI = _has_module("curl_cffi")
 IMPERSONATE = env("YTDLP_IMPERSONATE", default=("chrome" if HAS_CURL_CFFI else ""))
+if IMPERSONATE.lower() in ("off", "0", "no", "false", "none", "disable"):
+    IMPERSONATE = ""      # an explicit "off" must beat the auto-default
 if IMPERSONATE and not HAS_CURL_CFFI:
     IMPERSONATE = ""      # without curl_cffi yt-dlp would just fail on --impersonate
+
+# Browser impersonation: what gets past Cloudflare/DataDome on many hosts. If it
+# turns out to be unusable we stop paying for a failed retry on every extraction.
+IMPERSONATE_FAILURES = {"n": 0}
+MAX_IMPERSONATE_FAILURES = env_int("VIEWER_IMPERSONATE_FAILURES", default=3)
+
+
+def impersonate_ready() -> bool:
+    """True while browser impersonation is worth attempting."""
+    return bool(IMPERSONATE) and IMPERSONATE_FAILURES["n"] < MAX_IMPERSONATE_FAILURES
+
+
+def impersonate_target(profile: str):
+    """`--impersonate` for the API, which wants an ImpersonateTarget, not a string."""
+    try:
+        from yt_dlp.networking.impersonate import ImpersonateTarget
+        client, _, version = str(profile).partition(":")
+        return ImpersonateTarget(client or None, version or None)
+    except Exception:  # noqa: BLE001
+        return profile
 
 notice: list[str] = []
 
@@ -277,14 +299,13 @@ def ytdlp_mode() -> str:
     return "binary" if YT_DLP else "none"
 
 
-_BASE_ARGS: list[str] | None = None
+_BASE_ARGS: dict[bool, list[str]] = {}
 
 
-def base_ytdlp_args() -> list[str]:
+def base_ytdlp_args(impersonate: bool = True) -> list[str]:
     """Flags that make extraction survive hostile networks. Applies to every run."""
-    global _BASE_ARGS
-    if _BASE_ARGS is not None:
-        return _BASE_ARGS
+    if impersonate in _BASE_ARGS:
+        return _BASE_ARGS[impersonate]
     args = [
         # --no-warnings is deliberately *not* passed: stderr is only read when
         # something failed, and "ERROR: This video is unavailable" is a far
@@ -299,7 +320,7 @@ def base_ytdlp_args() -> list[str]:
     ]
     if AGE_LIMIT:
         args += ["--age-limit", str(AGE_LIMIT)]
-    if IMPERSONATE:
+    if IMPERSONATE and impersonate and impersonate_ready():
         args += ["--impersonate", IMPERSONATE]
     if env_bool("YTDLP_IPV4"):
         args += ["--force-ipv4"]
@@ -309,26 +330,28 @@ def base_ytdlp_args() -> list[str]:
             note(f"using cookies from {COOKIES}")
         else:
             note(f"YTDLP_COOKIES={COOKIES} does not exist — ignoring")
-    _BASE_ARGS = args
+    _BASE_ARGS[impersonate] = args
     return args
 
 
-def ytdlp_cmd(args: list[str]) -> list[str]:
+def ytdlp_cmd(args: list[str], impersonate: bool = True) -> list[str]:
     """Command line for the subprocess paths (merge, subtitle conversion).
 
     Prefers the console script, falls back to `python -m yt_dlp` when PATH does
     not have it (some sandboxes) — both work.
     """
+    base = base_ytdlp_args(impersonate)
     if YT_DLP:
-        return [YT_DLP, *base_ytdlp_args(), *EXTRA_ARGS, *args]
+        return [YT_DLP, *base, *EXTRA_ARGS, *args]
     if ytdlp_module() is not None:
-        return [sys.executable, "-m", "yt_dlp", *base_ytdlp_args(), *EXTRA_ARGS, *args]
+        return [sys.executable, "-m", "yt_dlp", *base, *EXTRA_ARGS, *args]
     raise RuntimeError("yt-dlp is not installed on this server")
 
 
-def run_yt_dlp(args: list[str], timeout: int | None = None) -> tuple[int, str, str]:
+def run_yt_dlp(args: list[str], timeout: int | None = None,
+               impersonate: bool = True) -> tuple[int, str, str]:
     """Run yt-dlp from an arg list (no shell → no command injection)."""
-    proc = subprocess.run(ytdlp_cmd(args), capture_output=True, text=True,
+    proc = subprocess.run(ytdlp_cmd(args, impersonate), capture_output=True, text=True,
                           timeout=timeout or YTDLP_TIMEOUT)
     return proc.returncode, proc.stdout, proc.stderr
 
@@ -497,7 +520,7 @@ def _extra_module_opts() -> dict:
     return out
 
 
-def _module_opts(playlist: bool = False) -> dict:
+def _module_opts(playlist: bool = False, impersonate: bool = True) -> dict:
     """YoutubeDL options mirroring base_ytdlp_args()."""
     opts = {
         "quiet": True,
@@ -511,7 +534,8 @@ def _module_opts(playlist: bool = False) -> dict:
         "file_access_retries": 3,
         "cachedir": YTDLP_DIR,
         "age_limit": AGE_LIMIT or None,
-        "impersonate": IMPERSONATE or None,
+        "impersonate": (impersonate_target(IMPERSONATE)
+                        if (impersonate and impersonate_ready()) else None),
         "noplaylist": not playlist,
         "extract_flat": "in_playlist" if playlist else False,
     }
@@ -521,7 +545,7 @@ def _module_opts(playlist: bool = False) -> dict:
     return {k: v for k, v in opts.items() if v is not None}
 
 
-def _module_extract(url: str, playlist: bool = False) -> dict:
+def _module_extract(url: str, playlist: bool = False, impersonate: bool = True) -> dict:
     """Extract in-process — no subprocess, no PATH, works in serverless sandboxes."""
     mod = ytdlp_module()
     plans: list[dict] = []
@@ -534,7 +558,7 @@ def _module_extract(url: str, playlist: bool = False) -> dict:
     detail = ""
     for extra in plans:
         log = _QuietLog()
-        opts = _module_opts()
+        opts = _module_opts(impersonate=impersonate)
         opts.update(extra)
         opts["logger"] = log
         try:
@@ -556,13 +580,76 @@ def _module_extract(url: str, playlist: bool = False) -> dict:
 
 
 def _extract(url: str, playlist: bool = False) -> dict:
-    """`yt-dlp -J` equivalent, with a short ladder of fallbacks."""
-    if ytdlp_mode() == "module":
-        return _module_extract(url, playlist=playlist)
-    return _subprocess_extract(url, playlist=playlist)
+    """`yt-dlp -J` equivalent, with a short ladder of fallbacks.
+
+    Browser impersonation is tried first; if it fails the whole ladder runs once
+    more without it (some hosts refuse the impersonated request but serve the
+    plain one). After a few failures impersonation is switched off for good, so a
+    broken profile costs one retry, not every request.
+    """
+    worker = _module_extract if ytdlp_mode() == "module" else _subprocess_extract
+    passes = (True, False) if impersonate_ready() else (False,)
+    last: Exception | None = None
+    for impersonate in passes:
+        try:
+            info = worker(url, playlist, impersonate)
+        except Exception as exc:  # noqa: BLE001
+            last = exc
+            if not impersonate:
+                continue
+            IMPERSONATE_FAILURES["n"] += 1
+            note(f"impersonation failed for {_host_of(url)} — retrying without it")
+            if IMPERSONATE_FAILURES["n"] >= MAX_IMPERSONATE_FAILURES:
+                note(f"impersonation disabled after {IMPERSONATE_FAILURES['n']} failures; "
+                     f"bot-protected hosts may not work until it is fixed")
+            continue
+        IMPERSONATE_FAILURES["n"] = 0
+        return info
+    if last is None:
+        raise RuntimeError("yt-dlp failed")
+    raise RuntimeError(with_hint(friendly(last)))
 
 
-def _subprocess_extract(url: str, playlist: bool = False) -> dict:
+def _host_of(url: str) -> str:
+    try:
+        return urllib.parse.urlparse(url).hostname or url[:40]
+    except Exception:  # noqa: BLE001
+        return url[:40]
+
+
+# Bot checks, logins and age gates are the three things that make a host
+# "work on my laptop but not here". Say which one it is instead of leaving the
+# user with a bare yt-dlp error.
+_HINTS = (
+    (("sign in to confirm", "cloudflare", "cf-mitigated", "datadome", "captcha",
+      "are you a robot", "bot check", "access denied", "forbidden"),
+     "this host is behind a bot check — it needs curl_cffi (--impersonate chrome) "
+     "and/or a non-datacenter IP; Vercel/Render ranges are often blocked outright"),
+    (("login", "log in", "sign in", "premium", "member", "subscribe", "paid", "ppv"),
+     "this host wants an account — export cookies from a logged-in browser and set "
+     "YTDLP_COOKIES=/path/cookies.txt"),
+    (("age", "verify", "consent", "parental", "are you over"),
+     "this host shows an age/consent gate — cookies from a browser that passed it "
+     "fix it (YTDLP_COOKIES)"),
+    (("geo", "in your country", "not available in", "region", "blocked in"),
+     "this host is region-locked — use a proxy via YTDLP_ARGS='--proxy …' or cookies "
+     "from the right region"),
+    (("private", "removed", "deleted", "terminated", "unavailable"),
+     "this video is private, removed or region-locked — nothing a server can do"),
+)
+
+
+def with_hint(reason: str) -> str:
+    """Append the one action that usually fixes this failure."""
+    low = (reason or "").lower()
+    for needles, hint in _HINTS:
+        if any(n in low for n in needles):
+            return f"{reason} — {hint}"
+    return reason
+
+
+def _subprocess_extract(url: str, playlist: bool = False,
+                        impersonate: bool = True) -> dict:
     plans: list[list[str]] = []
     flat = ["-J", "--yes-playlist", "--flat-playlist", url]
     if playlist:
@@ -576,7 +663,7 @@ def _subprocess_extract(url: str, playlist: bool = False) -> dict:
     detail = ""                    # last useful line, warning or error
     for plan in plans:
         try:
-            rc, out, err = run_yt_dlp(plan)
+            rc, out, err = run_yt_dlp(plan, impersonate=impersonate)
         except subprocess.TimeoutExpired as exc:
             best = best or friendly(exc)
             continue
@@ -1292,7 +1379,7 @@ class Handler(BaseHTTPRequestHandler):
                 "merge": FFMPEG is not None and mode != "none",
                 "playlists": PLAYLIST_PROBE,
                 "cookies": bool(COOKIES),
-                "impersonate": IMPERSONATE or None,
+                "impersonate": IMPERSONATE if impersonate_ready() else None,
                 "subtitles": True,
                 "cache": True,
             },
