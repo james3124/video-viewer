@@ -373,6 +373,55 @@ def main() -> int:
               "landing page" in landing)
         check("errors: landing pages are not blamed on the IP",
               "IP ranges" not in landing)
+
+        # 14 — the sniffer: what to try when yt-dlp gives up ----------------
+        html = (
+            '<link rel="alternate" type="application/rss+xml" '
+            'href="https://site.test/tag/x/feed/">'
+            '<iframe src="/wp-content/plugins/p/player-x.php?q=abc"></iframe>'
+            '<source data-src="https://cdn.test/media/clip.mp4">'
+            '<script>var s = "https://cdn.test/live/index.m3u8";</script>'
+            '<img src="/logo.png"><script src="/app.js"></script>')
+        real_fetch = server._fetch_html
+        server._fetch_html = lambda url: ("https://site.test/post/1/", html)
+        try:
+            server._SNIFF_CACHE.clear()
+            found = server.sniff_targets("https://site.test/post/1/")
+        finally:
+            server._fetch_html = real_fetch
+        media = [u for k, u in found if k == "media"]
+        check("sniff: finds the mp4 behind a data-src",
+              any(u.endswith("clip.mp4") for u in media), str(media))
+        check("sniff: finds the m3u8 in a script",
+              any(u.endswith("index.m3u8") for u in media), str(media))
+        check("sniff: finds the player frame",
+              any(u.endswith("player-x.php?q=abc") for _, u in found))
+        check("sniff: finds the RSS feed",
+              any(u.endswith("/feed/") for _, u in found))
+        check("sniff: ignores images and scripts",
+              not any(u.endswith((".png", ".js")) for _, u in found))
+        check("sniff: a progressive file outranks an HLS playlist",
+              found and found[0][0] == "media" and found[0][1].endswith("clip.mp4"),
+              str(found[:1]))
+
+        sniffed = server.browsable_formats(
+            server.synthetic_info("https://site.test/post/1/",
+                                  "https://cdn.test/media/clip.mp4"))
+        check("sniff: synthetic format counts as video+audio",
+              sniffed and sniffed[0]["hasVideo"] and sniffed[0]["hasAudio"])
+        check("sniff: synthetic format sends a Referer",
+              sniffed and sniffed[0]["headers"].get("Referer") == "https://site.test/post/1/")
+        check("sniff: synthetic format is marked and says where it came from",
+              sniffed and sniffed[0]["sniffed"] and "found in the page" in sniffed[0]["label"])
+
+        smuggled = server.playlist_entries({"entries": [
+            {"title": "t", "url": "https://site.test/p/1/#__youtubedl_smuggle=%7B%22http_headers%22%3A%7B%7D%7D"},
+            {"title": "no url"},
+        ]})
+        check("playlists: smuggle fragment stripped from entry urls",
+              smuggled[0]["url"] == "https://site.test/p/1/", smuggled[0]["url"])
+        check("playlists: entries without a usable url are dropped",
+              smuggled[1]["url"] is None)
     finally:
         backend.shutdown()
         cdn.shutdown()

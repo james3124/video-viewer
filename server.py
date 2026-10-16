@@ -664,7 +664,121 @@ def _module_extract(url: str, playlist: bool = False, impersonate: bool = True) 
     raise RuntimeError(detail or f"yt-dlp could not extract {url}")
 
 
-def _extract(url: str, playlist: bool = False) -> dict:
+_SNIFF_CACHE: dict[str, tuple[float, list[tuple[str, str]]]] = {}
+SNIFF_TTL = env_int("VIEWER_SNIFF_TTL", default=900)
+SNIFF_MAX = env_int("VIEWER_SNIFF_MAX", default=4)
+SNIFF_TIMEOUT = env_int("VIEWER_SNIFF_TIMEOUT", default=25)
+MEDIA_URL_RE = re.compile(
+    r"""["'(]([^"'()\s<>]{6,500}?\.(?:m3u8|mp4|webm|m4v|mov)(?:\?[^"'()\s<>]*)?)["')]""",
+    re.I)
+EMBED_ATTR_RE = re.compile(
+    r"""<(?:iframe|embed|object|source|video)\b[^>]*?\b(?:src|data-src|data-media-src|"""
+    r"""data-video-src|data-hls|data-file)=["']([^"']+)["']""", re.I)
+FEED_LINK_RE = re.compile(
+    r"""<link\b[^>]*?type=["']application/(?:rss|atom)\+xml["'][^>]*?href=["']([^"']+)["']""",
+    re.I)
+FEED_HREF_RE = re.compile(r"""<link\b[^>]*?href=["']([^"']+)["'][^>]*?type=["']application/(?:rss|atom)\+xml""", re.I)
+# Endpoint shapes that are almost always a player we can resolve further.
+PLAYER_HINTS = ("player", "embed", "/e/", "watch", "video", "stream", "play",
+                "jwplayer", "kt_player", "clean-tube", "media", "html5")
+SKIP_HOST_SUFFIX = (".js", ".css", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg",
+                    ".woff", ".woff2", ".ico", ".mp3", ".jpg.webp")
+
+
+def _fetch_html(url: str) -> tuple[str, str] | None:
+    """Fetch a page the way a browser would. Returns (final_url, html)."""
+    req = urllib.request.Request(url, headers={
+        "User-Agent": DEFAULT_UA,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "/".join(url.split("/")[:3]) + "/",
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=SNIFF_TIMEOUT) as resp:
+            raw = resp.read(2 << 20)
+            charset = resp.headers.get_content_charset() or "utf-8"
+            return resp.geturl(), raw.decode(charset, "replace")
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def sniff_targets(url: str) -> list[tuple[str, str]]:
+    """Things worth trying when yt-dlp gives up: media files, player frames, feeds.
+
+    Ordered best-first: a direct .m3u8/.mp4 plays immediately, a player frame is
+    worth another extraction pass, an RSS feed turns the page into a playlist.
+    """
+    now = time.time()
+    hit = _SNIFF_CACHE.get(url)
+    if hit and hit[0] > now:
+        return hit[1]
+
+    page = _fetch_html(url)
+    if not page:
+        return []
+    final, html = page
+    found: list[tuple[str, str]] = []
+
+    def add(kind: str, candidate: str) -> None:
+        try:
+            absolute = urllib.parse.urljoin(final, candidate.strip())
+        except Exception:  # noqa: BLE001
+            return
+        host = urllib.parse.urlparse(absolute).hostname or ""
+        low = absolute.lower().split("?")[0]
+        if not absolute.startswith(("http://", "https://")) or not host:
+            return
+        if any(low.endswith(sfx) for sfx in SKIP_HOST_SUFFIX):
+            return
+        if not is_private_url(absolute):
+            found.append((kind, absolute))
+
+    for m in MEDIA_URL_RE.finditer(html):
+        add("media", m.group(1))
+    for m in EMBED_ATTR_RE.finditer(html):
+        src = m.group(1)
+        add("media" if re.search(r"\.(m3u8|mp4|webm|m4v|mov)(\?|$)", src, re.I) else "page", src)
+    for m in (FEED_LINK_RE.finditer(html) or FEED_HREF_RE.finditer(html)):
+        add("feed", m.group(1))
+
+    # Frames first only when they look like a player; otherwise every nav link
+    # in the page becomes a candidate and the ladder turns into a crawl.
+    def rank(item: tuple[str, str]) -> tuple[int, str]:
+        kind, link = item
+        same_host = link.split("/")[2] == url.split("/")[2]
+        is_player = any(h in link.lower() for h in PLAYER_HINTS)
+        # A progressive file beats a playlist: it plays natively, without hls.js.
+        adaptive = 1 if ".m3u8" in link.lower() else 0
+        return ({"media": 0, "page": 1 if is_player else 3, "feed": 2}[kind]
+                + (1 if same_host else 0) + adaptive, link)
+
+    ordered = sorted(dict.fromkeys(found), key=rank)[:SNIFF_MAX]
+    _SNIFF_CACHE[url] = (now + SNIFF_TTL, ordered)
+    for stale in [k for k, (exp, _) in _SNIFF_CACHE.items() if exp <= now][:64]:
+        _SNIFF_CACHE.pop(stale, None)
+    return ordered
+
+
+def synthetic_info(url: str, media_url: str) -> dict:
+    """A one-format info dict for a media file we found in the page ourselves."""
+    ext = (urllib.parse.urlparse(media_url).path.rsplit(".", 1)[-1] or "mp4").lower()
+    return {
+        "title": None,
+        "extractor_key": "sniffed",
+        "formats": [{
+            "format_id": f"sniffed-{ext}",
+            "url": media_url,
+            "ext": ext,
+            "protocol": "https",
+            "vcodec": None, "acodec": None,
+            "_sniffed": True,             # "we found this file in the page"
+            "http_headers": {"User-Agent": DEFAULT_UA, "Referer": url},
+        }],
+        "webpage_url": url,
+    }
+
+
+def _extract(url: str, playlist: bool = False, depth: int = 0) -> dict:
     """`yt-dlp -J` equivalent, with a short ladder of fallbacks.
 
     Browser impersonation is tried first; if it fails the whole ladder runs once
@@ -697,6 +811,28 @@ def _extract(url: str, playlist: bool = False) -> dict:
     if last is None:
         raise RuntimeError("yt-dlp failed")
     raise RuntimeError(with_hint(friendly(last)))
+
+
+def _extract_sniffed(url: str, playlist: bool = False) -> dict:
+    """yt-dlp first; if it gives up, look for the media in the page ourselves.
+
+    WordPress tube sites and similar wrappers hide the stream behind a player
+    frame (`player.php?q=…`) or simply link to it, which the generic extractor
+    does not follow. One bounded extra pass is usually enough to turn
+    "Unsupported URL" into a playable format.
+    """
+    try:
+        return _extract(url, playlist=playlist)
+    except Exception as first:  # noqa: BLE001
+        original = first
+        for kind, candidate in sniff_targets(url):
+            try:
+                if kind == "media":
+                    return synthetic_info(url, candidate)
+                return _extract(candidate, playlist=(kind == "feed"))
+            except Exception:  # noqa: BLE001
+                continue
+        raise original
 
 
 def clean_reason(text: str) -> str:
@@ -851,7 +987,7 @@ def get_info(url: str, *, fresh: bool = False, playlist: bool = False) -> dict:
             STATS["busy"] += 1
             raise RuntimeError("every extraction slot is busy — try again in a few seconds")
         try:
-            info = _extract(url, playlist=playlist)
+            info = _extract_sniffed(url, playlist=playlist)
         except Exception as exc:  # noqa: BLE001
             _NEG[key] = (time.time() + NEG_TTL, friendly(exc))
             raise
@@ -996,6 +1132,8 @@ def browsable_formats(info: dict) -> list[dict]:
         has_video = v_state == "yes" or (v_state == "unknown" and sized)
         has_audio = (a_state == "yes"
                      or (a_state == "unknown" and (sized or ext in AUDIO_EXTS)))
+        if f.get("_sniffed"):                 # we found the file ourselves
+            has_video = has_audio = True
 
         if "m3u8" in proto or ext == "m3u8":
             kind, label = "hls", "HLS (adaptive stream)"
@@ -1005,7 +1143,9 @@ def browsable_formats(info: dict) -> list[dict]:
             kind, label = "dash", "storyboard (not playable)"
         else:
             kind = "direct"
-            if has_video and has_audio:
+            if f.get("_sniffed"):
+                label = f"{ext or 'media'} · found in the page"
+            elif has_video and has_audio:
                 label = f"{f['height']}p" if f.get("height") else (f.get("format_note") or "video+audio")
                 if ext:
                     label += f" · {ext}"
@@ -1032,6 +1172,7 @@ def browsable_formats(info: dict) -> list[dict]:
             "url": url,
             "protocol": proto,
             "expiresIn": f.get("expires_in"),
+            "sniffed": bool(f.get("_sniffed")),
             # Anything beyond a plain UA has to be re-fetched by us: <video> and
             # hls.js cannot attach Referer/Cookie cross-origin. That single flag
             # is what makes header-protected (18+, TikTok, …) links playable.
@@ -1100,6 +1241,11 @@ def playlist_entries(info: dict, limit: int = 200) -> list[dict]:
         url = e.get("url") or e.get("webpage_url") or e.get("original_url")
         if not url and e.get("id") and "youtu" in ie:
             url = f"https://www.youtube.com/watch?v={e['id']}"
+        # yt-dlp appends an internal smuggle fragment to some URLs; it is for
+        # yt-dlp, not for browsers, and it would pollute our cache keys.
+        url = (url.split("#__", 1)[0] if url else url)
+        if url and not valid_url(url):
+            url = None
         thumb = None
         for t in reversed(e.get("thumbnails") or []):
             if isinstance(t, dict) and t.get("url"):
