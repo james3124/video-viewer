@@ -27,6 +27,14 @@ HOSTS = [
     "https://www.redtube.com/",
     "https://www.spankbang.com/",
     "https://onlyfans.com/",
+    # landing pages that link to the embed hosts below rather than embedding
+    # anything themselves — useful contrast when a link "will not play"
+    "https://sulasokvid.co/",
+    # hosts yt-dlp's family extractor does support
+    "https://dood.to/",
+    "https://filemoon.sx/",
+    "https://viewsb.com/",
+    "https://viidshar.com/",
     # non-adult controls, useful to tell "site is down" from "IP is blocked"
     "https://www.youtube.com/",
     "https://www.tiktok.com/",

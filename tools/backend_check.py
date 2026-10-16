@@ -368,6 +368,11 @@ def main() -> int:
               server.with_hint(not_found) == not_found)   # no hint appended at all
         check("errors: removed videos are not blamed on the platform",
               "IP ranges" not in server.with_hint("This video has been removed"))
+        landing = server.with_hint("Unsupported URL: https://example.test/")
+        check("errors: a video-less landing page says so",
+              "landing page" in landing)
+        check("errors: landing pages are not blamed on the IP",
+              "IP ranges" not in landing)
     finally:
         backend.shutdown()
         cdn.shutdown()

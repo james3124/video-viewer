@@ -680,15 +680,19 @@ def _extract(url: str, playlist: bool = False) -> dict:
             info = worker(url, playlist, impersonate)
         except Exception as exc:  # noqa: BLE001
             last = exc
-            if not impersonate:
-                continue
-            IMPERSONATE_FAILURES["n"] += 1
-            note(f"impersonation failed for {_host_of(url)} — retrying without it")
-            if IMPERSONATE_FAILURES["n"] >= MAX_IMPERSONATE_FAILURES:
-                note(f"impersonation disabled after {IMPERSONATE_FAILURES['n']} failures; "
-                     f"bot-protected hosts may not work until it is fixed")
             continue
-        IMPERSONATE_FAILURES["n"] = 0
+        # Only the *un*impersonated success proves impersonation was the
+        # problem. A host that refuses both attempts is blocking us, not our
+        # TLS fingerprint — counting that would disable impersonation for good
+        # and break every other host that actually needs it.
+        if not impersonate and len(passes) > 1:
+            IMPERSONATE_FAILURES["n"] += 1
+            note(f"impersonation was rejected by {_host_of(url)} — retrying without it")
+            if IMPERSONATE_FAILURES["n"] >= MAX_IMPERSONATE_FAILURES:
+                note(f"impersonation disabled after {IMPERSONATE_FAILURES['n']} hosts "
+                     f"rejected it; bot-protected sites may not work until it is fixed")
+        else:
+            IMPERSONATE_FAILURES["n"] = 0
         return info
     if last is None:
         raise RuntimeError("yt-dlp failed")
@@ -736,6 +740,9 @@ _HINTS = (
 _TERMINAL_HINTS = (
     (("private", "removed", "deleted", "terminated", "unavailable"),
      "this video is private, removed or gone — nothing a server can do"),
+    (("unsupported url", "no video formats", "no formats found"),
+     "this page does not embed a video — it is a landing page that links elsewhere, "
+     "so there is nothing here to extract"),
 )
 
 
