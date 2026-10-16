@@ -98,6 +98,10 @@ def _has_module(name: str) -> bool:
 # Shared secret. Empty = open (fine for localhost, unwise for the internet).
 TOKEN = env("VIEWER_TOKEN", "VIEWER_API_KEY")
 COOKIES = env("YTDLP_COOKIES", "VIEWER_COOKIES", "COOKIES")
+# Cookies pasted in as base64 instead of a file in the repo — for hosts where
+# committing cookies.txt would leak a logged-in session to everyone.
+COOKIES_B64 = env("VIEWER_COOKIES_B64", "YTDLP_COOKIES_B64")
+_COOKIES_READY = False
 CACHE_TTL = env_int("VIEWER_TTL", "YTDLP_TTL", default=900)       # info TTL, seconds
 NEG_TTL = env_int("VIEWER_NEG_TTL", default=45)                   # remember failures briefly
 SUB_TTL = env_int("VIEWER_SUB_TTL", default=6 * 3600)
@@ -165,6 +169,64 @@ def ensure_dirs() -> None:
             os.makedirs(d, exist_ok=True)
         except OSError as exc:                 # read-only bundle filesystems
             note(f"cache dir {d} unavailable ({exc}) — running memory-only")
+
+
+def _looks_like_netscape_cookies(raw: bytes) -> bool:
+    """A cookies.txt export is tab-separated with ≥6 fields per entry."""
+    text = raw.decode("utf-8", "replace")
+    if text.lstrip().startswith(("{", "<")):          # JSON export, not cookies.txt
+        return False
+    for line in text.splitlines():
+        line = line.removeprefix("#HttpOnly_").strip()
+        if line and not line.startswith("#") and len(line.split("\t")) >= 6:
+            return True
+    return False
+
+
+def cookies_path() -> str:
+    """The active cookies.txt, materialising it from base64 env once if needed.
+
+    Order: an explicit path (--cookies / YTDLP_COOKIES) wins, then
+    VIEWER_COOKIES_B64, which is written into the cache dir (mode 0600) on first
+    use. Nothing is ever written into the repository.
+    """
+    global COOKIES, _COOKIES_READY
+    if _COOKIES_READY:
+        return COOKIES
+    _COOKIES_READY = True
+    if COOKIES and os.path.isfile(COOKIES):
+        return COOKIES
+    if COOKIES:
+        note(f"YTDLP_COOKIES={COOKIES} does not exist — ignoring it")
+    if not COOKIES_B64:
+        return COOKIES
+
+    try:
+        import base64
+        import binascii
+        raw = base64.b64decode(re.sub(r"\s+", "", COOKIES_B64) + "===")
+    except (ValueError, binascii.Error, ImportError):
+        note("VIEWER_COOKIES_B64 is not valid base64 — ignoring it")
+        return COOKIES
+    if not _looks_like_netscape_cookies(raw):
+        note("VIEWER_COOKIES_B64 does not contain a cookies.txt export — ignoring it "
+             "(expected tab-separated Netscape format, not JSON)")
+        return COOKIES
+
+    ensure_dirs()
+    target = os.path.join(CACHE_DIR, "cookies.txt")
+    try:
+        tmp = f"{target}.{os.getpid()}.part"
+        with open(tmp, "wb") as fh:
+            fh.write(raw)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, target)          # atomic: concurrent cold starts are fine
+        COOKIES = target
+        note(f"cookies loaded from VIEWER_COOKIES_B64 "
+             f"({len(raw)} bytes → {target})")
+    except OSError as exc:
+        note(f"could not write cookies to {target} ({exc}) — ignoring them")
+    return COOKIES
 
 
 # --------------------------------------------------------------------------- #
@@ -324,12 +386,9 @@ def base_ytdlp_args(impersonate: bool = True) -> list[str]:
         args += ["--impersonate", IMPERSONATE]
     if env_bool("YTDLP_IPV4"):
         args += ["--force-ipv4"]
-    if COOKIES:
-        if os.path.isfile(COOKIES):
-            args += ["--cookies", COOKIES]
-            note(f"using cookies from {COOKIES}")
-        else:
-            note(f"YTDLP_COOKIES={COOKIES} does not exist — ignoring")
+    if cookies_path() and os.path.isfile(cookies_path()):
+        args += ["--cookies", cookies_path()]
+        note(f"using cookies from {cookies_path()}")
     _BASE_ARGS[impersonate] = args
     return args
 
@@ -539,8 +598,9 @@ def _module_opts(playlist: bool = False, impersonate: bool = True) -> dict:
         "noplaylist": not playlist,
         "extract_flat": "in_playlist" if playlist else False,
     }
-    if COOKIES and os.path.isfile(COOKIES):
-        opts["cookiefile"] = COOKIES
+    cookie_file = cookies_path()
+    if cookie_file and os.path.isfile(cookie_file):
+        opts["cookiefile"] = cookie_file
     opts.update(_extra_module_opts())
     return {k: v for k, v in opts.items() if v is not None}
 
@@ -1378,7 +1438,7 @@ class Handler(BaseHTTPRequestHandler):
                 "hls": True,
                 "merge": FFMPEG is not None and mode != "none",
                 "playlists": PLAYLIST_PROBE,
-                "cookies": bool(COOKIES),
+                "cookies": bool(cookies_path() and os.path.isfile(cookies_path())),
                 "impersonate": IMPERSONATE if impersonate_ready() else None,
                 "subtitles": True,
                 "cache": True,

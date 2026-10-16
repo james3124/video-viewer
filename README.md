@@ -129,7 +129,8 @@ instance answers `429` instead of forking itself to death.
 | `VIEWER_PLAYLIST_PROBE` | `1` | also look for playlist/channel entries |
 | `VIEWER_AGE_LIMIT` | `18` | yt-dlp `--age-limit` |
 | `VIEWER_YTDLP_MODE` | `auto` | `auto` uses the `yt_dlp` Python module (no subprocess, no PATH dependency), `binary`/`module` force one. Both are checked, so this reports "missing" only if neither exists |
-| `YTDLP_COOKIES` | *(empty)* | path to `cookies.txt` |
+| `YTDLP_COOKIES` | *(empty)* | path to a `cookies.txt` on disk |
+| `VIEWER_COOKIES_B64` | *(empty)* | the same `cookies.txt`, base64-encoded, written into the cache dir (mode 0600) on first use — **use this on Vercel instead of putting cookies in a public repo** |
 | `YTDLP_IMPERSONATE` | `chrome` if `curl_cffi` is present, `off` to disable | yt-dlp `--impersonate` |
 | `VIEWER_IMPERSONATE_FAILURES` | `3` | failures in a row before impersonation is switched off |
 | `YTDLP_ARGS` | *(empty)* | extra raw yt-dlp flags |
@@ -180,6 +181,39 @@ window.VIEWER_TOKEN = 'the-same-token-as-the-server';   // only if you set one
 (Or visit once with `?backend=https://…` / `?token=…`.) The backend sends
 `Access-Control-Allow-Origin: *`, so cross-origin calls work; with a token every
 URL the page builds carries it, since `<video>` cannot send custom headers.
+
+## Cookies (age gates, logins, paywalls)
+
+A `cookies.txt` export is what gets past age/consent gates, account walls and
+some bot checks. There are two ways to give the backend one:
+
+**1. Base64 in an environment variable — the safe one, nothing in git**
+
+```bash
+# 1. export cookies.txt from your browser (Get cookies.txt LOCALLY extension)
+# 2. encode it (one line, no newlines/quotes to fight with):
+base64 -w0 cookies.txt
+# 3. Vercel → Settings → Environment Variables:
+#    VIEWER_COOKIES_B64 = <paste>   (tick "Sensitive")
+# 4. Redeploy
+```
+
+The backend decodes it on first use into `<cache dir>/cookies.txt` with mode
+`0600`. A value that is not a real cookies.txt is reported in
+`/api/health` → `notices` rather than failing silently.
+
+**2. A file in the deployment** (fine for a VPS, wrong for a public repo)
+
+```bash
+YTDLP_COOKIES=/opt/render/project/src/cookies.txt   # Render
+python3 server.py --cookies /path/cookies.txt        # local
+```
+
+> `cookies.txt` is a logged-in session — anyone holding it is logged in as you.
+> `cookies.txt` is git-ignored, but **never commit it to a public repository**;
+> use method 1. Scope the export to the one host you need where you can.
+
+---
 
 ## Security
 
