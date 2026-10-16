@@ -182,23 +182,40 @@ What actually works, in order:
 
 ### Full backend elsewhere (recommended)
 
-Any host that runs a long-lived process — Render (`render.yaml` is ready-made),
-Railway, Fly.io, a VPS:
+Any host that runs a long-lived process — Render, Railway, Fly.io, a VPS.
+
+**Render, in four steps**
+
+1. <https://render.com/deploy?repo=https://github.com/james3124/video-viewer>
+   (or New → Blueprint → pick the repo; `render.yaml` does the rest).
+2. In the dashboard, set the two secrets Render prompts for:
+   - `VIEWER_TOKEN` — generate with
+     `python3 -c "import secrets;print(secrets.token_urlsafe(32))"`
+   - `VIEWER_COOKIES_B64` — `base64 -w0 cookies.txt`, or leave empty.
+3. Wait for the deploy, then check it:
+   ```bash
+   curl -s https://video-viewer-backend.onrender.com/api/health
+   ```
+4. Point the frontend at it in `config.js`:
+   ```js
+   window.VIEWER_BACKEND = 'https://video-viewer-backend.onrender.com';
+   ```
+   then open the page **once** as
+   `https://your-app.vercel.app/?token=<your VIEWER_TOKEN>` — it is remembered in
+   that browser. Do **not** commit the token into `config.js`: this repo is
+   public, so that would publish it.
+
+Anything else:
 
 ```bash
-python3 server.py --host 0.0.0.0 --port $PORT
+python3 server.py --host 0.0.0.0 --port $PORT   # reads PORT/HOST from the env
 ```
 
-Then point the frontend at it in `config.js`:
-
-```js
-window.VIEWER_BACKEND = 'https://your-backend.example.com';
-window.VIEWER_TOKEN = 'the-same-token-as-the-server';   // only if you set one
-```
-
-(Or visit once with `?backend=https://…` / `?token=…`.) The backend sends
-`Access-Control-Allow-Origin: *`, so cross-origin calls work; with a token every
-URL the page builds carries it, since `<video>` cannot send custom headers.
+> Free Render instances sleep after ~15 minutes idle, so the first play after a
+> pause waits for a cold start (~30-60 s); after that the cache makes it fast.
+> If `free` is not offered on your account, set `plan: starter` in `render.yaml`.
+> Render is still a datacenter range: fewer hosts block it than Vercel, but
+> cookies remain the cure for the stubborn ones.
 
 ## Cookies (age gates, logins, paywalls)
 

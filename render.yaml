@@ -1,28 +1,53 @@
+# Render blueprint: https://render.com/deploy?repo=https://github.com/james3124/video-viewer
+#
+# Deploy with: New → Blueprint → pick this repo. Render fills in everything and
+# creates the service for you. The dashboard then asks for the two secrets
+# marked `sync: false` below.
+#
+# The service URL will be https://video-viewer-backend.onrender.com — put that
+# into window.VIEWER_BACKEND in config.js so the page talks to this backend.
 services:
   - type: web
     name: video-viewer-backend
     runtime: python
+    # `free` sleeps after ~15 min idle (first play after idle waits ~30-60 s) and
+    # has a monthly hour cap. If free is not offered for your account, change
+    # this to `starter` and pick a region close to you.
     plan: free
+    # requirements.txt installs yt-dlp, imageio-ffmpeg and curl_cffi (which powers
+    # --impersonate chrome, the thing that gets past bot checks).
     buildCommand: pip install --no-cache-dir -r requirements.txt
-    # server.py reads PORT/HOST itself; --host 0.0.0.0 is what Render needs.
+    # server.py honours $PORT by itself; 0.0.0.0 is what Render needs.
     startCommand: python3 server.py --host 0.0.0.0 --port $PORT
     healthCheckPath: /api/health
     autoDeploy: true
     envVars:
       - key: PYTHON_VERSION
         value: "3.12.3"
-      # Shared secret so the public URL is not an open extractor for anyone.
-      # Set VIEWER_TOKEN in the dashboard, then put the same value in config.js.
+      # ------------------------------------------------------------------------
+      # Set these two in the Render dashboard right after the first deploy.
+      # ------------------------------------------------------------------------
+      # Shared secret, so the public URL is not an open extractor for anyone.
+      # Generate one:  python3 -c "import secrets;print(secrets.token_urlsafe(32))"
+      # Do NOT commit it to config.js in a public repo — instead open the page
+      # once as  ?token=…  and it is remembered in your browser.
       - key: VIEWER_TOKEN
         sync: false
+      # Cookies: base64 of your cookies.txt (age gates, logins, paywalls, and
+      # several bot checks). Generate with:  base64 -w0 cookies.txt
+      # Leave empty if you do not have any yet — everything else still works.
+      - key: VIEWER_COOKIES_B64
+        sync: false
+      # ------------------------------------------------------------------------
       - key: VIEWER_CACHE_DIR
         value: /tmp/viewer-cache
       - key: VIEWER_TTL
         value: "900"
-      # Cookies for age/geo-gated sites (commit this file as cookies.txt).
-      # - key: YTDLP_COOKIES
-      #   value: /opt/render/project/src/cookies.txt
       - key: YTDLP_IMPERSONATE
         value: chrome
+      # Refuse loopback/private targets: this service is public, so it must not
+      # be usable to probe your own network.
       - key: VIEWER_BLOCK_PRIVATE
         value: "1"
+      - key: VIEWER_RATE
+        value: "300"
