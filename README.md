@@ -92,7 +92,18 @@ Failures come with the one action that usually fixes them:
 Hosts behind Cloudflare frequently block Vercel/Render IP ranges outright — if
 `tools/site_check.py` fails there but succeeds on a VPS, that is the reason.
 
-## Player controls
+## Download
+
+The ⬇ button (in the control bar) saves the video through the backend, so it
+works even when the CDN refuses to let the browser download (cross-origin, needs
+Referer/Cookie, age-gated). The backend picks the quality on screen if the
+backend resolved it, otherwise a sensible (≤1080p, MP4) single file, sends it
+with `Content-Disposition: attachment` (filename from the title, UTF-8 safe), and
+falls back to the ffmpeg merge when the site only publishes split streams. The
+file lands in the browser's downloads folder — no client-side `fetch`/blob
+problems.
+
+## Player controls:
 
 The video element has no native `controls`; the page draws its own bar:
 

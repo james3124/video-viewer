@@ -135,6 +135,7 @@
       thumbnail: data.thumbnail,
       isLive: data.isLive,
       extractor: data.extractor,
+      formatId: fmt.id,
       formatLabel: fmt.label,
       playlist: playlist && playlist.length ? playlist : null,
       subtitles: (data.subtitles || []).slice(0, 6).map((s) => ({
@@ -352,6 +353,18 @@
 
   let probeTimer = null;
 
+  /** Download URL for the current link (needs the backend: it names the file).
+   Pass `fmt` to save exactly the quality that is on screen. */
+  window.ViewerDownloadUrl = function (pageUrl, fmt) {
+    if (!pageUrl || !/^https?:/i.test(pageUrl)) return null;
+    const q = fmt ? `&fmt=${encodeURIComponent(fmt)}` : '';
+    return withToken(`${state.base}/api/play?url=${encodeURIComponent(pageUrl)}&dl=1${q}`);
+  };
+
+  /** Auth header for HEAD requests app.js makes itself (download pre-flight). */
+  window.ViewerAuthHeaders = () => authHeaders();
+
+  /** Register with app.js once the backend answers. */
   function registerResolver() {
     window.ViewerResolvers = window.ViewerResolvers || [];
     if (!window.ViewerResolvers.includes(resolver)) window.ViewerResolvers.push(resolver);

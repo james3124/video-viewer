@@ -114,6 +114,7 @@ CONCURRENCY = env_int("VIEWER_YTDLP_CONCURRENCY", default=4)       # parallel ex
 RATE_PER_MIN = env_int("VIEWER_RATE", default=300)                # 0 disables the limiter
 MANIFEST_TTL = env_int("VIEWER_MANIFEST_TTL", default=15)
 HTTP_CACHE = env_bool("VIEWER_HTTP_CACHE", default=True)          # ETag / Cache-Control
+DEBUG = env_bool("VIEWER_DEBUG")                                 # full tracebacks on stderr
 PLAYLIST_PROBE = env_bool("VIEWER_PLAYLIST_PROBE", default=True)
 BLOCK_PRIVATE = env_bool("VIEWER_BLOCK_PRIVATE", default=False)
 SOCKET_TIMEOUT = env_int("YTDLP_SOCKET_TIMEOUT", default=20)
@@ -1338,6 +1339,58 @@ def resolve_headers(page: str, fmt: str = "") -> dict:
         return {}
 
 
+def safe_filename(title: str, ext: str = "mp4") -> str:
+    """A download name that survives every OS, plus an RFC 5987 UTF-8 version."""
+    base = re.sub(r"[\x00-\x1f\x7f/\\:*?\"<>|]+", " ", title or "").strip()
+    base = re.sub(r"\s+", " ", base)[:90].strip(" .") or "video"
+    ext = (ext or "mp4").lower().strip(".") or "mp4"
+    if not base.lower().endswith("." + ext):
+        base = f"{base}.{ext}"
+    ascii_name = re.sub(r"[^\x20-\x7e]", "_", base).replace('"', "'")[:120]
+    return (f'attachment; filename="{ascii_name}"; '
+            f"filename*=UTF-8''{urllib.parse.quote(base, safe='')}")
+
+
+def resolve_download(page: str, fmt: str = "") -> dict:
+    """Pick a *single file* to hand the browser as a download.
+
+    Adaptive HLS is not a file, so it is skipped: saving an .m3u8 as .mp4 would
+    be worse than saying why. A plain media URL counts even when the extractor
+    reports no codecs — the container tells the browser what it is anyway.
+    """
+    info = get_info(page, playlist=PLAYLIST_PROBE)
+    fmts = browsable_formats(info)
+    direct = [f for f in fmts if f["kind"] == "direct"]
+
+    chosen = next((f for f in direct if fmt and f["id"] == fmt), None)
+    if chosen is None:
+        def rank(f: dict) -> tuple:
+            # Default downloads should be playable anywhere and not enormous:
+            # mp4 first, capped at 1080p, then webm/mkv, then anything bigger.
+            big = (f.get("height") or 0) > 1080
+            return (0 if f["ext"] in ("mp4", "m4v") and not big else
+                    1 if f["ext"] in MUXED_OK_EXT and not big else
+                    2 if f["ext"] in MUXED_OK_EXT else 3,
+                    -(f.get("height") or 0))
+        direct.sort(key=rank)
+        chosen = direct[0] if direct else None
+
+    if chosen is None:
+        kinds = sorted({f["kind"] for f in fmts}) or ["nothing"]
+        raise RuntimeError(
+            f"this link has no single file to save — yt-dlp only found "
+            f"{', '.join(kinds)} here"
+            + (", and the ffmpeg merge can still produce a file"
+               if FFMPEG is not None else ""))
+    return {
+        "url": chosen["url"],
+        "headers": chosen.get("headers") or {},
+        "title": info.get("title"),
+        "ext": chosen.get("ext") or "mp4",
+        "height": chosen.get("height"),
+    }
+
+
 # --------------------------------------------------------------------------- #
 #  Subtitle conversion, cached on disk
 # --------------------------------------------------------------------------- #
@@ -1637,6 +1690,9 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as exc:  # noqa: BLE001
             _, path = self._query()
             note(f"{path} failed: {exc}")
+            if DEBUG:
+                import traceback
+                traceback.print_exc()
             self._send_error_json(f"{exc.__class__.__name__}: {friendly(exc)}", 502)
 
     def log_message(self, fmt, *args) -> None:
@@ -1666,6 +1722,7 @@ class Handler(BaseHTTPRequestHandler):
                 "impersonate": IMPERSONATE if impersonate_ready() else None,
                 "subtitles": True,
                 "cache": True,
+                "download": True,
             },
             "tokenRequired": bool(TOKEN),
             "platform": PLATFORM or "self-hosted",
@@ -1770,6 +1827,32 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path.startswith("/api/") and parsed.netloc == self.server_host:
             return self._send_error_json("Refusing to proxy our own API", 400)
 
+        if q.get("dl") == "1":
+            try:
+                target = resolve_download(src, fmt)
+            except ValueError as exc:
+                return self._send_error_json(friendly(exc), 400)
+            except Exception as exc:  # noqa: BLE001
+                # Only adaptive streams? Let ffmpeg stitch a real file instead.
+                if FFMPEG is not None and ytdlp_mode() != "none":
+                    link = f"/api/merge?url={urllib.parse.quote(src, safe='')}&dl=1"
+                    if TOKEN:
+                        link += f"&token={urllib.parse.quote(TOKEN, safe='')}"
+                    return self._redirect(link)
+                return self._send_error_json(friendly(exc), 502)
+            name = safe_filename(target["title"] or f"video-{target['ext']}",
+                                 target["ext"])
+            note(f"download {target['ext']} ← {src[:70]}")
+            try:
+                self._proxy_with_retry(src, fmt,
+                                       {"url": target["url"],
+                                        "headers": target["headers"]},
+                                       head=head, reject_html=True,
+                                       disposition=name)
+            except Expired as exc:
+                self._send_error_json(friendly(exc), 502)
+            return
+
         try:
             target = resolve_target(src, fmt, fresh=q.get("fresh") == "1")
         except ValueError as exc:
@@ -1809,12 +1892,12 @@ class Handler(BaseHTTPRequestHandler):
 
     def _proxy_with_retry(self, page: str, fmt: str, target: dict,
                           head: bool = False, allow_refresh: bool = True,
-                          reject_html: bool = False) -> None:
+                          reject_html: bool = False, disposition: str | None = None) -> None:
         """Stream `target`, re-extracting once if the CDN says the URL expired."""
         for attempt in (0, 1):
             try:
                 self._proxy(target["url"], target.get("headers") or {}, head=head,
-                            reject_html=reject_html)
+                            reject_html=reject_html, disposition=disposition)
                 return
             except Expired:
                 if (attempt or not allow_refresh or ytdlp_mode() == "none"
@@ -1839,7 +1922,7 @@ class Handler(BaseHTTPRequestHandler):
         return urllib.request.urlopen(req, timeout=PROXY_TIMEOUT)
 
     def _proxy(self, url: str, headers: dict, head: bool = False,
-               reject_html: bool = False) -> None:
+               reject_html: bool = False, disposition: str | None = None) -> None:
         try:
             resp = self._open_upstream(url, headers, head)
         except urllib.error.HTTPError as exc:
@@ -1854,10 +1937,11 @@ class Handler(BaseHTTPRequestHandler):
         except urllib.error.URLError as exc:
             raise RuntimeError(f"Upstream refused the request ({exc.reason})") from exc
 
-        self._send_upstream(resp, head=head, reject_html=reject_html)
+        self._send_upstream(resp, head=head, reject_html=reject_html,
+                            disposition=disposition)
 
     def _send_upstream(self, resp, head: bool = False, reject_html: bool = False,
-                       prefix: bytes = b"") -> None:
+                       prefix: bytes = b"", disposition: str | None = None) -> None:
         """Mirror an upstream response to the client (self-framing when needed)."""
         with resp:
             up = {k.lower(): v for k, v in resp.getheaders()}
@@ -1875,7 +1959,14 @@ class Handler(BaseHTTPRequestHandler):
                 for k, v in resp.getheaders():
                     if k.lower() in HOP_BY_HOP or k.lower() in PROXY_DROP:
                         continue
+                    if disposition and k.lower() == "content-disposition":
+                        continue
                     self.send_header(k, v)
+                if disposition:
+                    # Makes the browser save the file even when the request that
+                    # started it was cross-origin (the `download` attribute cannot
+                    # do that, and is ignored for cross-origin media).
+                    self.send_header("Content-Disposition", disposition)
                 if chunked:
                     # Re-frame the body ourselves: an upstream response without
                     # Content-Length would otherwise hang the client forever.
@@ -1997,6 +2088,7 @@ class Handler(BaseHTTPRequestHandler):
         page = q.get("url", "")
         sel = q.get("sel", "") or "bv*+ba/b"
         sort = q.get("sort", "") or "vcodec:h264:vp9:av1,+res:1080"
+        download = q.get("dl") == "1"
         if not valid_url(page):
             return self._send_error_json("Missing/invalid ?url=", 400)
         if FFMPEG is None or ytdlp_mode() == "none":
@@ -2014,6 +2106,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_response(200)
                 self.send_header("Content-Type", "video/mp4")
                 self.send_header("Cache-Control", "no-store")
+                if download:
+                    self.send_header("Content-Disposition", safe_filename("video", "mp4"))
                 self._cors()
                 self.end_headers()
             except (BrokenPipeError, ConnectionResetError):
@@ -2025,6 +2119,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "video/mp4")
             # No Content-Length: stream until the pipeline ends.
             self.send_header("Cache-Control", "no-store")
+            if download:
+                self.send_header("Content-Disposition", safe_filename("video", "mp4"))
             self.send_header("Connection", "close")
             self.close_connection = True
             self._cors()
@@ -2032,7 +2128,7 @@ class Handler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             return
 
-        note(f"merge {sel} ← {page[:80]}")
+        note(f"{'download ' if download else 'merge '}{sel} ← {page[:70]}")
         pipe_in = subprocess.Popen(dl, stdout=subprocess.PIPE,
                                    stderr=subprocess.PIPE, bufsize=1 << 16)
         pipe_out = subprocess.Popen(out, stdin=pipe_in.stdout,
@@ -2242,7 +2338,7 @@ handler = Handler          # alias: Vercel's older Python runtime looks for this
 
 def main() -> None:
     global ROOT, CACHE_TTL, TOKEN, COOKIES, YT_DLP, FFMPEG
-    global CACHE_DIR, INFO_DIR, SUB_DIR, YTDLP_DIR, _BASE_ARGS
+    global CACHE_DIR, INFO_DIR, SUB_DIR, YTDLP_DIR
 
     ap = argparse.ArgumentParser(description="Viewer — yt-dlp backed video server")
     ap.add_argument("--host", default=env("HOST", default="127.0.0.1"))
@@ -2276,7 +2372,7 @@ def main() -> None:
         INFO_DIR = os.path.join(CACHE_DIR, "info")
         SUB_DIR = os.path.join(CACHE_DIR, "subs")
         YTDLP_DIR = os.path.join(CACHE_DIR, "yt-dlp")
-    _BASE_ARGS = None            # rebuilt with the final cookie/impersonate setup
+    _BASE_ARGS.clear()          # rebuilt with the final cookie/impersonate setup
     YT_DLP = (shutil.which("yt-dlp") or shutil.which("yt_dlp")
               or (LOCAL_BIN if os.access(LOCAL_BIN, os.X_OK) else None))
     FFMPEG = _ffmpeg_path()

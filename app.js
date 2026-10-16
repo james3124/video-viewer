@@ -86,6 +86,7 @@
   let captionsOn = true;
   let lastAttempt = null;    // {src, proxied} — for the direct→proxy retry
   let retried = false;
+  let currentFmtId = '';   // backend format id on screen, so downloads match it
   const history = [];
 
   const HISTORY_KEY = 'viewer.recent';
@@ -133,6 +134,7 @@
     vol: document.getElementById('ctlVolume'),
     rate: document.getElementById('ctlRate'),
     cc: document.getElementById('ctlCC'),
+    dl: document.getElementById('ctlDl'),
     pip: document.getElementById('ctlPip'),
     full: document.getElementById('ctlFull'),
   };
@@ -219,8 +221,57 @@
     ctl.cc.disabled = !tracks;
     ctl.cc.classList.toggle('on', captionsOn && tracks > 0);
     ctl.pip.disabled = !document.pictureInPictureEnabled;
+    ctl.dl.disabled = !downloadUrl();
+    ctl.dl.title = ctl.dl.disabled
+      ? 'Downloading needs the backend (it names the file and adds the CDN headers)'
+      : 'Download this file';
     ctl.full.innerHTML = (document.fullscreenElement || document.webkitFullscreenElement)
       ? ICON.unfull : ICON.full;
+  }
+
+  /** The backend download URL for what is playing, or null without a backend. */
+  function downloadUrl() {
+    if (!currentUrl || !/^https?:/i.test(currentUrl)) return null;
+    if (window.ViewerDownloadUrl) {
+      // currentFmtId is set when the backend resolved this link, so the file we
+      // save matches the quality on screen rather than a different default.
+      return window.ViewerDownloadUrl(currentUrl, currentFmtId);
+    }
+    // Same origin and no bridge: the page is being served by server.py itself.
+    const fmt = currentFmtId ? `&fmt=${encodeURIComponent(currentFmtId)}` : '';
+    return location.protocol + '//' + location.host
+      + '/api/play?url=' + encodeURIComponent(currentUrl) + '&dl=1' + fmt;
+  }
+
+  async function downloadCurrent() {
+    const url = downloadUrl();
+    if (!url) return error('Nothing to download for this source.');
+    clearError();
+    status('Preparing download…');
+    // Ask first, so a "no single file here" answer becomes a message instead of
+    // a browser tab full of JSON.
+    try {
+      const res = await fetch(url, {
+        method: 'HEAD', cache: 'no-store',
+        headers: window.ViewerAuthHeaders ? window.ViewerAuthHeaders() : {},
+      });
+      const type = res.headers.get('Content-Type') || '';
+      if (!res.ok || type.includes('json')) {
+        let msg = `HTTP ${res.status}`;
+        try { msg = (await res.json()).error || msg; } catch (_) { /* html error page */ }
+        return error('Download not available: ' + msg);
+      }
+      const a = document.createElement('a');
+      a.href = url;
+      a.rel = 'noopener';
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      status('Downloading…');
+      wakeControls();
+    } catch (err) {
+      error('Download failed: ' + ((err && err.message) || err));
+    }
   }
 
   function wakeControls() {
@@ -359,6 +410,7 @@
       applyCaptionState();
       wakeControls();
     });
+    ctl.dl.addEventListener('click', downloadCurrent);
     ctl.pip.addEventListener('click', () => pipBtn.click());
     ctl.full.addEventListener('click', toggleFullscreen);
 
@@ -466,6 +518,7 @@
     destroyHls();
     showMedia();
     currentKind = 'native';
+    currentFmtId = '';           // raw media: the backend never picked a format
     lastAttempt = { src, proxied: false };
     retried = false;
     video.src = src;
@@ -478,6 +531,7 @@
     showMedia();
     video.poster = '';
     currentKind = 'hls';
+    currentFmtId = '';           // raw HLS, no backend format id to reuse
     lastAttempt = { src, proxied: false };
     retried = false;
 
@@ -523,6 +577,7 @@
   function playResolved(resolved) {
     const { stream, meta } = resolved;
     const title = (meta && meta.title) || prettyName(currentUrl);
+    currentFmtId = (meta && meta.formatId) || '';
 
     clearError();
     srcEl.textContent = title;
@@ -639,6 +694,7 @@
     showMedia();
     currentKind = 'file';
     currentUrl = file.name;
+    currentFmtId = '';
     video.src = URL.createObjectURL(file);
     srcEl.textContent = file.name;
     setDocumentTitle(file.name + ' — Viewer');

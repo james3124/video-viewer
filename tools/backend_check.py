@@ -422,6 +422,56 @@ def main() -> int:
               smuggled[0]["url"] == "https://site.test/p/1/", smuggled[0]["url"])
         check("playlists: entries without a usable url are dropped",
               smuggled[1]["url"] is None)
+
+        # 15 — downloads -----------------------------------------------------
+        disp = server.safe_filename('A "weird" / name: ünïcode', "mp4")
+        check("download: header has an attachment disposition",
+              disp.startswith("attachment;"))
+        check("download: quotes and slashes are neutralised",
+              '"' not in disp.split("filename*=UTF-8''")[0].split('filename="')[1].split('"')[0],
+              disp[:90])
+        check("download: utf-8 filename is included",
+              "filename*=UTF-8''" in disp and "%C3%BC" in disp)
+        check("download: extension is appended once",
+              disp.count(".mp4") >= 1 and not disp.split("filename=")[1].startswith(".mp4"))
+        check("download: empty title still names the file",
+              "video.mp4" in server.safe_filename("", "mp4"))
+
+        # main() resets the cached yt-dlp flags; it used to set the cache to None,
+        # which broke every subprocess path once that cache became a dict.
+        check("base args cache survives the main() reset",
+              (server._BASE_ARGS.clear() or server.base_ytdlp_args()) is not None)
+
+        dl_info = {"formats": [
+            {"format_id": "hls", "ext": "mp4", "protocol": "m3u8_native",
+             "url": "https://cdn.test/m.m3u8", "vcodec": "avc1", "acodec": "mp4a"},
+            {"format_id": "big", "ext": "webm", "protocol": "https", "height": 2160,
+             "url": "https://cdn.test/4k.webm", "vcodec": "vp9", "acodec": "opus"},
+            {"format_id": "sd", "ext": "mp4", "protocol": "https", "height": 480,
+             "url": "https://cdn.test/sd.mp4", "vcodec": None, "acodec": None},
+        ], "title": "Example"}
+        real_get = server.get_info
+        server.get_info = lambda url, **kw: dl_info
+        try:
+            picked = server.resolve_download("https://site.test/v")
+            check("download: skips HLS and picks a real file",
+                  picked["url"].endswith(".mp4"), picked["url"])
+            check("download: defaults to a sane size, not the 4K file",
+                  picked["height"] == 480, str(picked["height"]))
+            check("download: no codec metadata needed for a plain file",
+                  picked["ext"] == "mp4")
+            check("download: an explicit format id wins",
+                  server.resolve_download("https://site.test/v", "big")["url"].endswith("4k.webm"))
+            server.get_info = lambda url, **kw: {"formats": [dl_info["formats"][0]],
+                                                 "title": "HLS only"}
+            try:
+                server.resolve_download("https://site.test/v")
+                check("download: refuses when only HLS exists", False)
+            except Exception as exc:  # noqa: BLE001
+                check("download: refuses when only HLS exists",
+                      "no single file" in str(exc), str(exc)[:60])
+        finally:
+            server.get_info = real_get
     finally:
         backend.shutdown()
         cdn.shutdown()
