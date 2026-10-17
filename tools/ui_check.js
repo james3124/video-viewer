@@ -170,6 +170,33 @@ setTimeout(() => {
   check('time display follows playback',
     $('ctlTime').textContent.startsWith('1:00 /'), $('ctlTime').textContent);
 
+  // --- mobile behaviours -------------------------------------------
+  // A tap on the picture while the bar is hidden must bring the bar back,
+  // not pause the video (there is no mousemove on a touch screen).
+  Object.defineProperty(video, 'paused', { value: false, writable: true, configurable: true });
+  controls.hidden = false;
+  controls.classList.add('idle');
+  let played = 0, paused = 0;
+  video.play = () => { played++; return Promise.resolve(); };
+  video.pause = () => { paused++; };
+  video.dispatchEvent(new window.PointerEvent('pointerdown', { bubbles: true }));
+  video.dispatchEvent(new window.MouseEvent('click', { bubbles: true }));
+  check('first tap on the picture just reveals the bar',
+    played === 0 && paused === 0 && !controls.classList.contains('idle'),
+    `play=${played} pause=${paused} idle=${controls.classList.contains('idle')}`);
+
+  video.dispatchEvent(new window.PointerEvent('pointerdown', { bubbles: true }));
+  video.dispatchEvent(new window.MouseEvent('click', { bubbles: true }));
+  check('a tap with the bar already up pauses the video', paused === 1, `pause=${paused}`);
+
+  // iOS Safari has no Element.requestFullscreen — fall back to the video call.
+  let iosFull = 0;
+  video.webkitEnterFullscreen = () => { iosFull++; };
+  delete $('stage').requestFullscreen;
+  delete $('stage').webkitRequestFullscreen;
+  $('ctlFull').dispatchEvent(new window.MouseEvent('click', { bubbles: true }));
+  check('fullscreen falls back to iOS webkitEnterFullscreen', iosFull === 1, String(iosFull));
+
   console.log(`\n${pass} passed, ${fail.length} failed`);
   if (fail.length) console.log('failed:', fail.join(', '));
   process.exit(fail.length ? 1 : 0);

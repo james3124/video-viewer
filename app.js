@@ -767,15 +767,34 @@
   helpBtn.addEventListener('click', () => help.showModal());
   closeHelp.addEventListener('click', () => help.close());
 
+  // Touching the picture while the bar is hidden should *bring back the bar*,
+  // not pause the video. Only a tap with the controls already on screen toggles
+  // playback (on desktop the bar is kept awake by mousemove, so nothing changes).
+  let barWasIdle = false;
+  video.addEventListener('pointerdown', () => {
+    barWasIdle = !!(ctl.root && !ctl.root.hidden && ctl.root.classList.contains('idle'));
+  });
   video.addEventListener('click', (e) => {
     if (e.target !== video) return;
+    if (barWasIdle) { barWasIdle = false; wakeControls(); return; }
     if (video.paused) video.play().catch(() => {}); else video.pause();
   });
   video.addEventListener('dblclick', toggleFullscreen);
+  video.addEventListener('webkitbeginfullscreen', syncControls);
+  video.addEventListener('webkitendfullscreen', syncControls);
 
   function toggleFullscreen() {
-    if (document.fullscreenElement) document.exitFullscreen();
-    else stage.requestFullscreen && stage.requestFullscreen();
+    const doc = document;
+    const el = doc.fullscreenElement || doc.webkitFullscreenElement;
+    if (el) {
+      if (doc.exitFullscreen) doc.exitFullscreen();
+      else if (doc.webkitExitFullscreen) doc.webkitExitFullscreen();
+      return;
+    }
+    if (stage.requestFullscreen) { stage.requestFullscreen().catch(() => {}); return; }
+    if (stage.webkitRequestFullscreen) { stage.webkitRequestFullscreen(); return; }
+    // iOS Safari: only <video> can go fullscreen, and only via this vendor call.
+    if (video.webkitEnterFullscreen) video.webkitEnterFullscreen();
   }
 
   /* ------------------------------------------------------------------ *
