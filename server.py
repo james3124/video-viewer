@@ -1458,6 +1458,23 @@ def _codec_state(value) -> str:
     return "yes"
 
 
+def static_build() -> str:
+    """A short id for the current frontend files.
+
+    The phone keeps a page open while you edit the code on the server. Without
+    this the tab happily runs the old JavaScript against the new backend, and a
+    fixed bug looks like it is still broken. index.html gets this value
+    substituted into its build meta tag, and app.js compares it with /api/health.
+    """
+    newest = 0.0
+    for name in ("index.html", "app.js", "ytdlp.js", "style.css", "config.js"):
+        try:
+            newest = max(newest, os.path.getmtime(os.path.join(ROOT, name)))
+        except OSError:
+            continue
+    return hashlib.sha1(f"{int(newest)}".encode()).hexdigest()[:10]
+
+
 def browsable_formats(info: dict) -> list[dict]:
     """Slim, browser-usable view over whatever yt-dlp reported."""
     fmts, seen = [], set()
@@ -1490,7 +1507,11 @@ def browsable_formats(info: dict) -> list[dict]:
         else:
             kind = "direct"
             if f.get("_sniffed"):
-                label = f"{ext or 'media'} · found in the page"
+                # A file we found ourselves. When we know the resolution, lead
+                # with it — "1080p · mp4" is the only thing that tells the
+                # quality buttons apart when a site offers several.
+                label = f"{f['height']}p · {ext or 'media'}" if f.get("height") \
+                    else f"{ext or 'media'} · found in the page"
             elif has_video and has_audio:
                 label = f"{f['height']}p" if f.get("height") else (f.get("format_note") or "video+audio")
                 if ext:
@@ -1933,6 +1954,19 @@ class Handler(BaseHTTPRequestHandler):
         ctype = MIME.get(os.path.splitext(target)[1].lower(), "application/octet-stream")
         st = os.stat(target)
         etag = f'"{int(st.st_mtime):x}-{st.st_size:x}"'
+
+        # index.html carries the build id, so a page left open in a browser can
+        # notice it is running yesterday's JavaScript (see static_build()).
+        if rel == "index.html":
+            try:
+                with open(target, "rb") as fh:
+                    page = fh.read().replace(b"<!--BUILD-->",
+                                             static_build().encode())
+                return self._raw(page, ctype, cache="no-cache", etag=etag,
+                                 head_only=head_only)
+            except OSError:
+                pass
+
         try:
             if self.headers.get("If-None-Match") == etag:
                 self.send_response(304)
@@ -2070,6 +2104,7 @@ class Handler(BaseHTTPRequestHandler):
                 "download": True,
             },
             "tokenRequired": bool(TOKEN),
+            "staticBuild": static_build(),
             "platform": PLATFORM or "self-hosted",
             "cache": {"dir": CACHE_DIR, "entries": len(_MEM), **STATS},
             "notices": notice[-4:],

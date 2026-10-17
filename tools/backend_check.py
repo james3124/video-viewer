@@ -413,6 +413,15 @@ def main() -> int:
               sniffed and sniffed[0]["headers"].get("Referer") == "https://site.test/post/1/")
         check("sniff: synthetic format is marked and says where it came from",
               sniffed and sniffed[0]["sniffed"] and "found in the page" in sniffed[0]["label"])
+        # A sniffed file with a known resolution must lead with it, or every
+        # quality button on a multi-quality site reads the same.
+        sized = server.browsable_formats({"formats": [dict(
+            server.synthetic_info("https://site.test/post/1/",
+                                  "https://cdn.test/media/clip.mp4")["formats"][0],
+            height=1080)]})
+        check("sniff: a sniffed format with a height leads with the resolution",
+              sized and sized[0]["label"].startswith("1080p"),
+              sized[0]["label"] if sized else "none")
 
         smuggled = server.playlist_entries({"entries": [
             {"title": "t", "url": "https://site.test/p/1/#__youtubedl_smuggle=%7B%22http_headers%22%3A%7B%7D%7D"},
@@ -530,6 +539,20 @@ def main() -> int:
             server._fetch_html = real_fetch
         check("player-site: unknown hosts are left to the normal path",
               server.player_site_extract("https://example.com/x") is None)
+
+        # a stale page must be able to notice it is stale ----------------------
+        build = server.static_build()
+        check("build: a frontend build id exists",
+              isinstance(build, str) and len(build) >= 8, str(build))
+        check("build: it is stable between calls", server.static_build() == build)
+        page_html = open(os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "index.html"), encoding="utf-8").read()
+        check("build: index.html carries the placeholder for the server to fill",
+              'name="viewer-build" content="<!--BUILD-->"' in page_html)
+        served = server.static_build().encode()
+        check("build: serving substitutes a real id, not the placeholder",
+              served.decode() != "<!--BUILD-->" and len(served) == len(build))
 
         # a CDN 474/5xx should re-extract instead of surfacing as 502
         check("proxy: 474 counts as 'the url may have expired'",

@@ -150,11 +150,19 @@
 
   async function resolver(pageUrl, fresh) {
     window.ViewerLastFailure = '';
+    // A hard site can spend 15-30 s in yt-dlp's ladder before the adapters run,
+    // so say we are working rather than leaving a dead-looking page.
+    setStatus('Resolving — the backend is working on this link…');
     const data = await info(pageUrl, fresh);
 
     if (data && data.extractable === false) {
       // A playlist still deserves its entry list, even with nothing to play.
       if (data.playlist && data.playlist.entries && data.playlist.entries.length) {
+        // Tell app.js there is nothing to put in <video>: without this it falls
+        // through and points the video element at the page URL, which is an HTML
+        // document — that "plays" as nothing, with no error anywhere.
+        window.ViewerLastFailure =
+          'That link is a list, not a single video — pick an entry below.';
         renderPanel(data, null);
         note(`Playlist “${data.playlist.title || pageUrl}” — ${data.playlist.count} entries. `
            + 'Pick one below.');
@@ -163,7 +171,11 @@
       showBadNews(pageUrl, data.reason || 'yt-dlp could not extract anything playable.');
       return null;
     }
-    if (!data || !data.formats || !data.formats.length) return null;
+    if (!data || !data.formats || !data.formats.length) {
+      window.ViewerLastFailure =
+        'The backend answered but offered no playable format for this link.';
+      return null;
+    }
 
     state.lastInfo = data;
     renderPanel(data);
@@ -373,6 +385,25 @@
   // Probe a few origins: a configured backend first, then same-origin, then the
   // usual localhost ports. The first healthy one wins. If none answer we keep
   // retrying, so a slow/restarted server eventually comes back online.
+  function checkBuild(h) {
+    // A tab left open on a phone keeps running yesterday's JavaScript while the
+    // backend already has today's fixes. That looks exactly like "the bug is
+    // still there", so say what is actually wrong.
+    const mine = document.querySelector('meta[name="viewer-build"]');
+    const theirs = h && h.staticBuild;
+    const here = mine && mine.getAttribute('content');
+    // A plain static host (Vercel) never substitutes the placeholder, so there
+    // is nothing to compare against — stay quiet rather than cry wolf.
+    if (!theirs || !here || here === theirs || /[<>=]/.test(here)) return false;
+    const box = document.getElementById('errors');
+    const msg = 'This page is running older code than the server '
+      + `(page ${here}, server ${theirs}) — reload it to get the fix.`;
+    if (box) { box.hidden = false; box.textContent = msg; }
+    console.warn('[viewer] ' + msg);
+    note(msg);
+    return true;
+  }
+
   async function checkBackend() {
     const configured = configuredBase();
     const state0 = configuredToken();
@@ -394,6 +425,7 @@
           state.ytDlpMode = h.ytDlpMode;
           state.platform = h.platform;
           state.ffmpeg = !!(h.features && h.features.merge);
+          checkBuild(h);
           if (base) { try { localStorage.setItem('viewer.backend', base); } catch (_) {} }
           if (h.tokenRequired && !state.token) {
             state.token = '';
