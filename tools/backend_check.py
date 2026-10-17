@@ -423,6 +423,40 @@ def main() -> int:
         check("playlists: entries without a usable url are dropped",
               smuggled[1]["url"] is None)
 
+        # 16 — API-driven sites ---------------------------------------------
+        page = ('<astro-island props="{&quot;video_id&quot;:[0,3210],'
+                '&quot;slug&quot;:[0,&quot;some-video&quot;]}"></astro-island>')
+        real_json = server._json_get
+        try:
+            server._json_get = lambda url, headers, timeout=25: {
+                "video": {"title": "Example",
+                          "videos": [{"url": "https://cdn.x/hls/i.m3u8"},
+                                     {"url": "https://cdn.x/mp4/720.mp4"}]}}
+            info = server.api_site_extract("https://hanime.tv/videos/hentai/x", html=page)
+            fmts = server.browsable_formats(info)
+            check("api-site: a stream url from the api becomes a format",
+                  bool(fmts) and fmts[0]["url"].endswith("720.mp4"),
+                  fmts[0]["url"] if fmts else "none")
+            check("api-site: progressive file preferred over the playlist",
+                  bool(fmts) and ".m3u8" not in fmts[0]["url"])
+            check("api-site: title is taken from the payload",
+                  info.get("title") == "Example", str(info.get("title")))
+            server._json_get = lambda url, headers, timeout=25: ("error", 403)
+            try:
+                server.api_site_extract("https://hanime.tv/videos/hentai/x", html=page)
+                check("api-site: a blocked api explains itself", False)
+            except Exception as exc:  # noqa: BLE001
+                check("api-site: a blocked api explains itself",
+                      "cookies" in str(exc) and "403" in str(exc), str(exc)[:70])
+        finally:
+            server._json_get = real_json
+        check("api-site: unknown hosts are left to the normal path",
+              server.api_site_extract("https://example.com/x") is None)
+
+        # a CDN 474/5xx should re-extract instead of surfacing as 502
+        check("proxy: 474 counts as 'the url may have expired'",
+              474 in server.EXPIRY_CODES, str(server.EXPIRY_CODES))
+
         # 15 — downloads -----------------------------------------------------
         disp = server.safe_filename('A "weird" / name: ünïcode', "mp4")
         check("download: header has an attachment disposition",

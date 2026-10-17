@@ -287,7 +287,7 @@ HEADER_WHITELIST = ("user-agent", "referer", "origin", "cookie", "authorization"
 HEADER_BLOCKLIST = ("host", "connection", "content-length", "range",
                     "accept-encoding", "accept", "transfer-encoding", "upgrade")
 STREAM_CHUNK = 1 << 18
-EXPIRY_CODES = (401, 403, 410)
+EXPIRY_CODES = (401, 403, 410, 474)      # 474 = CDN "origin refused", i.e. retry
 MEDIA_EXT_RE = re.compile(r"\.(mp4|m4v|webm|ogv|ogg|mov|mkv|avi|mpe?g|ts|mp3|m4a|aac|wav|flac|m3u8)(\?|#|$)", re.I)
 _URI_ATTR = re.compile(r'(URI=")([^"]+)(")')
 
@@ -667,6 +667,142 @@ def _module_extract(url: str, playlist: bool = False, impersonate: bool = True) 
 
 _SNIFF_CACHE: dict[str, tuple[float, list[tuple[str, str]]]] = {}
 SNIFF_TTL = env_int("VIEWER_SNIFF_TTL", default=900)
+
+# --------------------------------------------------------------------------- #
+#  API-driven sites
+#
+#  Some pages carry nothing but an id: the stream URL only exists in the JSON
+#  endpoint the site's own player calls. yt-dlp has no extractor for them, so we
+#  call the same public endpoint a browser would. Kept as a small, explicit table
+#  rather than a heuristic — guessing at API shapes is how extractors rot.
+# --------------------------------------------------------------------------- #
+
+_API_SITES = {
+    # host suffix: (id patterns, endpoint templates)
+    "hanime.tv": (
+        # the Astro island props carry ["video_id", [0, 3210]]
+        (r'"video_id"\s*:\s*\[\s*\d+\s*,\s*(\d+)\s*\]',
+         r'"video_id"\s*:\s*(\d+)'),
+        ("https://guest.freeanimehentai.net/api/v11/video?id={id}",
+         "https://hanime.tv/api/v11/video?id={id}"),
+    ),
+}
+
+
+def _json_get(url: str, headers: dict, timeout: int = 25):
+    """GET some JSON, preferring curl_cffi's browser TLS profile when present."""
+    try:
+        from curl_cffi import requests as _cr          # noqa: PLC0415
+        resp = _cr.get(url, headers=headers, timeout=timeout, impersonate="chrome")
+        if resp.status_code == 200:
+            return resp.json()
+        return ("error", resp.status_code)
+    except ImportError:
+        pass
+    except Exception:  # noqa: BLE001
+        return ("error", 0)
+    req = urllib.request.Request(url, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8", "replace"))
+    except urllib.error.HTTPError as exc:
+        return ("error", exc.code)
+    except Exception:  # noqa: BLE001
+        return ("error", 0)
+
+
+def _media_urls_from_json(obj, depth: int = 0) -> list[str]:
+    """Collect media URLs from a JSON payload without knowing its exact shape."""
+    if depth > 8:
+        return []
+    out: list[str] = []
+    if isinstance(obj, str):
+        for m in re.finditer(r'https?://[^\s"\'\\]+?\.(?:m3u8|mp4|webm|m4v)(?:\?[^\s"\'\\]*)?',
+                             obj, re.I):
+            out.append(m.group(0))
+    elif isinstance(obj, dict):
+        for value in obj.values():
+            out += _media_urls_from_json(value, depth + 1)
+    elif isinstance(obj, list):
+        for value in obj:
+            out += _media_urls_from_json(value, depth + 1)
+    seen, uniq = set(), []
+    for u in out:
+        if u not in seen:
+            seen.add(u)
+            uniq.append(u)
+    return uniq
+
+
+def _title_from_json(obj, depth: int = 0):
+    """Grab a human title from a JSON payload if one is obviously there."""
+    if depth > 6:
+        return None
+    if isinstance(obj, dict):
+        for key in ("title", "name", "video_name", "episode_name"):
+            value = obj.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()[:160]
+        for key in ("video", "data", "result", "item", "videos"):
+            if key in obj:
+                found = _title_from_json(obj[key], depth + 1)
+                if found:
+                    return found
+    elif isinstance(obj, list) and obj:
+        return _title_from_json(obj[0], depth + 1)
+    return None
+
+
+def api_site_extract(url: str, html: str | None = None) -> dict | None:
+    """For sites that only publish a stream URL through a JSON API."""
+    host = (urllib.parse.urlparse(url).hostname or "").lower()
+    entry = next((v for k, v in _API_SITES.items()
+                  if host == k or host.endswith("." + k)), None)
+    if not entry:
+        return None
+    patterns, endpoints = entry
+    if html is None:
+        page = _fetch_html(url)
+        if not page:
+            raise RuntimeError(
+                f"{host} did not serve the page to this server — try from the same "
+                f"network you watch from, or add cookies (VIEWER_COOKIES_B64)")
+        _, html = page
+
+    # The payload usually lives inside an HTML-escaped JSON attribute, so the
+    # quotes arrive as &quot; — normalise before looking for the id.
+    haystack = (html.replace("&quot;", '"').replace("&#34;", '"')
+                .replace("&#39;", "'").replace("&amp;", "&"))
+    video_id = None
+    for pattern in patterns:
+        m = re.search(pattern, haystack)
+        if m:
+            video_id = m.group(1)
+            break
+    if not video_id:
+        return None
+
+    headers = {"Referer": url, "Origin": "/".join(url.split("/")[:3]),
+               "Accept": "application/json, text/plain, */*"}
+    blocked = 0
+    for template in endpoints:
+        api = template.format(id=video_id)
+        payload = _json_get(api, headers)
+        if isinstance(payload, tuple):
+            blocked = blocked or (payload[1] or 0)     # report the first refusal
+            continue
+        found = _media_urls_from_json(payload)
+        if found:
+            found.sort(key=lambda u: (1 if ".m3u8" in u.lower() else 0, len(u)))
+            info = synthetic_info(url, found[0])
+            info["title"] = _title_from_json(payload) or info.get("title")
+            note(f"resolved {host} via its JSON api")
+            return info
+    raise RuntimeError(
+        f"{host} serves its streams from an API that refused the request "
+        f"(HTTP {blocked or 403}) — it wants a real browser session: add cookies "
+        f"(VIEWER_COOKIES_B64) and run the backend from the same network you watch "
+        f"from")
 SNIFF_MAX = env_int("VIEWER_SNIFF_MAX", default=4)
 SNIFF_TIMEOUT = env_int("VIEWER_SNIFF_TIMEOUT", default=25)
 MEDIA_URL_RE = re.compile(
@@ -826,6 +962,15 @@ def _extract_sniffed(url: str, playlist: bool = False) -> dict:
         return _extract(url, playlist=playlist)
     except Exception as first:  # noqa: BLE001
         original = first
+        # Sites that only expose their stream through a JSON API need asking
+        # first: there is nothing in the HTML for the sniffer to find.
+        api_error = None
+        try:
+            api_info = api_site_extract(url)
+            if api_info is not None:
+                return api_info
+        except Exception as exc:  # noqa: BLE001
+            api_error = exc
         for kind, candidate in sniff_targets(url):
             try:
                 if kind == "media":
@@ -833,7 +978,7 @@ def _extract_sniffed(url: str, playlist: bool = False) -> dict:
                 return _extract(candidate, playlist=(kind == "feed"))
             except Exception:  # noqa: BLE001
                 continue
-        raise original
+        raise (api_error or original)
 
 
 def clean_reason(text: str) -> str:
@@ -1931,7 +2076,7 @@ class Handler(BaseHTTPRequestHandler):
                 exc.close()
             except Exception:  # noqa: BLE001
                 pass
-            if code in EXPIRY_CODES:
+            if code in EXPIRY_CODES or 500 <= code < 600:
                 raise Expired(f"The CDN refused the stream ({code})") from exc
             raise RuntimeError(f"Upstream returned {code}") from exc
         except urllib.error.URLError as exc:
