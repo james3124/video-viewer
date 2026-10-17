@@ -30,6 +30,8 @@ callers holding the secret can make the server fetch URLs for them.
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
 import collections
 import email.message
 import hashlib
@@ -38,6 +40,7 @@ import importlib.util
 import io
 import json
 import os
+from html import unescape as html_unescape
 import re
 import shutil
 import socket
@@ -803,6 +806,150 @@ def api_site_extract(url: str, html: str | None = None) -> dict | None:
         f"(HTTP {blocked or 403}) — it wants a real browser session: add cookies "
         f"(VIEWER_COOKIES_B64) and run the backend from the same network you watch "
         f"from")
+
+
+# --------------------------------------------------------------------------- #
+#  Player-frame sites
+#
+#  Some hosts serve the video from their own player frame and hand the browser an
+#  obfuscated media URL that its own page decodes client-side. The generic
+#  extractor has nothing to read, so we run the very same decoder the page already
+#  runs for every visitor. There is no login, no paywall and no signed token — the
+#  value is in the HTML the site serves anyway. Kept as an explicit table, like
+#  _API_SITES: one named entry per site beats a decoder-shaped guess that rots.
+# --------------------------------------------------------------------------- #
+
+def wh_decode_media_url(blob: str) -> str | None:
+    """The player's own `whDecodeMediaUrl()`, ported.
+
+    base64url -> XOR each byte with (13 + i % 17) -> reverse -> base64 again.
+    Returns None unless the result is an http(s) URL.
+    """
+    if not blob:
+        return None
+    data = blob.replace("-", "+").replace("_", "/")
+    data += "=" * (-len(data) % 4)
+    try:
+        first = base64.b64decode(data)
+        second = bytes(b ^ ((13 + i % 17) & 0xFF) for i, b in enumerate(first))
+        second = second[::-1]
+        second += b"=" * (-len(second) % 4)
+        out = base64.b64decode(second).decode("utf-8")
+    except (binascii.Error, ValueError, UnicodeDecodeError):
+        return None
+    return out if out.startswith(("http://", "https://")) else None
+
+
+_WH_PLAYER_RE = re.compile(
+    r"""data-(?:primary|alternate)-player-url=["']([^"']+)["']""", re.I)
+_WH_SOURCES_RE = re.compile(r"""whJwSources\s*=\s*(\[.*?\])\s*;""", re.S)
+_WH_LABEL_RE = re.compile(r"""<h1[^>]*>(.*?)</h1>""", re.S | re.I)
+_WH_DURATION_RE = re.compile(
+    r"""["']duration["']\s*:\s*["']PT(?:(\d+)H)?(?:(\d+)M)?(?:([\d.]+)S)?["']""", re.I)
+
+
+def _wh_height(label: str) -> int | None:
+    m = re.search(r"(\d{3,4})\s*[pP]", label or "")
+    return int(m.group(1)) if m else None
+
+
+def watchhentai_extract(url: str, html: str | None = None) -> dict | None:
+    """watchhentai.net: follow the player frame it names and decode its sources."""
+    if html is None:
+        page = _fetch_html(url)
+        if not page:
+            return None
+        final, html = page
+
+    m = _WH_PLAYER_RE.search(html)
+    if not m:
+        return None
+    player_url = urllib.parse.urljoin(url, m.group(1))
+
+    # The player frame is only served to a browser coming from a video page.
+    frame = _fetch_html(player_url)
+    if not frame:
+        raise RuntimeError(
+            "the player frame refused the request — it wants the video page as the "
+            "Referer; retry, or add cookies (VIEWER_COOKIES_B64)")
+    _, player_html = frame
+
+    src_match = _WH_SOURCES_RE.search(player_html)
+    if not src_match:
+        raise RuntimeError(
+            "the player frame carried no source list — this site's player markup "
+            "changed, so the decoder needs updating")
+
+    try:
+        sources = json.loads(src_match.group(1))
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"the player's source list did not parse: {exc}") from exc
+
+    formats = []
+    for src in sources if isinstance(sources, list) else []:
+        if not isinstance(src, dict):
+            continue
+        media = wh_decode_media_url(src.get("file") or "")
+        if not media:
+            continue
+        ext = (urllib.parse.urlparse(media).path.rsplit(".", 1)[-1] or "mp4").lower()
+        if ext not in ("mp4", "webm", "m4v", "mov"):
+            continue
+        label = str(src.get("label") or "")
+        height = _wh_height(label)
+        # The CDN refuses a request without the player page as its Referer, which
+        # is exactly what a browser sends — needsProxy then routes it via us.
+        formats.append({
+            "format_id": f"wh-{height or ext}",
+            "url": media,
+            "ext": ext,
+            "protocol": "https",
+            "height": height,
+            "vcodec": None,
+            "acodec": None,
+            "_sniffed": True,
+            "http_headers": {"User-Agent": DEFAULT_UA, "Referer": player_url},
+        })
+    if not formats:
+        raise RuntimeError("every source in the player frame decoded to nothing usable")
+
+    formats.sort(key=lambda f: f.get("height") or 0, reverse=True)
+
+    title = None
+    h1 = _WH_LABEL_RE.search(html)
+    if h1:
+        title = html_unescape(re.sub(r"<[^>]+>", "", h1.group(1))).strip()[:160] or None
+    # The VideoObject block with the runtime lives in the player frame, not on the
+    # page, so look in both and take whichever answers.
+    duration = None
+    for blob in (player_html, html):
+        dur = _WH_DURATION_RE.search(blob)
+        if dur:
+            duration = (int(dur.group(1) or 0) * 3600 + int(dur.group(2) or 0) * 60
+                        + float(dur.group(3) or 0)) or None
+            break
+
+    note(f"decoded {len(formats)} source(s) from the watchhentai player frame")
+    return {
+        "title": title,
+        "extractor_key": "watchhentai",
+        "duration": duration,
+        "formats": formats,
+        "webpage_url": url,
+    }
+
+
+_PLAYER_SITES = {"watchhentai.net": watchhentai_extract}
+
+
+def player_site_extract(url: str, html: str | None = None) -> dict | None:
+    """Hand the page to an adapter for a host we know how to decode."""
+    host = (urllib.parse.urlparse(url).hostname or "").lower()
+    fn = next((v for k, v in _PLAYER_SITES.items()
+               if host == k or host.endswith("." + k)), None)
+    return fn(url, html) if fn else None
+
+
 SNIFF_MAX = env_int("VIEWER_SNIFF_MAX", default=4)
 SNIFF_TIMEOUT = env_int("VIEWER_SNIFF_TIMEOUT", default=25)
 MEDIA_URL_RE = re.compile(
@@ -950,6 +1097,29 @@ def _extract(url: str, playlist: bool = False, depth: int = 0) -> dict:
     raise RuntimeError(with_hint(friendly(last)))
 
 
+def _is_comment_playlist(info: dict) -> bool:
+    """True when yt-dlp's generic extractor latched onto a page's comment links.
+
+    On a busy WordPress page the first <a href> it likes can be a comment
+    permalink, which it happily reports as a 200-entry "Comments for …"
+    playlist. It has no playable formats, so accepting it as success means the
+    video is never found and the user gets an empty player — and following it
+    walks from page to page chasing other people's comments.
+    """
+    entries = info.get("entries")
+    if not entries:
+        return False
+    if info.get("formats") or info.get("url"):
+        return False                       # a real playlist that also plays
+    title = str((info.get("playlist") or {}).get("title") or info.get("title") or "")
+    if re.search(r"\bcomments?\b", title, re.I):
+        return True
+    links = [str(e.get("url") or "") for e in entries if isinstance(e, dict)]
+    return bool(links) and all(
+        re.search(r"/comment-page-\d+|#comment-\d+|/comments?/|#respond", u, re.I)
+        for u in links)
+
+
 def _extract_sniffed(url: str, playlist: bool = False) -> dict:
     """yt-dlp first; if it gives up, look for the media in the page ourselves.
 
@@ -959,26 +1129,56 @@ def _extract_sniffed(url: str, playlist: bool = False) -> dict:
     "Unsupported URL" into a playable format.
     """
     try:
-        return _extract(url, playlist=playlist)
+        info = _extract(url, playlist=playlist)
+        # "Succeeded" is not the same as "playable": a comment playlist has to
+        # fall through to the ladder below instead of ending the search.
+        if not _is_comment_playlist(info):
+            return info
+        note(f"{_host_of(url)}: yt-dlp only found comment links — looking for the "
+             f"video itself")
+        original = RuntimeError(
+            f"yt-dlp found only comment links on {_host_of(url)}, not the video")
     except Exception as first:  # noqa: BLE001
         original = first
-        # Sites that only expose their stream through a JSON API need asking
-        # first: there is nothing in the HTML for the sniffer to find.
-        api_error = None
+
+    # Sites that only expose their stream through a JSON API need asking first:
+    # there is nothing in the HTML for the sniffer to find.
+    api_error = None
+    try:
+        api_info = api_site_extract(url)
+        if api_info is not None:
+            return api_info
+    except Exception as exc:  # noqa: BLE001
+        api_error = exc
+
+    # Player-frame hosts hand the browser an obfuscated media URL; run the same
+    # decoder their own page runs.
+    player_error = None
+    try:
+        player_info = player_site_extract(url)
+        if player_info is not None:
+            return player_info
+    except Exception as exc:  # noqa: BLE001
+        player_error = exc
+
+    for kind, candidate in sniff_targets(url):
         try:
-            api_info = api_site_extract(url)
-            if api_info is not None:
-                return api_info
-        except Exception as exc:  # noqa: BLE001
-            api_error = exc
-        for kind, candidate in sniff_targets(url):
-            try:
-                if kind == "media":
-                    return synthetic_info(url, candidate)
-                return _extract(candidate, playlist=(kind == "feed"))
-            except Exception:  # noqa: BLE001
-                continue
-        raise (api_error or original)
+            if kind == "media":
+                return synthetic_info(url, candidate)
+            found = _extract(candidate, playlist=(kind == "feed"))
+            # An RSS feed on a comment-heavy page yields a playlist of comments:
+            # no formats, and every entry is another page's comment permalink.
+            if not _is_comment_playlist(found):
+                return found
+            note(f"{_host_of(candidate)} is only a comment feed — skipping it")
+        except Exception:  # noqa: BLE001
+            continue
+
+    # The adapter's own complaint is the most specific one, so it wins.
+    for err in (player_error, api_error, original):
+        if err is not None:
+            raise err
+    raise RuntimeError(f"nothing playable found on {_host_of(url)}")
 
 
 def clean_reason(text: str) -> str:

@@ -65,6 +65,35 @@ Extra bits that help on hostile networks:
 - Retries, socket timeouts and a shared yt-dlp cache directory are always on.
 - Playlists, channels and profile pages are detected and listed in the UI.
 
+### Site adapters
+
+Some hosts have no usable generic extraction, so there is a small explicit
+adapter table in `server.py` instead of a heuristic. One entry per site, because
+guessing at site shapes is how extractors rot.
+
+| Host | What the adapter does |
+|---|---|
+| `hanime.tv` | the stream URL only exists in the JSON endpoint the site's own player calls |
+| `watchhentai.net` | follows the player frame the page names, then runs that frame's own client-side decoder (`whDecodeMediaUrl`) to recover the real, per-quality MP4 URLs |
+
+Both only read what the site serves to any visitor — no login, no paywall, no
+signed token. The media URLs are obfuscated in the HTML, but the page decodes
+them for every browser that loads it, so the adapter just runs the same code.
+The CDN then requires the player frame as its `Referer`, which is why these
+formats report `needsProxy` and stream through `/api/play?...&proxy=1`.
+
+To add a site: write the extractor, add a row to the table, and add a check to
+`tools/backend_check.py`.
+
+### Comment pages are not playlists
+
+On a busy WordPress page yt-dlp's generic extractor sometimes latches onto the
+first comment permalink and reports a 200-entry "Comments for …" playlist. It
+has no playable formats, so accepting it as success leaves you with an empty
+player — and following it just walks to the next page of comments. Those results
+are rejected (`_is_comment_playlist`) and the search falls through to the
+adapters and the HTML sniffer instead.
+
 ### When a host still will not play
 
 Whether a host works is a property of the **server's IP**, not of the page, so

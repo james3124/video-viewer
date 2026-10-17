@@ -453,6 +453,84 @@ def main() -> int:
         check("api-site: unknown hosts are left to the normal path",
               server.api_site_extract("https://example.com/x") is None)
 
+        # 16b — comment playlists must not end the search ---------------------
+        comments = {"playlist": {"title": "\n\tComments for Watch Hentai\t", "count": 2},
+                    "entries": [{"url": "https://site.test/comment-page-1/#comment-9"},
+                                {"url": "https://site.test/comment-page-2/#comment-11"}]}
+        check("comment-playlist: a page's comment links are rejected",
+              server._is_comment_playlist(comments))
+        check("comment-playlist: a real playlist is kept",
+              not server._is_comment_playlist(
+                  {"playlist": {"title": "Best of"},
+                   "entries": [{"url": "https://youtube.com/watch?v=abc"}]}))
+        check("comment-playlist: a playlist that also plays is kept",
+              not server._is_comment_playlist({"entries": [{"url": "https://x/1"}],
+                                               "formats": [{"url": "https://x/1.mp4"}]}))
+        check("comment-playlist: a plain video is kept",
+              not server._is_comment_playlist({"formats": [{"url": "https://x/1.mp4"}]}))
+
+        # 16c — player-frame sites with an obfuscated media url ---------------
+        blob = ("MF9Lc2UnUHdicVNVYSJ3UWlISW54eUVfZFN7dXRTQkIvJEpqeWQjXnt8Qk94KUp7cylK"
+                "V3dJInVkQSd3ZC5hSmxWREd-YmJKZ31LcSEjREJ3XHZ_a189bH8oa18iWF50KEtSeg")
+        check("player-site: the page's own decoder round-trips its blob",
+              server.wh_decode_media_url(blob)
+              == "https://hstorage.xyz/files/K/kotowarenai-haha/"
+                 "kotowarenai-haha-2_1080p.mp4",
+              str(server.wh_decode_media_url(blob)))
+        check("player-site: junk decodes to nothing rather than to bytes",
+              server.wh_decode_media_url("not-base64-at-all!!") is None
+              and server.wh_decode_media_url("") is None)
+
+        wh_page = ('<h1 class="entry-title">Kotowarenai Haha &#8211; Episode 2</h1>'
+                   '<iframe class="metaframe" data-primary-player-url='
+                   '"https://watchhentai.net/player/19823/1/mp4/" '
+                   'data-alternate-player-url="https://watchhentai.net/player-alt/x/">'
+                   '<script>{"@type":"VideoObject","duration":"PT24M50S"}</script>')
+        frame = ('<script>var whJwSources = [{"file":"' + blob + '",'
+                 '"type":"video/mp4","label":"1080p","default":true}];</script>')
+        real_fetch = server._fetch_html
+        try:
+            server._fetch_html = lambda u: (u, frame if "/player/" in u else wh_page)
+            info = server.player_site_extract(
+                "https://watchhentai.net/videos/kotowarenai-haha-episode-2-id-01/")
+            fmts = server.browsable_formats(info)
+            check("player-site: a decoded source becomes a format",
+                  bool(fmts) and fmts[0]["url"].endswith("_1080p.mp4"),
+                  fmts[0]["url"] if fmts else "none")
+            check("player-site: the quality label becomes the height",
+                  bool(fmts) and fmts[0]["height"] == 1080,
+                  str(fmts[0]["height"]) if fmts else "none")
+            check("player-site: the player frame is the Referer, so it needs the proxy",
+                  bool(fmts) and fmts[0]["needsProxy"]
+                  and fmts[0]["headers"].get("Referer") == "https://watchhentai.net/player/19823/1/mp4/",
+                  str(fmts[0].get("headers")) if fmts else "none")
+            check("player-site: title is unescaped",
+                  info.get("title") == "Kotowarenai Haha – Episode 2",
+                  str(info.get("title")))
+            check("player-site: iso-8601 duration is parsed",
+                  info.get("duration") == 1490, str(info.get("duration")))
+
+            server._fetch_html = lambda u: None
+            try:
+                server.player_site_extract("https://watchhentai.net/videos/x/",
+                                           html=wh_page)
+                check("player-site: an unreachable player frame explains itself", False)
+            except Exception as exc:  # noqa: BLE001
+                check("player-site: an unreachable player frame explains itself",
+                      "Referer" in str(exc), str(exc)[:70])
+            server._fetch_html = lambda u: (u, "<html>markup changed</html>")
+            try:
+                server.player_site_extract("https://watchhentai.net/videos/x/",
+                                           html=wh_page)
+                check("player-site: changed markup is reported, not guessed at", False)
+            except Exception as exc:  # noqa: BLE001
+                check("player-site: changed markup is reported, not guessed at",
+                      "decoder needs updating" in str(exc), str(exc)[:70])
+        finally:
+            server._fetch_html = real_fetch
+        check("player-site: unknown hosts are left to the normal path",
+              server.player_site_extract("https://example.com/x") is None)
+
         # a CDN 474/5xx should re-extract instead of surfacing as 502
         check("proxy: 474 counts as 'the url may have expired'",
               474 in server.EXPIRY_CODES, str(server.EXPIRY_CODES))
