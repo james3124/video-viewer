@@ -384,8 +384,28 @@ def main() -> int:
               st == 204 and hd.get("Access-Control-Allow-Origin") == "*")
         st, _, _ = fetch(bport, "/api/bogus")
         check("routes: unknown /api path is 404 json", st == 404)
+
+        # the browser error beacon: reaches the operator without a token, capped
+        real_ul = server.UI_LOG_LIMIT
+        try:
+            server.UI_LOG_LIMIT = server.SlidingWindow(1)
+            st, _, _ = fetch(bport, "/api/ui-log?msg=smoke-test+from+the+suite")
+            check("ui-log: the browser error beacon lands", st == 204, str(st))
+            st, _, _ = fetch(bport, "/api/ui-log?msg=second")
+            check("ui-log: beacon flood is capped", st == 429, str(st))
+        finally:
+            server.UI_LOG_LIMIT = real_ul
         st, _, _ = fetch(bport, "/../server.py")
         check("static: path traversal refused", st in (403, 404), str(st))
+        st, hd, raw = fetch(bport, "/vendor/hls.min.js")
+        check("static: the vendored hls.js is served from this server",
+              st == 200 and len(raw) > 100_000
+              and "javascript" in hd.get("Content-Type", "").lower(),
+              f"{st} {len(raw)}B {hd.get('Content-Type', '')}")
+        st, hd, raw = fetch(bport, "/index.html")
+        check("index: hls.js comes from us, not a third-party CDN",
+              st == 200 and b"vendor/hls.min.js" in raw and b"jsdelivr" not in raw,
+              "index.html script src")
 
         # 9 — rate limit ---------------------------------------------------------
         server.EXTRACT_LIMIT = server.SlidingWindow(2)

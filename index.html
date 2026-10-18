@@ -144,7 +144,10 @@
   <button id="closeHelp">Close</button>
 </dialog>
 
-<script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.17/dist/hls.min.js"></script>
+<!-- hls.js is vendored and served from this server: a third-party CDN here
+     means ad blockers or DNS filters silently kill every HLS stream before
+     our backend is ever asked for a byte. -->
+<script src="vendor/hls.min.js"></script>
 <script src="config.js"></script>
 <script src="app.js"></script>
 <script src="ytdlp.js"></script>

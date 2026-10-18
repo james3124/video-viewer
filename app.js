@@ -100,6 +100,15 @@
   function error(msg) {
     errBox.hidden = false;
     errBox.textContent = msg;
+    // The phone is the only place this fires, so a server-side copy of what it
+    // saw turns "still can't play" into a one-line diagnosis. Fire-and-forget,
+    // never allowed to break the error box itself (jsdom may lack fetch).
+    try {
+      if (typeof fetch === 'function') {
+        fetch(`/api/ui-log?msg=${encodeURIComponent(String(msg).slice(0, 200))}`)
+          .catch(() => {});
+      }
+    } catch (_) { /* report path must never become the error */ }
   }
   /* Failure with the escape hatch attached: the explanation plus a way out that
      does not depend on our extractor working. */
@@ -561,7 +570,15 @@
 
     if (!video.canPlayType('application/vnd.apple.mpegurl')) {
       if (!window.Hls || !window.Hls.isSupported()) {
-        return error('This browser cannot play HLS natively and hls.js did not load (offline?).');
+        // No MSE in this build and canPlayType claims no native HLS. But
+        // canPlayType lies on Android WebView and some Chromium builds, so
+        // throwing the URL away is worse than trying: hand it to the element
+        // and let the real error events speak.
+        status('No hls.js here — trying the browser player directly…');
+        video.src = src;
+        setDocumentTitle('HLS — ' + prettyName(src));
+        tryAutoplay();
+        return;
       }
       hls = new window.Hls({ lowLatencyMode: true, backBufferLength: 90 });
       hls.on(window.Hls.Events.ERROR, (_e, d) => {

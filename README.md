@@ -69,6 +69,14 @@ Extra bits that help on hostile networks:
   hostnames in the message instead of leading the phone somewhere else. Tune
   with `VIEWER_MAX_REDIRECTS`, or allow another CDN family with
   `VIEWER_REDIRECT_HOSTS=a.com,b.com`.
+- The frontend has no third-party CDN assets: hls.js is vendored in
+  `vendor/` and served from this server, so an ad blocker or DNS filter can
+  no longer silently break every HLS stream. When a browser really has no
+  MSE, the player still hands the stream to its native player and reports
+  whatever that says.
+- Every error the browser shows is echoed to the server log (`[ui] …`, via
+  `/api/ui-log`, rate-limited): "it doesn't play" becomes a diagnosable line
+  instead of a back-and-forth.
 - `VIEWER_ALWAYS_PROXY=1` (or the "stream through this server" checkbox in the
   quality panel) keeps the browser off CDNs entirely: every byte comes from
   this server, so no remote host can redirect the player's tab.

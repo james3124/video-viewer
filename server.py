@@ -2092,6 +2092,7 @@ class SlidingWindow:
 
 
 EXTRACT_LIMIT = SlidingWindow(RATE_PER_MIN)
+UI_LOG_LIMIT = SlidingWindow(20)
 
 
 # --------------------------------------------------------------------------- #
@@ -2298,10 +2299,14 @@ class Handler(BaseHTTPRequestHandler):
                 "/api/merge": lambda: self._api_merge(q, head),
                 "/api/hls": lambda: self._api_hls(q, head),
                 "/api/subsrc": lambda: self._api_subsrc(q, head),
+                "/api/ui-log": lambda: self._api_ui_log(q, head),
             }
             fn = routes.get(path)
             if fn is not None:
-                if path != "/api/health":
+                # ui-log stays token-free like health: it is the error box's
+                # way of telling the operator what the phone saw, and it is
+                # exactly what must still work when the UI is stranded.
+                if path not in ("/api/health", "/api/ui-log"):
                     if not self._authorized(q):
                         return self._send_error_json("Invalid or missing token", 401)
                     # Only the expensive/extraction calls are limited — a single
@@ -2786,6 +2791,23 @@ class Handler(BaseHTTPRequestHandler):
                     proc.stderr.close()
                 except OSError:
                     pass
+
+    # -- UI telemetry ----------------------------------------------------------- #
+    def _api_ui_log(self, q: dict, head: bool = False) -> None:
+        """One line per error the browser shows, so 'still can't play' is
+        diagnosable from the log without asking the user to transcribe UI text.
+        Token-free on purpose (the error path must never be locked out), so it
+        is capped hard per address and the message truncated."""
+        if not UI_LOG_LIMIT.allow(self._client_ip()):
+            return self._send_error_json("Too many ui-log messages", 429)
+        msg = (q.get("msg") or "").strip()[:200]
+        if msg and not head:
+            sys.stderr.write(f"[ui] {msg}\n")
+            sys.stderr.flush()
+        self.send_response(204)
+        self.send_header("Content-Length", "0")
+        self._cors()
+        self.end_headers()
 
     # -- subtitles -------------------------------------------------------------- #
     def _api_subsrc(self, q: dict, head: bool = False) -> None:
