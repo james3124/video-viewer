@@ -110,6 +110,13 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   check('the title reached the page',
     /Kotowarenai/i.test(window.document.title), window.document.title);
 
+  // The always-proxy toggle lives in the quality row of the happy-path panel.
+  // Grab it here: the playlist mock below re-renders the panel without it, but
+  // the captured element keeps its real change listener for the toggle test.
+  const alwaysBox = window.document.querySelector('#ytdlp .yt-always input[type=checkbox]');
+  check('the panel offers the always-proxy toggle', !!alwaysBox,
+    alwaysBox ? 'checkbox present' : 'no .yt-always checkbox');
+
   // ---- the silent-failure case ------------------------------------------
   // When the backend answers "this is a list, nothing playable here", the old
   // code returned null without saying so, and app.js fell through to
@@ -141,6 +148,45 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     !/list\.test/.test(listSrc), listSrc.slice(0, 80) || '(empty)');
   check('a playlist-only answer explains itself instead of failing silently',
     !!window.ViewerLastFailure, window.ViewerLastFailure || '(no message)');
+
+  // The failure box must carry the way out: exactly one safe new-tab link to
+  // the page itself, so a stuck extraction never strands the user.
+  const errBox = $('errors');
+  const link = errBox ? errBox.querySelector('a') : null;
+  check('the failure box offers the escape hatch',
+    !!errBox && errBox.hidden === false && !!link &&
+    errBox.querySelectorAll('a').length === 1 &&
+    link.target === '_blank' &&
+    link.rel.includes('noopener') && link.rel.includes('noreferrer') &&
+    link.href.endsWith('https://list.test/feed/'),
+    link ? `${link.target} ${link.rel} ${link.href}`
+         : ((errBox && errBox.textContent) || '(no anchor)').slice(0, 60));
+
+  // Flipping "always proxy" re-resolves. With the playlist answer still mocked,
+  // nothing playable comes back — the video must never end up pointing at the
+  // page URL, and the choice must persist. (The playlist panel above has no
+  // checkbox; the happy-path one captured earlier still fires its listener.)
+  if (alwaysBox) {
+    alwaysBox.checked = true;
+    alwaysBox.dispatchEvent(new window.Event('change'));
+    await sleep(600);
+    const toggledSrc = $('video').getAttribute('src') || '';
+    let stored = null, storageOk = true;
+    try { stored = window.localStorage.getItem('viewer.alwaysProxy'); }
+    catch (_) { storageOk = false; }   // jsdom origin may refuse storage
+    check('toggling always-proxy re-resolves without pointing at the page',
+      !/list\.test/.test(toggledSrc) && (!storageOk || stored === '1'),
+      `src=${toggledSrc.slice(0, 70) || '(empty)'} pref=${storageOk ? String(stored) : '(unavailable)'}`);
+    // Leave no trace for later checks.
+    alwaysBox.checked = false;
+    alwaysBox.dispatchEvent(new window.Event('change'));
+    try { window.localStorage.removeItem('viewer.alwaysProxy'); } catch (_) { /* jsdom */ }
+    await sleep(100);
+  } else {
+    check('toggling always-proxy re-resolves without pointing at the page', false,
+      'no always-proxy toggle in the panel');
+  }
+
   window.fetch = realFetch;
 
   console.log(`\n${pass} passed, ${fail.length} failed`);

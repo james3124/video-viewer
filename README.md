@@ -64,6 +64,18 @@ Extra bits that help on hostile networks:
   members-only and region-locked hosts.
 - Retries, socket timeouts and a shared yt-dlp cache directory are always on.
 - Playlists, channels and profile pages are detected and listed in the UI.
+- The streaming proxy never follows a redirect off the domain the media was
+  resolved on (cap: 5 hops) — a poisoned or expired CDN link fails with both
+  hostnames in the message instead of leading the phone somewhere else. Tune
+  with `VIEWER_MAX_REDIRECTS`, or allow another CDN family with
+  `VIEWER_REDIRECT_HOSTS=a.com,b.com`.
+- `VIEWER_ALWAYS_PROXY=1` (or the "stream through this server" checkbox in the
+  quality panel) keeps the browser off CDNs entirely: every byte comes from
+  this server, so no remote host can redirect the player's tab.
+- When extraction fails, the error box and the ↗ button in the control bar
+  offer the honest fallback: open the original page in a new tab — their
+  player, their session, `target="_blank" rel="noopener noreferrer"` so it
+  cannot pull this page with it.
 
 ### What works out of the box
 

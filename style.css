@@ -546,3 +546,19 @@ dialog[open]{animation:pop .16s ease-out}
   .ctl:active,.ctl.on:active{background:rgba(255,255,255,.22)}
   button:active,.file-btn:active{filter:brightness(1.15)}
 }
+
+/* ---------- escape hatch + per-device proxy toggle ---------- */
+.yt-always{
+  display:inline-flex;
+  align-items:center;
+  gap:6px;
+  margin:8px 0 0 2px;
+  color:var(--muted);
+  font-size:12px;
+  cursor:pointer;
+  user-select:none;
+  white-space:nowrap;
+}
+.yt-always input{accent-color:var(--accent);width:15px;height:15px}
+.yt-always:active,.site-link:active{opacity:.7}
+.site-link{color:var(--accent);margin:0 2px;text-decoration:underline}

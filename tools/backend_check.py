@@ -112,6 +112,44 @@ class CDN(BaseHTTPRequestHandler):
         self.end_headers()
 
 
+class Zone(BaseHTTPRequestHandler):
+    """A tame origin on 127.0.0.1, for the media redirect guard exercises."""
+
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *a):
+        pass
+
+    def _302(self, location: str) -> None:
+        self.send_response(302)
+        self.send_header("Location", location)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def do_GET(self):                       # noqa: N802
+        if self.path == "/file":
+            body = b"ZONE01"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        elif self.path == "/same":
+            self._302("/file")                       # same host — may follow
+        elif self.path == "/off":
+            self._302("http://example.com/x.mp4")    # leaves the domain
+        elif self.path == "/loop":
+            self._302("/loop")                       # redirect to itself, always
+        elif self.path == "/chain":
+            self._302("/chain?i=1")                  # fresh URL every hop
+        elif self.path.startswith("/chain?i="):
+            self._302(f"/chain?i={int(self.path.partition('i=')[2]) + 1}")
+        else:
+            self.send_response(404)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+
 class Backend(BaseHTTPRequestHandler):
     """Routes straight into server.Handler without touching the socket layer."""
 
@@ -316,6 +354,99 @@ def main() -> int:
         st, _, _ = fetch(bport, "/api/info" + q("http://127.0.0.1:9/x.mp4"))
         check("ssrf: loopback refused when VIEWER_BLOCK_PRIVATE=1", st == 400, str(st))
         server.BLOCK_PRIVATE = False
+
+        # 10b — media redirect guard --------------------------------------------
+        zone = ThreadingHTTPServer(("127.0.0.1", 0), Zone)
+        zport = zone.server_address[1]
+        threading.Thread(target=zone.serve_forever, daemon=True).start()
+        try:
+            host = "127.0.0.1"
+            table = [
+                ("video.google.com", "google.com"),
+                ("x.example.co.uk", "example.co.uk"),
+                ("v16m.tiktokcdn.com", "tiktokcdn.com"),
+                ("rr2---sn-qpuvuxaxjvh-jxce.googlevideo.com", "googlevideo.com"),
+                ("localhost", "localhost"),          # single labels pass through
+                ("127.0.0.1", "127.0.0.1"),
+            ]
+            wrong = [f"{h}->{server.base_domain(h)} (want {w})"
+                     for h, w in table if server.base_domain(h) != w]
+            check("redirect guard: base_domain trims CDN hosts to their operator",
+                  not wrong, "; ".join(wrong) or f"{len(table)} hosts ok")
+
+            # a redirect that stays inside the domain is followed to the file
+            try:
+                resp = server.guarded_urlopen(f"http://{host}:{zport}/same",
+                                              {"Range": "bytes=0-5"}, timeout=10)
+                first = resp.read(6)
+                resp.close()
+            except Exception as exc:  # noqa: BLE001
+                check("redirect guard: follows a redirect on the same domain",
+                      False, f"{type(exc).__name__}: {exc}")
+            else:
+                check("redirect guard: follows a redirect on the same domain",
+                      resp.status == 200 and b"ZONE01" in first
+                      and resp.headers.get("Content-Type", "").startswith("text/plain"),
+                      f"{resp.status}, {first!r}")
+
+            # leaving the domain is refused before example.com is ever contacted
+            try:
+                server.guarded_urlopen(f"http://{host}:{zport}/off", {}, timeout=10)
+                check("redirect guard: refuses an off-domain redirect", False,
+                      "no exception raised")
+            except server.RedirectBlocked as exc:
+                check("redirect guard: refuses an off-domain redirect",
+                      "example.com" in str(exc) and "VIEWER_REDIRECT_HOSTS" in str(exc),
+                      str(exc))
+            except Exception as exc:  # noqa: BLE001
+                check("redirect guard: refuses an off-domain redirect", False,
+                      f"wrong error: {type(exc).__name__}: {str(exc)[:70]}")
+
+            # a url that redirects to itself can never finish, and must abort
+            try:
+                server.guarded_urlopen(f"http://{host}:{zport}/loop", {}, timeout=10)
+                check("redirect guard: a self-redirect cannot loop the stream", False,
+                      "no exception raised")
+            except Exception as exc:  # noqa: BLE001
+                check("redirect guard: a self-redirect cannot loop the stream",
+                      isinstance(exc, (server.RedirectBlocked, urllib.error.HTTPError)),
+                      f"{type(exc).__name__}: {str(exc)[:80]}")
+
+            # distinct urls every hop: only the hop cap itself ends the chain
+            try:
+                server.guarded_urlopen(f"http://{host}:{zport}/chain", {}, timeout=10)
+                check("redirect guard: refuses to chase an endless hop chain", False,
+                      "no exception raised")
+            except server.RedirectBlocked as exc:
+                check("redirect guard: refuses to chase an endless hop chain",
+                      "redirected" in str(exc)
+                      and str(server.PROXY_MAX_REDIRECTS) in str(exc),
+                      str(exc)[:90])
+            except Exception as exc:  # noqa: BLE001
+                check("redirect guard: refuses to chase an endless hop chain", False,
+                      f"wrong error: {type(exc).__name__}: {str(exc)[:70]}")
+        finally:
+            zone.shutdown()
+            zone.server_close()
+
+        # 10c — the ALWAYS_PROXY override ---------------------------------------
+        bare_info = {"id": "x", "title": "t", "url": "http://a.test/",
+                     "formats": [{"format_id": "f1", "url": "http://a.test/f.mp4",
+                                  "ext": "mp4"}]}         # no http_headers at all
+        real_always = server.ALWAYS_PROXY
+        try:
+            server.ALWAYS_PROXY = False
+            entries = server.browsable_formats(bare_info)
+            check("proxy: a header-free format does not need the proxy",
+                  len(entries) == 1 and entries[0]["needsProxy"] is False,
+                  f"{len(entries)} entry(ies)")
+            server.ALWAYS_PROXY = True
+            entries = server.browsable_formats(bare_info)
+            check("proxy: ALWAYS_PROXY flags every format for the proxy",
+                  len(entries) == 1 and entries[0]["needsProxy"] is True,
+                  f"{len(entries)} entry(ies)")
+        finally:
+            server.ALWAYS_PROXY = real_always
 
         # 11 — subtitle conversion cache -------------------------------------------
         sub_url = "https://cdn.example.test/captions.vtt"

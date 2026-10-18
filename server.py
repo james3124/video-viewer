@@ -291,6 +291,84 @@ HEADER_BLOCKLIST = ("host", "connection", "content-length", "range",
                     "accept-encoding", "accept", "transfer-encoding", "upgrade")
 STREAM_CHUNK = 1 << 18
 EXPIRY_CODES = (401, 403, 410, 474)      # 474 = CDN "origin refused", i.e. retry
+
+# -- media redirect guard -------------------------------------------------- #
+# The phone trusts this server with every byte of a stream, so the server must
+# not let the media drag it somewhere else. urllib follows 302s silently; this
+# guard follows them only within the domain the stream was resolved on.
+PROXY_MAX_REDIRECTS = env_int("VIEWER_MAX_REDIRECTS", default=5)
+_REDIRECT_ALLOW_EXTRA = tuple(
+    h.strip().lower() for h in env("VIEWER_REDIRECT_HOSTS", "").split(",")
+    if h.strip())
+
+# VIEWER_ALWAYS_PROXY=1 forces every format to report needsProxy, so phones
+# never talk to a CDN directly and can never be led anywhere by one. Prefer
+# the checkbox in the quality panel for a per-device choice; this is for a
+# locked-down deployment.
+ALWAYS_PROXY = bool(env_int("VIEWER_ALWAYS_PROXY", default=0))
+
+_SECOND_LEVEL_TLD = {"co.uk", "org.uk", "gov.uk", "com.au", "com.br", "com.mx",
+                     "co.jp", "co.in", "co.kr", "co.za", "com.tr", "com.cn",
+                     "com.pl"}
+
+
+def base_domain(host: str) -> str:
+    """The part of a host that one operator controls.
+
+    `video.google.com` → `google.com`, `x.example.co.uk` → `example.co.uk`,
+    single-label hosts (localhost, `127.0.0.1`) pass through unchanged.
+    """
+    labels = (host or "").lower().rstrip(".").split(".")
+    last = labels[-1] if labels else ""
+    if len(labels) >= 3 and ".".join(labels[-2:]) in _SECOND_LEVEL_TLD:
+        return ".".join(labels[-3:])
+    if len(labels) >= 2 and last and not last.isdigit():
+        return ".".join(labels[-2:])
+    return host or ""
+
+
+class RedirectBlocked(RuntimeError):
+    """A media URL tried to hop to a host outside the one we resolved."""
+
+
+class _MediaRedirectGuard(urllib.request.HTTPRedirectHandler):
+    """urllib's redirect handler, confined to one operator's domain."""
+
+    def __init__(self, allowed: str):
+        super().__init__()
+        self.allowed = allowed
+        self.hops = 0
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        self.hops += 1
+        if self.hops > PROXY_MAX_REDIRECTS:
+            raise RedirectBlocked(
+                f"the media redirected {PROXY_MAX_REDIRECTS}+ times — not following")
+        hop = base_domain(urllib.parse.urlparse(newurl).hostname or "")
+        if hop != self.allowed and hop not in _REDIRECT_ALLOW_EXTRA:
+            raise RedirectBlocked(
+                f"the media tried to redirect from {self.allowed} to {hop} — refused "
+                f"(allow it with VIEWER_REDIRECT_HOSTS={hop} if that CDN is expected)")
+        if newurl == req.get_full_url():
+            # A URL redirecting to itself is an infinite loop even though the
+            # domain matches; urllib's own cycle check would only fire later
+            # with a vaguer message, so own the case here.
+            raise RedirectBlocked(
+                f"the media redirected to itself {self.hops} times — not following")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def guarded_urlopen(url: str, headers: dict, head: bool = False, timeout: float = PROXY_TIMEOUT):
+    """Open a media URL without letting its redirects leave the resolved domain."""
+    origin = urllib.parse.urlparse(url)
+    # `netloc` carries the port, which base_domain would read as a label — use
+    # the bare hostname so "host:8443" and "host" allow the same hops.
+    opener = urllib.request.build_opener(
+        _MediaRedirectGuard(base_domain(origin.hostname or "")))
+    req = urllib.request.Request(url, headers=headers, method="HEAD" if head else "GET")
+    return opener.open(req, timeout=timeout)
+
+
 MEDIA_EXT_RE = re.compile(r"\.(mp4|m4v|webm|ogv|ogg|mov|mkv|avi|mpe?g|ts|mp3|m4a|aac|wav|flac|m3u8)(\?|#|$)", re.I)
 _URI_ATTR = re.compile(r'(URI=")([^"]+)(")')
 
@@ -1617,7 +1695,8 @@ def browsable_formats(info: dict) -> list[dict]:
             # Anything beyond a plain UA has to be re-fetched by us: <video> and
             # hls.js cannot attach Referer/Cookie cross-origin. That single flag
             # is what makes header-protected (18+, TikTok, …) links playable.
-            "needsProxy": any(k.lower() != "user-agent" for k in headers),
+            "needsProxy": True if ALWAYS_PROXY else any(
+                k.lower() != "user-agent" for k in headers),
             "headers": headers,
         }
         key = (entry["id"], entry["url"][:64])
@@ -1638,7 +1717,8 @@ def browsable_formats(info: dict) -> list[dict]:
             "width": None, "height": None, "fps": None,
             "hasAudio": True, "hasVideo": True,
             "url": info["url"],
-            "needsProxy": any(k.lower() != "user-agent" for k in headers),
+            "needsProxy": True if ALWAYS_PROXY else any(
+                k.lower() != "user-agent" for k in headers),
             "headers": headers, "size": info.get("filesize"),
             "sizeHuman": human_size(info.get("filesize")),
             "protocol": (info.get("protocol") or ""), "expiresIn": info.get("expires_in"),
@@ -2140,6 +2220,8 @@ class Handler(BaseHTTPRequestHandler):
             pass
         except Expired as exc:
             self._send_error_json(friendly(exc), 502)
+        except RedirectBlocked as exc:
+            self._send_error_json(friendly(exc), 502)
         except Exception as exc:  # noqa: BLE001
             _, path = self._query()
             note(f"{path} failed: {exc}")
@@ -2167,6 +2249,7 @@ class Handler(BaseHTTPRequestHandler):
             "python": sys.version.split()[0],
             "ffmpegAvailable": FFMPEG is not None,
             "features": {
+                "alwaysProxy": ALWAYS_PROXY,
                 "proxy": True,
                 "hls": True,
                 "merge": FFMPEG is not None and mode != "none",
@@ -2372,8 +2455,7 @@ class Handler(BaseHTTPRequestHandler):
         rng = self.headers.get("Range")
         if rng:
             merged["Range"] = rng
-        req = urllib.request.Request(url, headers=merged, method="HEAD" if head else "GET")
-        return urllib.request.urlopen(req, timeout=PROXY_TIMEOUT)
+        return guarded_urlopen(url, merged, head=head, timeout=PROXY_TIMEOUT)
 
     def _proxy(self, url: str, headers: dict, head: bool = False,
                reject_html: bool = False, disposition: str | None = None) -> None:

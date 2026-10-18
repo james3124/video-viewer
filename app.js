@@ -101,6 +101,18 @@
     errBox.hidden = false;
     errBox.textContent = msg;
   }
+  /* Failure with the escape hatch attached: the explanation plus a way out that
+     does not depend on our extractor working. */
+  function errorWithSite(msg) {
+    errBox.hidden = false;
+    errBox.textContent = '';
+    const span = document.createElement('span');
+    span.textContent = msg;
+    errBox.appendChild(span);
+    if (typeof currentUrl === 'string' && /^https?:/i.test(currentUrl)) {
+      errBox.appendChild(window.ViewerSiteLink(currentUrl));
+    }
+  }
   const clearError = () => { errBox.hidden = true; errBox.textContent = ''; };
 
   function status(text) {
@@ -135,6 +147,7 @@
     rate: document.getElementById('ctlRate'),
     cc: document.getElementById('ctlCC'),
     dl: document.getElementById('ctlDl'),
+    site: document.getElementById('ctlSite'),
     pip: document.getElementById('ctlPip'),
     full: document.getElementById('ctlFull'),
   };
@@ -411,6 +424,17 @@
       wakeControls();
     });
     ctl.dl.addEventListener('click', downloadCurrent);
+    if (ctl.site) {
+      ctl.site.addEventListener('click', () => {
+        if (!currentUrl || !/^https?:/i.test(currentUrl)) {
+          return status('No link to open — paste one first.');
+        }
+        const a = window.ViewerSiteLink(currentUrl);
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+      });
+    }
     ctl.pip.addEventListener('click', () => pipBtn.click());
     ctl.full.addEventListener('click', toggleFullscreen);
 
@@ -489,7 +513,7 @@
           // The backend is up and already explained itself in the error box:
           // trying to play the page URL as media only produces a bogus
           // "codec error" on top of a real, already-reported reason.
-          if (window.ViewerLastFailure) return;
+          if (window.ViewerLastFailure) return errorWithSite(window.ViewerLastFailure);
           return playNative(clean);
         }
         playResolved(resolved);
@@ -616,6 +640,17 @@
   window.ViewerApply = playResolved;
   /* Exposed for ytdlp.js: jump straight to another link (playlist entries). */
   window.ViewerPlay = play;
+  /* Exposed for ytdlp.js and the error paths: a new-tab link to the pasted page,
+     built once so target/rel can never regress to an unsafe default. */
+  window.ViewerSiteLink = function (url) {
+    const a = document.createElement('a');
+    a.href = url;
+    a.target = '_blank';
+    a.rel = 'noopener noreferrer';
+    a.className = 'site-link';
+    a.textContent = 'open on the original site ↗';
+    return a;
+  };
 
   function showMedia() {
     dropzone.hidden = true;

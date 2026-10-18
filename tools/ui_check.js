@@ -77,6 +77,19 @@ check('seek range exists', !!$('seek') && $('seek').tagName === 'INPUT');
 check('skip buttons exist', !!$('ctlBack') && !!$('ctlFwd'));
 check('time field exists', !!$('ctlTime') && !!$('ctlTimeInput'));
 
+// 2b — the escape hatch: a link out to the original site, built so it can
+// never hand our page's privileges to theirs.
+const siteLink = typeof window.ViewerSiteLink === 'function'
+  ? window.ViewerSiteLink('https://a.test/x') : null;
+check('a viewer site link opens a new tab responsibly',
+  !!siteLink && siteLink.tagName === 'A' && siteLink.target === '_blank' &&
+  siteLink.rel.includes('noopener') && siteLink.rel.includes('noreferrer') &&
+  siteLink.href === 'https://a.test/x',
+  siteLink ? `${siteLink.target} ${siteLink.rel}` : '(no ViewerSiteLink)');
+check('the open-on-site button exists in the controls',
+  !!$('ctlSite') && $('ctlSite').tagName === 'BUTTON',
+  $('ctlSite') ? $('ctlSite').tagName : 'missing');
+
 // 3 — the video has no native controls attribute (we draw our own)
 check('native controls attribute absent', $('video').getAttribute('controls') === null);
 
@@ -155,6 +168,19 @@ setTimeout(() => {
     String(video.currentTime));
   check('garbage time explains itself', $('errors').textContent.includes('banana'),
     $('errors').textContent.slice(0, 60));
+
+  // error() keeps the box plain text: the site-link escape hatch belongs to
+  // errorWithSite (extractor failures), never to our own validation nag.
+  let siteLinkCalls = 0;
+  const realSiteLink = window.ViewerSiteLink;
+  window.ViewerSiteLink = (...args) => { siteLinkCalls++; return realSiteLink(...args); };
+  $('ctlTime').dispatchEvent(new window.MouseEvent('click', { bubbles: true }));
+  $('ctlTimeInput').value = 'banana';
+  $('ctlTimeInput').dispatchEvent(new window.KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+  window.ViewerSiteLink = realSiteLink;
+  check('error() keeps the box plain text',
+    siteLinkCalls === 0 && $('errors').querySelector('a') === null,
+    `links=${siteLinkCalls} box="${$('errors').textContent.slice(0, 40)}"`);
 
   // Volume + speed + captions.
   $('ctlVolume').value = '0.4';

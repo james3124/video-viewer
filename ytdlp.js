@@ -29,6 +29,11 @@
     lastInfo: null,
   };
 
+  const ALWAYS_KEY = 'viewer.alwaysProxy';
+  function alwaysProxy() {
+    try { return localStorage.getItem(ALWAYS_KEY) === '1'; } catch (_) { return false; }
+  }
+
   const panel = document.createElement('div');
   panel.id = 'ytdlp';
   panel.hidden = true;
@@ -109,7 +114,7 @@
     if (fmt.kind === 'hls') {
       // Adaptive streams only work when every segment can be re-fetched with the
       // right headers — i.e. through /api/hls, which rewrites the playlist.
-      const proxied = !!fmt.needsProxy;
+      const proxied = !!fmt.needsProxy || alwaysProxy();
       return {
         kind: 'hls', url: fmt.url,
         proxyUrl: proxied ? hlsUrl(pageUrl, fmt.id) : null,
@@ -120,8 +125,10 @@
       kind: 'direct', url: fmt.url,
       proxyUrl: playUrl(pageUrl, fmt.id),
       // CDNs that demand extra headers (Referer/Cookie) refuse the browser's
-      // plain request, so those go straight through the backend.
-      proxied: !!fmt.needsProxy,
+      // plain request, so those go straight through the backend. The per-device
+      // toggle goes further: when it is set, the browser never touches the CDN
+      // directly — every stream is re-fetched by this server.
+      proxied: !!fmt.needsProxy || alwaysProxy(),
     };
   }
 
@@ -201,7 +208,17 @@
     // app.js checks this flag to avoid "playing" a web page as if it were media.
     window.ViewerLastFailure = why;
     const box = document.getElementById('errors');
-    if (box) { box.hidden = false; box.textContent = 'yt-dlp: ' + why; }
+    if (box) {
+      box.hidden = false;
+      box.textContent = '';
+      const span = document.createElement('span');
+      span.textContent = 'yt-dlp: ' + why;
+      box.appendChild(span);
+      if (typeof window.ViewerSiteLink === 'function' &&
+          /^https?:/i.test(pageUrl || '')) {
+        box.appendChild(window.ViewerSiteLink(pageUrl));
+      }
+    }
     setStatus(why);
     state.lastInfo = { reason: why, url: pageUrl };
   }
@@ -283,6 +300,22 @@
         window.ViewerApply({ stream: { ...built, proxied: true }, meta: buildMeta(data, f) });
       });
       row.appendChild(proxy);
+
+      const always = document.createElement('label');
+      always.className = 'yt-always';
+      always.title = 'Route every stream through this server, so the browser '
+                   + 'never follows a CDN redirect it did not ask for';
+      const alwaysBox = document.createElement('input');
+      alwaysBox.type = 'checkbox';
+      alwaysBox.checked = alwaysProxy();
+      alwaysBox.addEventListener('change', () => {
+        try { localStorage.setItem(ALWAYS_KEY, alwaysBox.checked ? '1' : '0'); }
+        catch (_) { /* jsdom tests, private mode */ }
+        resolver(data.url).then((r) => { if (r) window.ViewerApply(r); }).catch(() => {});
+      });
+      always.appendChild(alwaysBox);
+      always.appendChild(document.createTextNode(' stream through this server'));
+      row.appendChild(always);
 
       const hide = document.createElement('button');
       hide.type = 'button';
