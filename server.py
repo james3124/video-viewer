@@ -863,6 +863,13 @@ def watchhentai_extract(url: str, html: str | None = None) -> dict | None:
 
     m = _WH_PLAYER_RE.search(html)
     if not m:
+        # Series pages never carry a player frame — that is the site's own
+        # naming, not a guess. Saying so now keeps the resolver off yt-dlp's
+        # 16+ s crawl of a page it can never understand.
+        if "/series/" in urllib.parse.urlparse(url).path:
+            raise NotAVideoPage(
+                "a series page lists episodes — open an episode link; it has no "
+                "single video to play")
         return None
     player_url = urllib.parse.urljoin(url, m.group(1))
 
@@ -940,6 +947,16 @@ def watchhentai_extract(url: str, html: str | None = None) -> dict | None:
 
 
 _PLAYER_SITES = {"watchhentai.net": watchhentai_extract}
+
+
+class NotAVideoPage(RuntimeError):
+    """An adapter read the page and can state what it is: not a single video.
+
+    Unlike a provisional failure (frame unreachable, markup changed), a
+    page-type fact read off the URL/HTML is decisive — no other path in the
+    ladder will succeed either, so the resolver can stop and say so instead of
+    spending 20+ s proving it again.
+    """
 
 
 def player_site_extract(url: str, html: str | None = None) -> dict | None:
@@ -1120,14 +1137,51 @@ def _is_comment_playlist(info: dict) -> bool:
         for u in links)
 
 
+def _known_adapter_host(url: str) -> bool:
+    host = (_host_of(url) or "").lower()
+    return any(host == k or host.endswith("." + k)
+               for k in (*_PLAYER_SITES, *_API_SITES))
+
+
 def _extract_sniffed(url: str, playlist: bool = False) -> dict:
-    """yt-dlp first; if it gives up, look for the media in the page ourselves.
+    """Resolve a link: a site that needs an adapter first, then yt-dlp, then a
+    bounded look for the media in the page ourselves.
 
     WordPress tube sites and similar wrappers hide the stream behind a player
     frame (`player.php?q=…`) or simply link to it, which the generic extractor
     does not follow. One bounded extra pass is usually enough to turn
     "Unsupported URL" into a playable format.
     """
+    # Hosts with an adapter *start* there, and only fall back to yt-dlp if the
+    # adapter cannot answer. The generic extractor costs 15+ s to crawl such a
+    # page — and frequently answers "Unsupported URL" anyway — while the
+    # adapter is two quick requests with the answer already in them. Measured
+    # on a watchhentai page: 2.4 s through the adapter, 16.6 s through yt-dlp.
+    api_error: Exception | None = None
+    player_error: Exception | None = None
+    tried_adapters: list[str] = []
+
+    if _known_adapter_host(url):
+        for step, fn in (("api", api_site_extract), ("player", player_site_extract)):
+            tried_adapters.append(step)
+            try:
+                info = fn(url)
+                if info is not None:
+                    return info
+            except NotAVideoPage:
+                # The adapter read the page and found nothing any other path
+                # could use either; report its verdict now instead of spending
+                # the yt-dlp crawl + sniffer pass re-proving it.
+                raise
+            except Exception as exc:  # noqa: BLE001
+                # Keep each adapter's diagnosis: the player one says exactly
+                # what changed on that site ("the player frame carried no
+                # source list"), which is the error worth reporting in the end.
+                if step == "player":
+                    player_error = exc
+                else:
+                    api_error = exc
+
     try:
         info = _extract(url, playlist=playlist)
         # "Succeeded" is not the same as "playable": a comment playlist has to
@@ -1143,23 +1197,23 @@ def _extract_sniffed(url: str, playlist: bool = False) -> dict:
 
     # Sites that only expose their stream through a JSON API need asking first:
     # there is nothing in the HTML for the sniffer to find.
-    api_error = None
-    try:
-        api_info = api_site_extract(url)
-        if api_info is not None:
-            return api_info
-    except Exception as exc:  # noqa: BLE001
-        api_error = exc
+    if "api" not in tried_adapters:
+        try:
+            api_info = api_site_extract(url)
+            if api_info is not None:
+                return api_info
+        except Exception as exc:  # noqa: BLE001
+            api_error = exc
 
     # Player-frame hosts hand the browser an obfuscated media URL; run the same
     # decoder their own page runs.
-    player_error = None
-    try:
-        player_info = player_site_extract(url)
-        if player_info is not None:
-            return player_info
-    except Exception as exc:  # noqa: BLE001
-        player_error = exc
+    if "player" not in tried_adapters:
+        try:
+            player_info = player_site_extract(url)
+            if player_info is not None:
+                return player_info
+        except Exception as exc:  # noqa: BLE001
+            player_error = exc
 
     for kind, candidate in sniff_targets(url):
         try:

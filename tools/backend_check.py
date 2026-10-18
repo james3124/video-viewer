@@ -540,6 +540,52 @@ def main() -> int:
         check("player-site: unknown hosts are left to the normal path",
               server.player_site_extract("https://example.com/x") is None)
 
+        # a series page answers instantly with its own reason, not after the
+        # generic crawl
+        bare = "<html><body><h1>Kotowarenai Haha</h1></body></html>"
+        try:
+            server.player_site_extract(
+                "https://watchhentai.net/series/kotowarenai-haha-id-01/",
+                html=bare)
+            check("player-site: a series page says so, fast", False)
+        except Exception as exc:  # noqa: BLE001
+            check("player-site: a series page says so, fast",
+                  isinstance(exc, server.NotAVideoPage) and "series" in str(exc),
+                  str(exc)[:70])
+        check("player-site: a non-series page without a frame stays None",
+              server.player_site_extract("https://watchhentai.net/videos/x/",
+                                         html=bare) is None)
+
+        # known hosts start with their adapter; yt-dlp is only the fallback
+        real_extract = server._extract
+        real_player = server.player_site_extract
+        reached_ytdlp = []
+        try:
+            server._extract = lambda u, playlist=False: reached_ytdlp.append(u)
+            server.player_site_extract = lambda u: {
+                "id": "x", "title": "t",
+                "formats": [{"url": "http://cdn/a.mp4", "ext": "mp4"}]}
+            info = server._extract_sniffed(
+                "https://watchhentai.net/videos/kotowarenai-haha-episode-2-id-01/")
+            check("adapter-first: a known host never reaches the yt-dlp crawl",
+                  not reached_ytdlp, "yt-dlp called for %r" % reached_ytdlp)
+            check("adapter-first: the adapter's answer is used",
+                  len(info.get("formats") or []) > 0,
+                  "%d formats" % len(info.get("formats") or []))
+            # a decisive verdict ends the search before the fallback work
+            server.player_site_extract = lambda u: (_ for _ in ()).throw(
+                server.NotAVideoPage("a series page lists episodes"))
+            try:
+                server._extract_sniffed("https://watchhentai.net/series/k-01/")
+                check("decisive: a not-a-video page does not fall through", False)
+            except server.NotAVideoPage:
+                check("decisive: a not-a-video page does not fall through", True)
+            check("decisive: yt-dlp is never reached for it",
+                  not reached_ytdlp, "yt-dlp called for %r" % reached_ytdlp)
+        finally:
+            server._extract = real_extract
+            server.player_site_extract = real_player
+
         # a stale page must be able to notice it is stale ----------------------
         build = server.static_build()
         check("build: a frontend build id exists",
