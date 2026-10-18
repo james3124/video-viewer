@@ -150,6 +150,51 @@ class Zone(BaseHTTPRequestHandler):
             self.end_headers()
 
 
+class Sula(BaseHTTPRequestHandler):
+    """A tame sulasokvid-shaped site: video.php's inline JS names an /e/ embed,
+    and that embed's /api/stream answers a filecode with a manifest URL."""
+
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *a):
+        pass
+
+    def do_GET(self):                       # noqa: N802
+        if self.path.startswith("/video.php"):
+            port = self.server.server_address[1]
+            body = (f"<!doctype html><html><head><title>Katkat</title></head><body>"
+                    f"<script>const iframe = document.createElement('iframe');"
+                    f"iframe.src = 'http://127.0.0.1:{port}/e/deadbeef01';"
+                    f"</script></body></html>").encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        else:
+            self.send_response(404)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+    def do_POST(self):                      # noqa: N802
+        length = int(self.headers.get("Content-Length") or 0)
+        body = self.rfile.read(length) if length else b""
+        if self.path == "/api/stream" and b"deadbeef01" in body:
+            port = self.server.server_address[1]
+            out = json.dumps({"streaming_url":
+                              f"http://127.0.0.1:{port}/hls/master.m3u8?token=t",
+                              "title": ""}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(out)))
+            self.end_headers()
+            self.wfile.write(out)
+        else:
+            self.send_response(400)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+
 class Backend(BaseHTTPRequestHandler):
     """Routes straight into server.Handler without touching the socket layer."""
 
@@ -447,6 +492,49 @@ def main() -> int:
                   f"{len(entries)} entry(ies)")
         finally:
             server.ALWAYS_PROXY = real_always
+
+        # 10d — sulasokvid adapter against a tame embed host ---------------------
+        sula = ThreadingHTTPServer(("127.0.0.1", 0), Sula)
+        sport = sula.server_address[1]
+        threading.Thread(target=sula.serve_forever, daemon=True).start()
+        try:
+            check("sulasok: registered as a player site",
+                  "sulasokvid.co" in server._PLAYER_SITES, "")
+            try:
+                server.sulasokvid_extract("http://127.0.0.1:1/some-listing")
+                check("sulasok: a non-watch page says so", False, "no raise")
+            except server.NotAVideoPage:
+                check("sulasok: a non-watch page says so", True, "")
+            except Exception as exc:  # noqa: BLE001
+                check("sulasok: a non-watch page says so", False,
+                      f"wrong error: {type(exc).__name__}")
+            try:
+                got = server.sulasokvid_extract(
+                    f"http://127.0.0.1:{sport}/watch.php?id=katkat")
+            except Exception as exc:  # noqa: BLE001
+                check("sulasok: watch.php resolves through the player API",
+                      False, f"{type(exc).__name__}: {str(exc)[:80]}")
+            else:
+                fmt = (got.get("formats") or [{}])[0]
+                check("sulasok: watch.php resolves through the player API",
+                      got.get("title") == "Katkat"
+                      and got.get("webpage_url", "").endswith("/video.php?id=katkat")
+                      and fmt.get("ext") == "m3u8"
+                      and fmt.get("url", "").endswith("/hls/master.m3u8?token=t")
+                      and fmt.get("http_headers", {}).get("Referer", "")
+                      .endswith("/e/deadbeef01"),
+                      f"title={got.get('title')!r} url={fmt.get('url', '')[:60]!r}")
+                if fmt.get("url"):
+                    entries = server.browsable_formats(
+                        {"id": "k", "title": "t", "url": got["webpage_url"],
+                         "formats": [fmt]})
+                    check("sulasok: the manifest plays as proxied HLS",
+                          len(entries) == 1 and entries[0]["kind"] == "hls"
+                          and entries[0]["needsProxy"] is True,
+                          f"kind={entries[0]['kind'] if entries else None}")
+        finally:
+            sula.shutdown()
+            sula.server_close()
 
         # 11 — subtitle conversion cache -------------------------------------------
         sub_url = "https://cdn.example.test/captions.vtt"

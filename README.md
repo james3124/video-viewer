@@ -105,6 +105,7 @@ guessing at site shapes is how extractors rot.
 |---|---|
 | `hanime.tv` | the stream URL only exists in the JSON endpoint the site's own player calls |
 | `watchhentai.net` | follows the player frame the page names, then runs that frame's own client-side decoder (`whDecodeMediaUrl`) to recover the real, per-quality MP4 URLs |
+| `sulasokvid.co` | replays the site's own three-step player flow server-side: `watch.php` → `video.php` (its Skip button's target), read the `/e/` embed its JS injects, then that embed's `POST /api/stream` answers with the HLS manifest. Skips the ad redirect and the "intro" gate by construction |
 
 Both only read what the site serves to any visitor — no login, no paywall, no
 signed token. The media URLs are obfuscated in the HTML, but the page decodes

@@ -792,6 +792,30 @@ def _json_get(url: str, headers: dict, timeout: int = 25):
         return ("error", 0)
 
 
+def _json_post(url: str, payload: dict, headers: dict, timeout: int = 25):
+    """POST JSON and parse the JSON answer, same TLS preference as _json_get."""
+    body = json.dumps(payload).encode("utf-8")
+    try:
+        from curl_cffi import requests as _cr          # noqa: PLC0415
+        resp = _cr.post(url, data=body, headers=headers, timeout=timeout,
+                        impersonate="chrome")
+        if resp.status_code == 200:
+            return resp.json()
+        return ("error", resp.status_code)
+    except ImportError:
+        pass
+    except Exception:  # noqa: BLE001
+        return ("error", 0)
+    req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8", "replace"))
+    except urllib.error.HTTPError as exc:
+        return ("error", exc.code)
+    except Exception:  # noqa: BLE001
+        return ("error", 0)
+
+
 def _media_urls_from_json(obj, depth: int = 0) -> list[str]:
     """Collect media URLs from a JSON payload without knowing its exact shape."""
     if depth > 8:
@@ -1024,7 +1048,82 @@ def watchhentai_extract(url: str, html: str | None = None) -> dict | None:
     }
 
 
-_PLAYER_SITES = {"watchhentai.net": watchhentai_extract}
+_SULASOK_EMBED_RE = re.compile(
+    r"""iframe\.src\s*=\s*["']([^"']+?/e/[A-Za-z0-9_-]+)["']""", re.I)
+_SULASOK_TITLE_RE = re.compile(r"<title>([^<]+)</title>", re.I)
+
+
+def sulasokvid_extract(url: str, html: str | None = None) -> dict | None:
+    """sulasokvid.co: watch.php is a gate — the real player is an /e/ embed.
+
+    The page's own flow: watch.php shows an "intro" webp whose Skip button
+    builds video.php, whose inline JS injects an embed iframe from the player
+    host, whose /api/stream answers a plain POST with the HLS manifest. Every
+    step is served to every visitor; the only gate is the ad redirect, which
+    running the same steps server-side skips by construction.
+    """
+    parsed = urllib.parse.urlparse(url)
+    video_id = (urllib.parse.parse_qs(parsed.query).get("id") or [""])[0]
+    if not video_id or not parsed.path.endswith(("/watch.php", "/video.php")):
+        # A listing/home page carries no single video — same reasoning as the
+        # series pages on watchhentai: say so instead of burning 20 s on yt-dlp.
+        raise NotAVideoPage(
+            "this sulasokvid page lists videos — open a watch link (…/watch.php?id=…)")
+    if parsed.path.endswith("/watch.php"):
+        # video.php is where the site's own Skip button takes the browser.
+        url = urllib.parse.urlunparse(parsed._replace(
+            path=parsed.path[:-len("watch.php")] + "video.php"))
+    if html is None or not parsed.path.endswith("/video.php"):
+        page = _fetch_html(url)
+        if not page:
+            raise RuntimeError("the sulasokvid page did not load — retry, or check the link")
+        _, html = page
+
+    m = _SULASOK_EMBED_RE.search(html)
+    if not m:
+        raise RuntimeError(
+            "the sulasokvid page named no player embed — its markup changed, so "
+            "the adapter needs updating")
+    embed_url = m.group(1)
+    embed = urllib.parse.urlparse(embed_url)
+    stream = _json_post(
+        f"{embed.scheme}://{embed.netloc}/api/stream",
+        # device/codecs are what the page's own detectDevice()/detectCodecs()
+        # would send for a plain desktop browser without av1/h265.
+        {"filecode": embed.path.rsplit("/", 1)[-1], "device": "web", "codecs": []},
+        {"User-Agent": DEFAULT_UA, "Referer": embed_url,
+         "Content-Type": "application/json"},
+    )
+    streaming = stream.get("streaming_url") if isinstance(stream, dict) else None
+    if not streaming:
+        raise RuntimeError(
+            "the player's stream API answered without a stream URL — its scheme "
+            "changed, so the adapter needs updating")
+
+    # The manifest token is bound to the extracting IP, so this stream can only
+    # play from this server anyway — needsProxy (Referer header) is correct,
+    # not just polite.
+    note("resolved the sulasokvid player embed to an HLS manifest")
+    t = _SULASOK_TITLE_RE.search(html)
+    return {
+        "title": html_unescape(t.group(1)).strip()[:160] or None if t else None,
+        "extractor_key": "sulasokvid",
+        "formats": [{
+            "format_id": "sulasok-hls",
+            "url": streaming,
+            "ext": "m3u8",
+            "protocol": "https",
+            "vcodec": None,
+            "acodec": None,
+            "_sniffed": True,
+            "http_headers": {"User-Agent": DEFAULT_UA, "Referer": embed_url},
+        }],
+        "webpage_url": url,
+    }
+
+
+_PLAYER_SITES = {"watchhentai.net": watchhentai_extract,
+                 "sulasokvid.co": sulasokvid_extract}
 
 
 class NotAVideoPage(RuntimeError):
