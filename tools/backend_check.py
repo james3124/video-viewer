@@ -586,6 +586,21 @@ def main() -> int:
             server._extract = real_extract
             server.player_site_extract = real_player
 
+        # decisive vs provisional; session-bound CDNs tell the truth ----------
+        check("cdn notes: a tiktok web token explains itself",
+              "cookies" in (server.session_bound_media_note(
+                  "https://v16-webapp-prime.tiktok.com/video/tos/abc/?a=1988") or ""),
+              str((server.session_bound_media_note(
+                  "https://v16-webapp-prime.tiktok.com/video/tos/abc/?a=1988") or "")[:70]))
+        check("cdn notes: the app-CDN (music) family needs no note",
+              server.session_bound_media_note(
+                  "https://v16m.tiktokcdn.com/video/tos/x.mp4") is None)
+        check("cdn notes: ordinary hosts get none",
+              server.session_bound_media_note(
+                  "https://v16m.tiktokcdn.com/../../x.mp4") is None
+              and server.session_bound_media_note(
+                  "https://cdn.example.com/a.mp4") is None)
+
         # a stale page must be able to notice it is stale ----------------------
         build = server.static_build()
         check("build: a frontend build id exists",

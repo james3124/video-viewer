@@ -1235,6 +1235,26 @@ def _extract_sniffed(url: str, playlist: bool = False) -> dict:
     raise RuntimeError(f"nothing playable found on {_host_of(url)}")
 
 
+def session_bound_media_note(url: str) -> str | None:
+    """Some CDNs mint stream URLs only for the session that requested them.
+
+    Measured on TikTok: every video format comes from `v16/v19-webapp-prime`
+    tokens that a real browser also gets 403 on when replayed from another
+    session (the CLI works only because it downloads inside the minting
+    session; our stateless proxy cannot). Only the music CDN (`tiktokcdn.com`)
+    serves anyone. An "adapter" cannot statelessly fix this either — the
+    sanctioned path is the user's own cookies.
+    """
+    host = (_host_of(url) or "").lower()
+    if "tiktok" in host and "webapp" in url.lower():
+        return ("TikTok mints its video URLs only for the session that requested "
+                "them, so the server cannot replay them — only the audio streams "
+                "without cookies. Save a TikTok cookies file via "
+                "VIEWER_COOKIES_B64 (or run server.py with your cookies.txt) and "
+                "re-resolve to watch the video.")
+    return None
+
+
 def clean_reason(text: str) -> str:
     """Drop yt-dlp's wiki boilerplate so the answer is one sentence, not a dump."""
     text = re.sub(r"\s+", " ", text or "").strip()
@@ -2366,7 +2386,8 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:  # noqa: BLE001
                 pass
             if code in EXPIRY_CODES or 500 <= code < 600:
-                raise Expired(f"The CDN refused the stream ({code})") from exc
+                raise Expired(session_bound_media_note(url)
+                              or f"The CDN refused the stream ({code})") from exc
             raise RuntimeError(f"Upstream returned {code}") from exc
         except urllib.error.URLError as exc:
             raise RuntimeError(f"Upstream refused the request ({exc.reason})") from exc

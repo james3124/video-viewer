@@ -1,122 +1,54 @@
-"""Check whether a host is reachable, extractable and playable — per site.
+"""Ask the backend which layer answers for a URL, and how fast.
 
-    python3 tools/site_check.py                     # built-in list
-    python3 tools/site_check.py https://example.com # your own URL
+    .venv/bin/python tools/site_check.py <url> [more urls...]
 
-Prints structure only (extractor, format count, headers needed, error text) —
-never titles or any media content. Run it on the *same machine* that runs
-server.py: whether a host works depends on its IP, not on your code.
+Why: the viewer resolves a link through a ladder —
 
-Exit code 0 = every host resolved, 1 = at least one did not.
+  1. a site adapter (only for hosts registered in _PLAYER_SITES / _API_SITES)
+  2. yt-dlp's ~1,800 extractors (YouTube, TikTok, Facebook, and most sites)
+  3. a bounded page sniff for direct media links yt-dlp missed
+  4. an error
+
+This tool runs the real extraction once per URL and prints which layer
+caught it, the playable formats, and the timing. Use it when a site
+"doesn't work": the output is the bug report.
 """
 
-import os
+import json
 import sys
 import time
-import urllib.error
-import urllib.request
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, __file__.rsplit("/", 2)[0])
 
-# Homepage-level probes: enough to see the edge (Cloudflare/DataDome/age gate)
-# without depending on any particular video URL.
-HOSTS = [
-    "https://www.xvideos.com/",
-    "https://www.pornhub.com/",
-    "https://www.youporn.com/",
-    "https://www.redtube.com/",
-    "https://www.spankbang.com/",
-    "https://onlyfans.com/",
-    # landing pages that link to the embed hosts below rather than embedding
-    # anything themselves — useful contrast when a link "will not play"
-    "https://sulasokvid.co/",
-    # hosts yt-dlp's family extractor does support
-    "https://dood.to/",
-    "https://filemoon.sx/",
-    "https://viewsb.com/",
-    "https://viidshar.com/",
-    # non-adult controls, useful to tell "site is down" from "IP is blocked"
-    "https://www.youtube.com/",
-    "https://www.tiktok.com/",
-]
-
-UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
-      "Chrome/126.0 Safari/537.36")
-CHALLENGE = ("just a moment", "checking your browser", "cf-mitigated",
-             "attention required", "captcha", "access denied", "are you a robot",
-             "ddos-guard", "datadome", "pardon the interruption")
-
-
-def edge(url: str, headers: dict) -> tuple[int | None, str, dict]:
-    req = urllib.request.Request(url, headers=headers, method="GET")
-    try:
-        with urllib.request.urlopen(req, timeout=25) as r:
-            body = r.read(4096).decode("utf-8", "replace").lower()
-            return r.status, body, dict(r.headers)
-    except urllib.error.HTTPError as exc:
-        try:
-            body = exc.read(4096).decode("utf-8", "replace").lower()
-        except Exception:  # noqa: BLE001
-            body = ""
-        return exc.code, body, dict(exc.headers or {})
-    except Exception as exc:  # noqa: BLE001
-        return None, str(exc).lower(), {}
-
-
-def edge_check(url: str) -> str:
-    status, body, headers = edge(url, {"User-Agent": UA})
-    server = headers.get("Server", "-")
-    via = "cloudflare" if headers.get("CF-RAY") or "cloudflare" in server.lower() else server[:22]
-    verdict = "open" if status == 200 else f"HTTP {status}"
-    hit = next((c for c in CHALLENGE if c in body), None)
-    if hit:
-        verdict += f" · challenge({hit})"
-    if headers.get("CF-Mitigated"):
-        verdict += f" · CF-Mitigated={headers['CF-Mitigated']}"
-    return f"{verdict} via {via}"
-
-
-def extraction(url: str) -> str:
-    """Run the real backend extraction path and report the shape of the result."""
-    import server
-
-    if server.ytdlp_mode() == "none":
-        return "yt-dlp not installed"
-    started = time.time()
-    try:
-        info = server.get_info(url, playlist=True)
-    except Exception as exc:  # noqa: BLE001
-        return f"FAIL  {server.friendly(exc)[:150]}"
-    fmts = server.browsable_formats(info)
-    proxied = sum(1 for f in fmts if f["needsProxy"])
-    headers = sorted({k for f in fmts for k in f["headers"]})
-    bits = [f"ok   {len(fmts)} formats", f"{proxied} need the proxy"]
-    if headers:
-        bits.append("headers: " + ",".join(headers))
-    bits.append(f"{time.time() - started:.1f}s")
-    return " · ".join(bits)
+import server  # noqa: E402
 
 
 def main(argv: list[str]) -> int:
-    urls = argv[1:] or HOSTS
-    import server
-
-    print(f"yt-dlp {server.yt_dlp_version()} via {server.ytdlp_mode()} · "
-          f"impersonate={server.IMPERSONATE or 'off'} · cookies="
-          f"{'yes' if server.COOKIES else 'no'} · block_private="
-          f"{int(server.BLOCK_PRIVATE)}")
-    print()
-
+    if len(argv) < 2:
+        print(__doc__)
+        return 2
     bad = 0
-    for url in urls:
-        print(f"{url}")
-        print(f"  edge       {edge_check(url)}")
-        result = extraction(url)
-        print(f"  extraction {result}")
-        print()
-        if result.startswith("FAIL"):
+    for url in argv[1:]:
+        host = server._host_of(url) or "?"
+        print(f"\n{url}")
+        print(f"  host: {host}  adapter: {'yes' if server._known_adapter_host(url) else 'no'}")
+        t0 = time.time()
+        try:
+            info = server.get_info(url)
+        except Exception as exc:  # noqa: BLE001
+            print(f"  FAIL after {time.time() - t0:.1f}s: {server.clean_reason(str(exc))[:180]}")
             bad += 1
-    print(f"{len(urls) - bad}/{len(urls)} extracted")
+            continue
+        dt = time.time() - t0
+        fmts = server.browsable_formats(info)
+        labels = [f"{f['id']} ⟶ {f['label']}" for f in fmts[:5]]
+        why = server.clean_reason(str(info.get("reason") or ""))
+        print(f"  resolved in {dt:.1f}s: title={info.get('title')!r} formats={len(fmts)}")
+        if labels:
+            print(f"  first choices: {', '.join(labels)} ..."
+                  if len(fmts) > 5 else f"  choices: {', '.join(labels)}")
+        if why:
+            print(f"  reason: {why[:180]}")
     return 1 if bad else 0
 
 

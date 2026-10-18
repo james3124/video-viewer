@@ -65,6 +65,24 @@ Extra bits that help on hostile networks:
 - Retries, socket timeouts and a shared yt-dlp cache directory are always on.
 - Playlists, channels and profile pages are detected and listed in the UI.
 
+### What works out of the box
+
+yt-dlp is the universal layer: one dependency covers YouTube, TikTok, Facebook
+and ~1,800 other sites. Measured on this deployment (2026-10):
+
+| Site | Without cookies | With cookies (`VIEWER_COOKIES_B64`) |
+|---|---|---|
+| YouTube | works, ~5 s cold, 54 formats on a 4K video | n/a |
+| TikTok | **audio only** — its video tokens are minted for the requesting session and 403 even in a real fresh browser; the music CDN (`tiktokcdn.com`) streams from anywhere | video expected to work — tokens minted under your session are normally self-contained (this is how cookie-based downloader sites operate); not yet verified on this deployment |
+| Facebook | `watch?v=` public videos work; some `/page/videos/` permalinks answer "Cannot parse data" and want a session (yt-dlp issue #17583) | both shapes work |
+| anime/18+ tube sites with obfuscated players | the two adapters below | n/a |
+
+The TikTok case is a CDN design, not a missing codec: `v16/v19-webapp-prime`
+URLs carry the fingerprint of whoever requested them (verified: a fresh,
+impersonated, cookie-free real-browser fetch also gets 403). When the proxy
+hits one, the error says exactly this instead of inviting retries that can't
+work.
+
 ### Site adapters
 
 Some hosts have no usable generic extraction, so there is a small explicit
@@ -82,7 +100,10 @@ them for every browser that loads it, so the adapter just runs the same code.
 The CDN then requires the player frame as its `Referer`, which is why these
 formats report `needsProxy` and stream through `/api/play?...&proxy=1`.
 
-To add a site: write the extractor, add a row to the table, and add a check to
+To add a site: diagnose it first — `.venv/bin/python tools/site_check.py <url>`
+prints which layer answered, what formats it found, and why it failed. If
+nothing can decode it, the page usually decodes the stream for every visitor
+anyway: write the extractor, add a row to the table, and add a check to
 `tools/backend_check.py`.
 
 ### Comment pages are not playlists
