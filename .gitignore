@@ -4,6 +4,7 @@ __pycache__/
 /server.log
 /data/data/
 /node_modules/
+node_modules/
 .DS_Store
 /data/
 *.part

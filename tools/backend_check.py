@@ -112,6 +112,9 @@ class CDN(BaseHTTPRequestHandler):
         self.end_headers()
 
 
+HX = {"ts": b""}   # filled by the merge test with a real tiny encode
+
+
 class Zone(BaseHTTPRequestHandler):
     """A tame origin on 127.0.0.1, for the media redirect guard exercises."""
 
@@ -126,14 +129,16 @@ class Zone(BaseHTTPRequestHandler):
         self.send_header("Content-Length", "0")
         self.end_headers()
 
+    def _bytes(self, body: bytes, ctype: str) -> None:
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def do_GET(self):                       # noqa: N802
         if self.path == "/file":
-            body = b"ZONE01"
-            self.send_response(200)
-            self.send_header("Content-Type", "text/plain")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+            self._bytes(b"ZONE01", "text/plain")
         elif self.path == "/same":
             self._302("/file")                       # same host — may follow
         elif self.path == "/off":
@@ -144,6 +149,15 @@ class Zone(BaseHTTPRequestHandler):
             self._302("/chain?i=1")                  # fresh URL every hop
         elif self.path.startswith("/chain?i="):
             self._302(f"/chain?i={int(self.path.partition('i=')[2]) + 1}")
+        elif self.path == "/hls/master.m3u8":
+            self._bytes(b"#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:1\n"
+                        b"#EXTINF:0.5,\nseg0.ts\n#EXTINF:0.5,\nseg1.ts\n"
+                        b"#EXT-X-ENDLIST\n", "application/vnd.apple.mpegurl")
+        elif self.path in ("/seg0.ts", "/seg1.ts",
+                           "/hls/seg0.ts", "/hls/seg1.ts"):
+            self._bytes(HX["ts"], "video/mp2t")
+        elif self.path == "/fake-page":
+            self._bytes(b"<html><body>not a video</body></html>", "text/html")
         else:
             self.send_response(404)
             self.send_header("Content-Length", "0")
@@ -153,7 +167,6 @@ class Zone(BaseHTTPRequestHandler):
 class Sula(BaseHTTPRequestHandler):
     """A tame sulasokvid-shaped site: video.php's inline JS names an /e/ embed,
     and that embed's /api/stream answers a filecode with a manifest URL."""
-
     protocol_version = "HTTP/1.1"
 
     def log_message(self, *a):
@@ -555,6 +568,62 @@ def main() -> int:
         finally:
             sula.shutdown()
             sula.server_close()
+
+        # 10e — /api/merge dl=1 for adapter-resolved HLS → ffmpeg transmux ------
+        # The tame Zone doubles as a tiny HLS origin: master.m3u8 with two real
+        # .ts segments, encoded here by the same ffmpeg the server would use.
+        if server.FFMPEG:
+            import subprocess as _sp                       # noqa: PLC0415
+            tsdir = tempfile.mkdtemp(prefix="viewer-ts-")
+            tsfile = os.path.join(tsdir, "tiny.ts")
+            enc = _sp.run(
+                [server.FFMPEG, "-hide_banner", "-loglevel", "error",
+                 "-f", "lavfi", "-i", "testsrc=duration=0.5:size=128x96:rate=10",
+                 "-f", "lavfi", "-i", "sine=duration=0.5",
+                 "-c:v", "libx264", "-preset", "ultrafast", "-c:a", "aac",
+                 "-y", tsfile], capture_output=True)
+            HX["ts"] = open(tsfile, "rb").read() if enc.returncode == 0 else b""
+            detail = (enc.stderr.decode("utf-8", "replace")[-160:].strip()
+                      if enc.returncode else "fixture ok")
+            hz = ThreadingHTTPServer(("127.0.0.1", 0), Zone)
+            hport = hz.server_address[1]
+            threading.Thread(target=hz.serve_forever, daemon=True).start()
+            real_rt = server.resolve_target
+            try:
+                server.resolve_target = (
+                    lambda page, fmt="", fresh=False: {
+                        "url": f"http://127.0.0.1:{hport}/hls/master.m3u8",
+                        "headers": {},
+                        "kind": "hls", "id": fmt or "h1", "ext": "m3u8",
+                        "title": "Tiny Zone Stream"})
+                page = f"http://127.0.0.1:{hport}/fake-page"
+                if not HX["ts"]:
+                    # A broken fixture would fail for the wrong reason — say so
+                    # instead of blaming the merge code.
+                    check("merge: hls dl transmuxes to a real mp4", False, detail)
+                else:
+                    st, hd, body = fetch(
+                        bport, f"/api/merge?{urllib.parse.urlencode({'url': page, 'fmt': 'h1', 'dl': '1'})}")
+                    check("merge: hls dl transmuxes to a real mp4",
+                          st == 200 and hd.get("Content-Type") == "video/mp4"
+                          and b"ftyp" in body[:32] and len(body) > 1000,
+                          f"{st} {len(body)}B {hd.get('Content-Type', '')}")
+                    check("merge: the saved file is named for the video",
+                          "attachment" in hd.get("Content-Disposition", "")
+                          and "filename*=UTF-8''Tiny%20Zone" in hd.get("Content-Disposition", ""),
+                          hd.get("Content-Disposition", "")[:80])
+                    st, hd, body = fetch(
+                        bport, f"/api/merge?{urllib.parse.urlencode({'url': page, 'fmt': 'h1', 'dl': '1'})}",
+                        method="HEAD")
+                    check("merge: a HEAD download probe answers disposition, no body",
+                          st == 200 and hd.get("Content-Type") == "video/mp4"
+                          and not body
+                          and "attachment" in hd.get("Content-Disposition", ""),
+                          f"{st} {bool(body)}")
+            finally:
+                server.resolve_target = real_rt
+                hz.shutdown()
+                hz.server_close()
 
         # 11 — subtitle conversion cache -------------------------------------------
         sub_url = "https://cdn.example.test/captions.vtt"

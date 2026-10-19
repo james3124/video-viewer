@@ -290,7 +290,11 @@ HEADER_WHITELIST = ("user-agent", "referer", "origin", "cookie", "authorization"
 HEADER_BLOCKLIST = ("host", "connection", "content-length", "range",
                     "accept-encoding", "accept", "transfer-encoding", "upgrade")
 STREAM_CHUNK = 1 << 18
-EXPIRY_CODES = (401, 403, 410, 474)      # 474 = CDN "origin refused", i.e. retry
+EXPIRY_CODES = (401, 403, 404, 410, 474)
+# 404 belongs here because some CDNs (97bf1.com and kin) answer an *expired
+# playlist token* with 404 instead of 403 — there was no such file long before
+# the token. The refresh handler only re-extracts once, so a genuinely missing
+# video costs one extraction more before failing with the same 404.
 
 # -- media redirect guard -------------------------------------------------- #
 # The phone trusts this server with every byte of a stream, so the server must
@@ -1945,6 +1949,7 @@ def resolve_target(page: str, fmt: str = "", fresh: bool = False) -> dict:
         "kind": chosen["kind"],
         "id": chosen["id"],
         "ext": chosen.get("ext"),
+        "title": info.get("title"),
     }
 
 
@@ -2477,6 +2482,10 @@ class Handler(BaseHTTPRequestHandler):
                 # Only adaptive streams? Let ffmpeg stitch a real file instead.
                 if FFMPEG is not None and ytdlp_mode() != "none":
                     link = f"/api/merge?url={urllib.parse.quote(src, safe='')}&dl=1"
+                    if fmt:
+                        # keep the variant the user is watching, so the file we
+                        # save matches the quality on screen
+                        link += f"&fmt={urllib.parse.quote(fmt, safe='')}"
                     if TOKEN:
                         link += f"&token={urllib.parse.quote(TOKEN, safe='')}"
                     return self._redirect(link)
@@ -2721,12 +2730,87 @@ class Handler(BaseHTTPRequestHandler):
                   cache=f"public, max-age={MANIFEST_TTL}", head_only=head)
 
     # -- merge ---------------------------------------------------------------- #
+    def _stream_hls_transmux(self, q: dict, target: dict, head: bool,
+                             download: bool) -> None:
+        """ffmpeg reads HLS on its own — hand it the manifest and pipe a real
+        fragmented .mp4 out. Like the yt-dlp merge, the 200 goes out before we
+        know the CDN will cooperate, so hard failures shrink the file instead
+        of rewriting the status; stderr is drained on a thread both to prevent
+        a full-pipe deadlock and to keep the last ffmpeg word in our log."""
+        headers = target.get("headers") or {}
+        name = safe_filename(target.get("title") or "video", "mp4")
+        cmd = [FFMPEG, "-hide_banner", "-loglevel", "error", "-nostdin"]
+        if headers:
+            cmd += ["-headers", "".join(f"{k}: {v}\r\n" for k, v in headers.items())]
+        cmd += ["-i", target["url"], "-c", "copy",
+                # HLS ships its AAC audio as ADTS frames; a bare copy dies the
+                # moment the audio starts ("Malformed AAC bitstream") and the
+                # download collapses to a few seconds of video.
+                "-bsf:a", "aac_adtstoasc",
+                "-movflags", "+frag_keyframe+empty_moov", "-f", "mp4", "pipe:1"]
+
+        if head:
+            try:
+                self.send_response(200)
+                self.send_header("Content-Type", "video/mp4")
+                self.send_header("Cache-Control", "no-store")
+                if download:
+                    self.send_header("Content-Disposition", name)
+                self._cors()
+                self.end_headers()
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            return
+
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "video/mp4")
+            # No Content-Length: stream until the pipeline ends.
+            self.send_header("Cache-Control", "no-store")
+            if download:
+                self.send_header("Content-Disposition", name)
+            self.send_header("Connection", "close")
+            self.close_connection = True
+            self._cors()
+            self.end_headers()
+        except (BrokenPipeError, ConnectionResetError):
+            return
+
+        note(f"{'download' if download else 'transmux'} hls ← {target['url'][:70]}")
+        proc = subprocess.Popen(cmd, stdout=self.wfile, stderr=subprocess.PIPE,
+                                bufsize=1 << 16)
+        last = {"line": b""}
+
+        def drain() -> None:
+            try:
+                for line in iter(proc.stderr.readline, b""):
+                    if line.strip():
+                        last["line"] = line.strip()[:300]
+            except (OSError, ValueError):
+                pass
+
+        threading.Thread(target=drain, daemon=True).start()
+        try:
+            proc.wait()
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+            try:
+                proc.stderr.close()
+            except OSError:
+                pass
+        if not last["line"] or proc.returncode == 0:
+            return
+        note("  ffmpeg: "
+             + last["line"].decode("utf-8", "replace").strip()[:200])
+
     def _api_merge(self, q: dict, head: bool = False) -> None:
         """Stream video+audio as one ffmp4:
 
             yt-dlp -f 'bv*+ba' -o - <page>  |  ffmpeg -i pipe:0 -c copy -f mp4 pipe:1
         """
         page = q.get("url", "")
+        fmt = q.get("fmt", "") or q.get("f", "")
         sel = q.get("sel", "") or "bv*+ba/b"
         sort = q.get("sort", "") or "vcodec:h264:vp9:av1,+res:1080"
         download = q.get("dl") == "1"
@@ -2735,6 +2819,37 @@ class Handler(BaseHTTPRequestHandler):
         if FFMPEG is None or ytdlp_mode() == "none":
             return self._send_error_json(
                 "Merging needs both yt-dlp and ffmpeg available on the server", 501)
+
+        # Download links for HLS streams land here from /api/play's dl=1
+        # redirect: they name a page *our panel* resolved (sulasokvid-style
+        # adapters, header-protected manifests), not one yt-dlp's format
+        # selection understands. ffmpeg reads HLS natively, so transmux the
+        # resolved manifest straight to fragmented mp4 — at the variant the
+        # user is watching when fmt names one. The info cache may carry an
+        # already-expired token, so probe before committing: an expiry-code
+        # answer re-extracts once, other errors leave ffmpeg to try anyway.
+        if download:
+            target = None
+            try:
+                target = resolve_target(page, fmt, fresh=q.get("fresh") == "1")
+            except Exception:  # noqa: BLE001
+                target = None
+            if target and target.get("kind") == "hls":
+                try:
+                    with guarded_urlopen(target["url"], target.get("headers") or {},
+                                         head=False, timeout=15):
+                        pass                        # token alive — nothing to read
+                except urllib.error.HTTPError as exc:
+                    if exc.code in EXPIRY_CODES:
+                        note(f"manifest probe said {exc.code} — re-extracting fresh")
+                        try:
+                            target = resolve_target(page, fmt, fresh=True)
+                        except Exception:  # noqa: BLE001
+                            target = None
+                except Exception:  # noqa: BLE001
+                    pass                            # ffmpeg will surface what's real
+            if target and target.get("kind") == "hls":
+                return self._stream_hls_transmux(q, target, head, download)
 
         dl = ytdlp_cmd(["--no-playlist", "--newline", "--concurrent-fragments", "4",
                         "-S", sort, "-f", sel, "-o", "-", page])

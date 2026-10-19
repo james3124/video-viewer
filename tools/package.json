@@ -1,0 +1,8 @@
+{
+  "name": "viewer-js-tests",
+  "private": true,
+  "description": "Dev dependency for tools/ui_check.js and tools/integration_check.js (jsdom). Install inside tools/: `npm install`, then run the suites with NODE_PATH=tools/node_modules.",
+  "devDependencies": {
+    "jsdom": "^27.0.0"
+  }
+}

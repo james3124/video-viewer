@@ -195,8 +195,11 @@ Everything is keyboard reachable: the seek bar is a real `<input type="range">`
 Run the DOM test after touching `app.js` or the markup:
 
 ```bash
-npm install jsdom && node tools/ui_check.js     # 26 checks
+cd tools && npm install && cd .. && \
+NODE_PATH=tools/node_modules node tools/ui_check.js      # 32 UI checks
+NODE_PATH=tools/node_modules node tools/integration_check.js   # 14 end-to-end
 ```
+(The backend needs its own check-run before these: `tools/backend_check.py`.)
 
 ## Caching
 
