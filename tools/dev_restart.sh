@@ -6,6 +6,10 @@
 #   tools/dev_restart.sh                # stop + start
 #   tools/dev_restart.sh --purge-cache  # also drop extraction/playlist caches
 #
+# Binds 0.0.0.0:8080 by default — that is what lets the phone open
+# http://<lan-ip>:8080/. Override with VIEWER_HOST / VIEWER_PORT (e.g.
+# VIEWER_HOST=127.0.0.1 for this machine only).
+#
 # Logs go to ${VIEWER_LOG:-$TMPDIR/viewer.log}; the pid to ${VIEWER_PID:-$TMPDIR/viewer.pid}.
 set -eu
 APP=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
@@ -29,6 +33,15 @@ if [ "${1:-}" = "--purge-cache" ]; then
 fi
 
 cd "$APP"
-nohup "$PY" "$APP/server.py" >>"$LOG" 2>&1 &
+HOST=${VIEWER_HOST:-0.0.0.0}
+PORT=${VIEWER_PORT:-8080}
+# setsid: leave this shell's process group, so a terminal/agent teardown does
+# not take the backend with it. Plain nohup survives SIGHUP but not a group kill.
+if command -v setsid >/dev/null 2>&1; then
+  setsid nohup "$PY" "$APP/server.py" --host "$HOST" --port "$PORT" \
+    >>"$LOG" 2>&1 </dev/null &
+else
+  nohup "$PY" "$APP/server.py" --host "$HOST" --port "$PORT" >>"$LOG" 2>&1 &
+fi
 echo $! > "$PIDFILE"
 echo "started pid $(cat "$PIDFILE") (log: $LOG)"
