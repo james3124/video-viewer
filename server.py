@@ -45,6 +45,7 @@ import re
 import shutil
 import socket
 import stat as stat_mod
+import struct
 import subprocess
 import sys
 import tempfile
@@ -762,15 +763,12 @@ SNIFF_TTL = env_int("VIEWER_SNIFF_TTL", default=900)
 #  rather than a heuristic — guessing at API shapes is how extractors rot.
 # --------------------------------------------------------------------------- #
 
-_API_SITES = {
-    # host suffix: (id patterns, endpoint templates)
-    "hanime.tv": (
-        # the Astro island props carry ["video_id", [0, 3210]]
-        (r'"video_id"\s*:\s*\[\s*\d+\s*,\s*(\d+)\s*\]',
-         r'"video_id"\s*:\s*(\d+)'),
-        ("https://guest.freeanimehentai.net/api/v11/video?id={id}",
-         "https://hanime.tv/api/v11/video?id={id}"),
-    ),
+_API_SITES: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
+    # Nothing needs a plain JSON endpoint right now: hanime.tv was the only
+    # host here and it moved to an adapter of its own when it began signing its
+    # player API (see hanime_extract below). The machinery stays — and stays
+    # tested — because it is the cheapest path for the next host that publishes
+    # streams only through JSON.
 }
 
 
@@ -920,8 +918,9 @@ def api_site_extract(url: str, html: str | None = None) -> dict | None:
 #  Some hosts serve the video from their own player frame and hand the browser an
 #  obfuscated media URL that its own page decodes client-side. The generic
 #  extractor has nothing to read, so we run the very same decoder the page already
-#  runs for every visitor. There is no login, no paywall and no signed token — the
-#  value is in the HTML the site serves anyway. Kept as an explicit table, like
+#  runs for every visitor. There is no login and no paywall; what the page needs
+#  to decode for a visitor it ships to us too (hanime's handshake is signed, but
+#  by a public blob — see its adapter below). Kept as an explicit table, like
 #  _API_SITES: one named entry per site beats a decoder-shaped guess that rots.
 # --------------------------------------------------------------------------- #
 
@@ -1126,8 +1125,406 @@ def sulasokvid_extract(url: str, html: str | None = None) -> dict | None:
     }
 
 
+# --------------------------------------------------------------------------- #
+#  hanime.tv — a signed player handshake, run by the site's own wasm
+#
+#  The guest JSON endpoint this adapter used to call is gone. The player now:
+#    1. signs the current unix second with a wasm blob (the signature covers the
+#       timestamp and window.origin),
+#    2. AES-256-GCM seals {timestamp, directive, slug} and POSTs it, together
+#       with that signature, to auth.hanime.tv/api/v11/handshake,
+#    3. reads the HLS sources out of the answer's `x-token` header.
+#  All three steps are public and run for every visitor; we run the same ones
+#  from the server. The blob executes in wasmtime with a no-op import surface
+#  and a three-property JS value model, so it cannot touch the network, the
+#  disk, or anything else — it reads the clock and the origin, nothing more.
+#
+#  Two optional packages: wasmtime (run the signer) and cryptography (seal and
+#  open the handshake). Without them every other site is unaffected; this one
+#  says what to install and the UI keeps its "Open on site" link.
+# --------------------------------------------------------------------------- #
+
+HANIME_BASE = "https://hanime.tv"
+HANIME_CSRF_URL = "https://ct.hanime.tv/csrf-token"
+HANIME_AUTH_URL = "https://auth.hanime.tv/api/v11/handshake"
+HANIME_ORIGIN = "https://hanime.tv"          # what the signer attests
+HANIME_SEAL_KEY = hashlib.sha256(b"htv-insecure-handshake-v1").digest()
+HANIME_SEAL_AAD = b"htv-insecure-v1"
+
+_HANIME_SLUG_RE = re.compile(r"/videos/hentai/([A-Za-z0-9_-]+)")
+_HANIME_VENDOR_RE = re.compile(
+    r"""["'](https?://[^"']*?/vendor\.[0-9a-f]+\.min\.js)["']""")
+_HANIME_WASM_RE = re.compile(r'base64Decode\("([A-Za-z0-9+/=]{1000,})"\)')
+_HANIME_H1_RE = re.compile(r"<h1[^>]*>(.*?)</h1>", re.S | re.I)
+_HANIME_TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.S | re.I)
+_HANIME_DURATION_RE = re.compile(
+    r'"duration"\s*:\s*"PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+(?:\.\d+)?)S)?"')
+
+
+def _b64u(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
+
+
+def _b64u_dec(text: str) -> bytes:
+    return base64.urlsafe_b64decode(text + "=" * (-len(text) % 4))
+
+
+def _htv_aesgcm():
+    try:
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM  # noqa: PLC0415
+    except ImportError:
+        raise RuntimeError(
+            "hanime seals its player handshake with AES-256-GCM — install the "
+            "`cryptography` package (pip install cryptography) to play it here"
+        ) from None
+    return AESGCM
+
+
+def _htv_seal(payload: dict) -> str:
+    """Seal a handshake payload in the envelope the player sends."""
+    aesgcm = _htv_aesgcm()
+    iv = os.urandom(12)
+    sealed = aesgcm(HANIME_SEAL_KEY).encrypt(
+        iv, json.dumps(payload, separators=(",", ":")).encode(), HANIME_SEAL_AAD)
+    envelope = {"v": 1, "alg": "AES-256-GCM", "iv": _b64u(iv),
+                "tag": _b64u(sealed[-16:]), "data": _b64u(sealed[:-16])}
+    return _b64u(json.dumps(envelope, separators=(",", ":")).encode())
+
+
+def _htv_unseal(token: str) -> dict:
+    """Open the same envelope. ValueError if it is not one we understand."""
+    aesgcm = _htv_aesgcm()
+    try:
+        envelope = json.loads(_b64u_dec(token).decode("utf-8"))
+        sealed = _b64u_dec(envelope["data"]) + _b64u_dec(envelope["tag"])
+        plain = aesgcm(HANIME_SEAL_KEY).decrypt(
+            _b64u_dec(envelope["iv"]), sealed, HANIME_SEAL_AAD)
+    except Exception as exc:  # noqa: BLE001 - any malformed envelope, one answer
+        raise ValueError(f"unexpected handshake envelope: {exc}") from None
+    try:
+        return json.loads(plain.decode("utf-8"))
+    except ValueError as exc:
+        raise ValueError(f"handshake payload is not JSON: {exc}") from None
+
+
+def _htv_http(method: str, url: str, headers: dict,
+              body: bytes | None = None, timeout: int = 25) -> tuple[int, dict, bytes]:
+    """One browser-shaped request. The handshake needs no cookie jar."""
+    req = urllib.request.Request(url, data=body, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.getcode() or 200, dict(resp.headers), resp.read(1 << 20)
+    except urllib.error.HTTPError as exc:
+        return exc.code, dict(exc.headers or {}), exc.read(1 << 20)
+    except (urllib.error.URLError, OSError) as exc:
+        raise RuntimeError(
+            f"could not reach {urllib.parse.urlparse(url).hostname}: "
+            f"{getattr(exc, 'reason', exc)}") from None
+
+
+def _htv_signer_blob(html: str) -> str:
+    """Path to the player's signer wasm; download and cache it on first use."""
+    match = _HANIME_VENDOR_RE.search(html)
+    if not match:
+        raise RuntimeError(
+            "hanime's player bundle is not where it used to be — the site "
+            "changed its player; open the video on the site instead")
+    vendor_url = match.group(1)
+    directory = os.path.join(CACHE_DIR, "hanime")
+    name = "signer-" + hashlib.sha256(vendor_url.encode()).hexdigest()[:20] + ".wasm"
+    path = os.path.join(directory, name)
+    if os.path.exists(path):
+        try:
+            with open(path, "rb") as fh:
+                if fh.read(4) == b"\x00asm":
+                    return path
+        except OSError:
+            pass
+        os.unlink(path)                       # truncated by an old crash: refetch
+    status, _, body = _htv_http("GET", vendor_url,
+                                {"User-Agent": DEFAULT_UA,
+                                 "Referer": HANIME_BASE + "/"},
+                                timeout=SNIFF_TIMEOUT)
+    if status != 200:
+        raise RuntimeError(f"hanime's player bundle answered HTTP {status}")
+    blob = _HANIME_WASM_RE.search(body.decode("utf-8", "replace"))
+    if not blob:
+        raise RuntimeError(
+            "hanime's player bundle carries no signer blob — the site changed "
+            "its player; open the video on the site instead")
+    wasm = base64.b64decode(blob.group(1))
+    if not wasm.startswith(b"\x00asm"):
+        raise RuntimeError("hanime's signer blob is not a wasm module")
+    os.makedirs(directory, exist_ok=True)
+    tmp = f"{path}.{os.getpid()}.tmp"
+    with open(tmp, "wb") as fh:
+        fh.write(wasm)
+    os.replace(tmp, path)                     # never hand out a half-written blob
+    note(f"cached hanime's signer blob ({human_size(len(wasm))})")
+    return path
+
+
+_HTV_ENGINE: tuple | None = None
+_HTV_ENGINE_LOCK = threading.Lock()
+
+
+def _htv_engine(path: str):
+    """(wasmtime, engine, module) for the cached blob, compiled once."""
+    global _HTV_ENGINE
+    with _HTV_ENGINE_LOCK:
+        if _HTV_ENGINE and _HTV_ENGINE[0] == path:
+            return _HTV_ENGINE[1:]
+        try:
+            import wasmtime  # noqa: PLC0415
+        except ImportError:
+            raise RuntimeError(
+                "hanime signs its player API inside a wasm blob — install the "
+                "`wasmtime` package (pip install wasmtime) to run it here"
+            ) from None
+        engine = wasmtime.Engine()
+        module = wasmtime.Module.from_file(engine, path)
+        _HTV_ENGINE = (path, wasmtime, engine, module)
+        return wasmtime, engine, module
+
+
+def _htv_signature(seconds: int, path: str) -> str:
+    """Run the player's signer: it attests (unix second, window.origin).
+
+    The module is an embind build, so `_main` asks JS for the clock
+    (emscripten_asm_const_int) and for window.top.location.origin through the
+    emval imports. Both are answered here from a tiny value model: the only
+    thing the module can learn about its host is the origin we choose.
+    """
+    wasmtime, engine, module = _htv_engine(path)
+    store = wasmtime.Store(engine)
+
+    handles: dict[int, object] = {}
+    counter = [9]
+
+    def hold(value):
+        counter[0] += 1
+        handles[counter[0]] = value
+        return counter[0]
+
+    window: dict = {"location": {"origin": HANIME_ORIGIN}}
+    window["top"] = window
+    state = {"signature": None, "time": None}
+
+    def cstr(caller, ptr):
+        mem = caller.get("z")
+        out = b""
+        while True:
+            chunk = bytes(mem.read(store, ptr + len(out), ptr + len(out) + 256))
+            end = chunk.find(b"\x00")
+            if end >= 0:
+                return out + chunk[:end]
+            out += chunk
+
+    def asm_const(caller, code, sig_ptr, argbuf):
+        if code == 17392:                     # Date.now()/1000, in the site's build
+            return seconds
+        if code == 17442:                     # (signature, time) → window
+            mem = caller.get("z")
+            types = cstr(caller, sig_ptr).decode("ascii", "replace")
+            raw = bytes(mem.read(store, argbuf, argbuf + 64))
+            args, off = [], 0
+            for ch in types:
+                if ch in ("i", "p"):
+                    args.append(struct.unpack_from("<i", raw, off)[0])
+                    off += 4
+                elif ch == "j":
+                    args.append(struct.unpack_from("<q", raw, off)[0])
+                    off += 8
+                else:
+                    args.append(struct.unpack_from("<d", raw, off)[0])
+                    off += 8
+            if args:
+                state["signature"] = cstr(caller, args[0]).decode("ascii", "replace")
+                state["time"] = args[1] if len(args) > 1 else None
+        return 0
+
+    def get_global(caller, name):
+        key = cstr(caller, name).decode("utf-8", "replace") if name else ""
+        return hold(window if key in ("", "window") else window.get(key))
+
+    def new_cstring(caller, ptr):
+        return hold(cstr(caller, ptr).decode("utf-8", "replace"))
+
+    def get_property(caller, handle, key_handle):
+        obj, key = handles.get(handle), handles.get(key_handle)
+        try:
+            return hold(obj[key])             # type: ignore[index]
+        except (KeyError, TypeError):
+            return hold(None)
+
+    def invoke(caller, caller_id, handle, method, destructors, args):
+        """kind-3 invoker: identity, converted to a libc++ std::string.
+
+        Short strings live inline: a size word followed by the bytes.
+        """
+        value = handles.get(handle)
+        if not isinstance(value, str):
+            return 0.0
+        data = value.encode("utf-8")
+        buf = caller.get("E")(caller, 4 + len(data) + 24)
+        caller.get("z").write(store, struct.pack("<I", len(data)) + data, buf)
+        return float(buf)
+
+    def zero(caller, *a):
+        return 0
+
+    def noop(caller, *a):
+        return None
+
+    def abort(caller, *a):
+        raise RuntimeError("hanime's signer aborted on this host")
+
+    i32, i64, f64 = wasmtime.ValType.i32, wasmtime.ValType.i64, wasmtime.ValType.f64
+
+    def ftype(params, results=()):
+        return wasmtime.FuncType([p() for p in params], [r() for r in results])
+
+    defs = {
+        "a": (ftype([i32, i32, i32]), noop),
+        "b": (ftype([i32, i32, i32, i32, i32]), noop),
+        "c": (ftype([i32]), noop),
+        "d": (ftype([i32, i32, i32]), noop),
+        "e": (ftype([i32, i32, i32]), noop),
+        "f": (ftype([i32, i32, i32, i64, i64]), noop),
+        "g": (ftype([i32, i32, i32], [i32]), asm_const),
+        "h": (ftype([i32]), noop),
+        "i": (ftype([i32, i32, i32, i32, i32], [f64]), invoke),
+        "j": (ftype([i32]), noop),
+        "k": (ftype([i32, i32, i32], [i32]), zero),
+        "l": (ftype([i32, i32], [i32]), get_property),
+        "m": (ftype([i32], [i32]), new_cstring),
+        "n": (ftype([i32]), noop),
+        "o": (ftype([i32, i32]), noop),
+        "p": (ftype([i32], [i32]), get_global),
+        "q": (ftype([i32, i32, i32, i32]), noop),
+        "r": (ftype([i32, i32]), noop),
+        "s": (ftype([i32, i32, i32, i32]), noop),
+        "t": (ftype([i32, i32], [i32]), zero),
+        "u": (ftype([i32, i32], [i32]), zero),
+        "v": (ftype([]), abort),
+        "w": (ftype([i32], [i32]), zero),
+        "x": (ftype([i32, i32, i32]), abort),
+        "y": (ftype([i32]), noop),            # window_on(): we add no listeners
+    }
+    imports = [wasmtime.Func(store, ftype_, fn, access_caller=True)
+               for ftype_, fn in defs.values()]
+    instance = wasmtime.Instance(store, module, imports)
+    instance.exports(store)["C"](store, 0, 0)     # _main
+    signature = state["signature"] or ""
+    if not re.fullmatch(r"[0-9a-f]{64}", signature):
+        raise RuntimeError("hanime's signer produced no signature")
+    return signature
+
+
+def hanime_handshake(page_url: str, slug: str, html: str) -> list[dict]:
+    """Run the player's own three-step handshake; return its HLS sources."""
+    path = _htv_signer_blob(html)
+    now = int(time.time())
+    signature = _htv_signature(now, path)
+
+    status, _, body = _htv_http("GET", HANIME_CSRF_URL, {
+        "User-Agent": DEFAULT_UA, "Referer": page_url,
+        "Accept": "application/json, text/plain, */*"}, timeout=SNIFF_TIMEOUT)
+    try:
+        csrf = json.loads(body.decode("utf-8", "replace"))["csrf_token"]
+    except (ValueError, KeyError, TypeError):
+        raise RuntimeError(
+            f"hanime's csrf endpoint answered HTTP {status} without a token — "
+            f"the site changed its player") from None
+
+    sealed = _htv_seal({"timestamp_unix": now,
+                        "directive": "htv_player_handshake",
+                        "slug": slug})
+    status, headers, _ = _htv_http("POST", HANIME_AUTH_URL, {
+        "User-Agent": DEFAULT_UA, "Referer": page_url, "Origin": HANIME_BASE,
+        "Accept": "application/json", "Content-Type": "application/json",
+        "x-signature-version": "web2", "x-signature": signature,
+        "x-time": str(now), "x-csrf-token": csrf,
+    }, body=json.dumps({"token": sealed}).encode(), timeout=SNIFF_TIMEOUT)
+    token = {k.lower(): v for k, v in headers.items()}.get("x-token")
+    if status != 200 or not token:
+        raise RuntimeError(
+            f"hanime's player handshake was refused (HTTP {status}) — the site "
+            f"changed its player; open the video on the site instead")
+    try:
+        payload = _htv_unseal(token)
+    except ValueError as exc:
+        raise RuntimeError(f"hanime's handshake token did not open: {exc}") from None
+    sources = [s for s in payload.get("sources") or []
+               if isinstance(s, dict) and s.get("kind") == "normal" and s.get("src")]
+    if not sources:
+        raise RuntimeError(
+            "hanime's handshake returned no playable source — the video may be "
+            "region-locked or members-only")
+    note(f"hanime handshake: {len(sources)} source(s), signed for {now}")
+    return sources
+
+
+def hanime_extract(url: str, html: str | None = None) -> dict | None:
+    """hanime.tv: signed player handshake → one HLS playlist per resolution."""
+    slug_match = _HANIME_SLUG_RE.search(urllib.parse.urlparse(url).path)
+    if not slug_match:
+        raise NotAVideoPage(
+            "hanime only plays single videos at /videos/hentai/<slug> — this "
+            "link is a listing or a search page")
+    slug = slug_match.group(1)
+    if html is None:
+        page = _fetch_html(url)
+        if not page:
+            raise RuntimeError(
+                "hanime.tv did not serve the page to this server — try again, or "
+                "open the video on the site")
+        _, html = page
+
+    sources = hanime_handshake(url, slug, html)
+
+    heading = _HANIME_H1_RE.search(html) or _HANIME_TITLE_RE.search(html)
+    title = None
+    if heading:
+        title = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", "", heading.group(1))).strip()
+    duration = 0
+    dur = _HANIME_DURATION_RE.search(html)
+    if dur:
+        duration = (int(dur.group(1) or 0) * 3600 + int(dur.group(2) or 0) * 60
+                    + float(dur.group(3) or 0))
+
+    formats = []
+    for src in sources:
+        height = src.get("height")
+        label = src.get("label") or (f"{height}p" if height else "source")
+        formats.append({
+            "format_id": f"hanime-{label}",
+            "url": HANIME_BASE + str(src["src"]),
+            "ext": "m3u8",
+            "protocol": "m3u8_native",
+            "width": src.get("width"),
+            "height": height,
+            "vcodec": None,
+            "acodec": None,
+            "format_note": label,     # one playlist per resolution → distinct labels
+            "_sniffed": True,
+            "http_headers": {"User-Agent": DEFAULT_UA, "Referer": url},
+        })
+    note(f"decoded {len(formats)} source(s) from hanime's signed handshake")
+    return {
+        "title": title or "hanime video",
+        "extractor_key": "hanime",
+        "duration": int(duration) or None,
+        "formats": formats,
+        "webpage_url": url,
+    }
+
+
+# Sites whose markup needs decoding by an adapter — a player frame to walk, or
+# (hanime) an API that signs every request. One named function per host.
 _PLAYER_SITES = {"watchhentai.net": watchhentai_extract,
-                 "sulasokvid.co": sulasokvid_extract}
+                 "sulasokvid.co": sulasokvid_extract,
+                 "hanime.tv": hanime_extract}
 
 
 class NotAVideoPage(RuntimeError):
@@ -1754,7 +2151,11 @@ def browsable_formats(info: dict) -> list[dict]:
             has_video = has_audio = True
 
         if "m3u8" in proto or ext == "m3u8":
-            kind, label = "hls", "HLS (adaptive stream)"
+            kind = "hls"
+            # A quality label matters when a site offers one playlist per
+            # resolution (hanime): without it every button would read "HLS".
+            label = (f"{f['format_note']} · HLS" if f.get("format_note")
+                     else "HLS (adaptive stream)")
         elif "mpd" in proto or ext == "mpd" or "http_dash_segments" in proto:
             kind, label = "dash", "DASH (not playable directly)"
         elif ext == "mhtml":
@@ -2596,13 +2997,19 @@ class Handler(BaseHTTPRequestHandler):
         with resp:
             up = {k.lower(): v for k, v in resp.getheaders()}
             ctype = (up.get("content-type") or "").split(";")[0].strip().lower()
-            if reject_html and ctype in ("text/html", "application/json",
-                                         "application/xhtml+xml"):
+            if reject_html:
                 # Someone answered with a web page: usually an expired signature
-                # that got redirected to an error/consent page.
-                raise RuntimeError(
-                    "the host answered with a web page instead of media — the link "
-                    "expired, needs cookies, or is region-locked")
+                # that got redirected to an error/consent page. Judge by the
+                # body when we have one — hanime's CDN serves real media as
+                # .html with text/html, and trusting the header alone would
+                # reject every segment of it.
+                document = prefix.lstrip(b"\xef\xbb\xbf \t\r\n")[:1] == b"<"
+                if ctype == "application/json" or (
+                        ctype in ("text/html", "application/xhtml+xml")
+                        and (document or not prefix)):
+                    raise RuntimeError(
+                        "the host answered with a web page instead of media — the link "
+                        "expired, needs cookies, or is region-locked")
             chunked = "content-length" not in up and not head
             try:
                 self.send_response(getattr(resp, "status", None) or resp.getcode() or 200)

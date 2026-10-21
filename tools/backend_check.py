@@ -208,6 +208,89 @@ class Sula(BaseHTTPRequestHandler):
             self.end_headers()
 
 
+class Hanime(BaseHTTPRequestHandler):
+    """A tame hanime-shaped host: page → player bundle → csrf → handshake → HLS.
+
+    The bundle carries a fake signer blob (wasm header plus padding), so the
+    test exercises blob extraction and caching without running the real signer;
+    the signature itself is stubbed by the caller.
+    """
+    protocol_version = "HTTP/1.1"
+    slug = "tennen-koi-iro-alcohol-2"
+    seen: dict = {}
+
+    def log_message(self, *a):
+        pass
+
+    def _bytes(self, body: bytes, ctype: str, status: int = 200,
+               extra: dict | None = None) -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        for key, val in (extra or {}).items():
+            self.send_header(key, val)
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):                       # noqa: N802
+        import base64 as _b64                      # noqa: PLC0415
+        port = self.server.server_address[1]
+        if self.path == f"/videos/hentai/{self.slug}":
+            body = (f'<!doctype html><html><head>'
+                    f"<title>Watch Tennen Koi-iro Alcohol 2 Hentai Video - hanime.tv</title>"
+                    f'<script src="http://127.0.0.1:{port}/vendor.abc123.min.js"></script>'
+                    f'<script type="application/ld+json">'
+                    f'{{"name": "Tennen Koi-iro Alcohol 2", "duration": "PT22M4S"}}'
+                    f"</script></head><body><h1>Tennen Koi-iro Alcohol 2</h1>"
+                    f"<p>not the player</p></body></html>").encode()
+            return self._bytes(body, "text/html")
+        if self.path.startswith("/vendor."):
+            wasm = b"\x00asm\x01\x00\x00\x00" + b"\x00" * 900
+            body = ('var w; function f(){ return base64Decode("'
+                    + _b64.b64encode(wasm).decode() + '") }').encode()
+            return self._bytes(body, "application/javascript")
+        if self.path == "/csrf-token":
+            return self._bytes(json.dumps({"csrf_token": "test-csrf"}).encode(),
+                               "application/json")
+        if self.path.startswith("/hls/"):
+            return self._bytes(
+                b"#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:1\n"
+                b'#EXT-X-KEY:METHOD=AES-128,URI="https://ct.test/sign.bin"\n'
+                b"#EXTINF:1.0,\nseg0.ts\n#EXT-X-ENDLIST\n",
+                "application/vnd.apple.mpegurl")
+        self._bytes(b"no", "text/plain", 404)
+
+    def do_POST(self):                      # noqa: N802
+        import server as _server                   # noqa: PLC0415
+        length = int(self.headers.get("Content-Length") or 0)
+        raw = self.rfile.read(length) if length else b""
+        if self.path != "/handshake":
+            return self._bytes(b"", "text/plain", 404)
+        Hanime.seen = {k.lower(): self.headers.get(k) for k in
+                       ("x-signature", "x-signature-version", "x-time",
+                        "x-csrf-token")}
+        port = self.server.server_address[1]
+        try:
+            payload = _server._htv_unseal(json.loads(raw)["token"])
+            Hanime.seen["payload"] = payload
+            token = _server._htv_seal({"sources": [
+                {"kind": "promotion", "label": "1080p", "height": 1080,
+                 "width": 1920, "src": ""},
+                {"kind": "normal", "label": "720p", "height": 720, "width": 1280,
+                 "src": "/hls/1/aaa720"},
+                {"kind": "normal", "label": "480p", "height": 480, "width": 854,
+                 "src": "/hls/1/bbb480"},
+                {"kind": "normal", "label": "360p", "height": 360, "width": 640,
+                 "src": "/hls/1/ccc360"},
+            ]})
+        except Exception as exc:  # noqa: BLE001
+            Hanime.seen["error"] = f"{type(exc).__name__}: {exc}"
+            return self._bytes(json.dumps({"error_id": "TEST"}).encode(),
+                               "application/json", 401)
+        return self._bytes(b'{"status":"OK"}', "application/json",
+                           extra={"x-token": token})
+
+
 class Backend(BaseHTTPRequestHandler):
     """Routes straight into server.Handler without touching the socket layer."""
 
@@ -569,6 +652,84 @@ def main() -> int:
             sula.shutdown()
             sula.server_close()
 
+        # 10d2 — hanime.tv: signed player handshake ---------------------------
+        han = ThreadingHTTPServer(("127.0.0.1", 0), Hanime)
+        hport = han.server_address[1]
+        threading.Thread(target=han.serve_forever, daemon=True).start()
+        keep = {k: getattr(server, k) for k in
+                ("HANIME_BASE", "HANIME_CSRF_URL", "HANIME_AUTH_URL",
+                 "_htv_signature")}
+        try:
+            hbase = f"http://127.0.0.1:{hport}"
+            server.HANIME_BASE = hbase
+            server.HANIME_CSRF_URL = hbase + "/csrf-token"
+            server.HANIME_AUTH_URL = hbase + "/handshake"
+            # The real signer runs the site's blob; its own test lives in the
+            # probe that reverse-engineered it. Here we check the flow around it.
+            server._htv_signature = lambda seconds, path: "a" * 64
+
+            check("hanime: registered as a player-site adapter",
+                  "hanime.tv" in server._PLAYER_SITES, "")
+            han_page = f"{hbase}/videos/hentai/{Hanime.slug}"
+            try:
+                got = server.hanime_extract(han_page)
+            except Exception as exc:  # noqa: BLE001
+                check("hanime: page → handshake → HLS sources", False,
+                      f"{type(exc).__name__}: {str(exc)[:80]}")
+                got = None
+            if got:
+                fmts = got.get("formats") or []
+                check("hanime: page → handshake → HLS sources",
+                      got.get("title") == "Tennen Koi-iro Alcohol 2"
+                      and got.get("duration") == 1324 and len(fmts) == 3,
+                      f"title={got.get('title')!r} n={len(fmts)} d={got.get('duration')}")
+                check("hanime: a pre-roll entry without a stream is dropped",
+                      sorted(f.get("height") for f in fmts) == [360, 480, 720],
+                      ",".join(str(f.get("height")) for f in fmts))
+                check("hanime: signature + sealed token reached the api",
+                      Hanime.seen.get("x-signature") == "a" * 64
+                      and Hanime.seen.get("x-signature-version") == "web2"
+                      and Hanime.seen.get("x-csrf-token") == "test-csrf"
+                      and (Hanime.seen.get("payload") or {}).get("slug") == Hanime.slug,
+                      str(Hanime.seen)[:140])
+                try:
+                    cached = os.listdir(os.path.join(tmp, "hanime"))
+                except OSError:
+                    cached = []
+                check("hanime: signer blob extracted and cached",
+                      any(n.startswith("signer-") and n.endswith(".wasm")
+                          for n in cached), str(cached)[:80])
+                entries = server.browsable_formats(
+                    {"id": "h", "title": got["title"], "url": han_page,
+                     "duration": got["duration"], "formats": fmts})
+                check("hanime: every resolution gets its own label",
+                      sorted(e["label"] for e in entries)
+                      == ["360p · HLS", "480p · HLS", "720p · HLS"],
+                      str([e["label"] for e in entries]))
+                check("hanime: playlists are proxied (AES key needs rewriting)",
+                      all(e["kind"] == "hls" and e["needsProxy"] is True
+                          for e in entries), "")
+
+            try:
+                server.hanime_extract(f"{hbase}/videos/hentai/")
+                check("hanime: a listing page is rejected outright", False, "no raise")
+            except server.NotAVideoPage:
+                check("hanime: a listing page is rejected outright", True, "")
+            except Exception as exc:  # noqa: BLE001
+                check("hanime: a listing page is rejected outright", False,
+                      f"wrong error: {type(exc).__name__}")
+
+            try:
+                server._htv_unseal("not-an-envelope")
+                check("hanime: a malformed token is refused", False, "no raise")
+            except ValueError:
+                check("hanime: a malformed token is refused", True, "")
+        finally:
+            for key, val in keep.items():
+                setattr(server, key, val)
+            han.shutdown()
+            han.server_close()
+
         # 10e — /api/merge dl=1 for adapter-resolved HLS → ffmpeg transmux ------
         # The tame Zone doubles as a tiny HLS origin: master.m3u8 with two real
         # .ts segments, encoded here by the same ffmpeg the server would use.
@@ -740,16 +901,19 @@ def main() -> int:
         check("playlists: entries without a usable url are dropped",
               smuggled[1]["url"] is None)
 
-        # 16 — API-driven sites ---------------------------------------------
+        # 16 — API-driven sites (the table is empty today; keep it working) ---
         page = ('<astro-island props="{&quot;video_id&quot;:[0,3210],'
                 '&quot;slug&quot;:[0,&quot;some-video&quot;]}"></astro-island>')
-        real_json = server._json_get
+        real_json, real_api = server._json_get, server._API_SITES
         try:
+            server._API_SITES = {"api.test": (
+                (r'"video_id"\s*:\s*\[\s*\d+\s*,\s*(\d+)\s*\]',),
+                ("https://api.test/v?id={id}",))}
             server._json_get = lambda url, headers, timeout=25: {
                 "video": {"title": "Example",
                           "videos": [{"url": "https://cdn.x/hls/i.m3u8"},
                                      {"url": "https://cdn.x/mp4/720.mp4"}]}}
-            info = server.api_site_extract("https://hanime.tv/videos/hentai/x", html=page)
+            info = server.api_site_extract("https://api.test/videos/hentai/x", html=page)
             fmts = server.browsable_formats(info)
             check("api-site: a stream url from the api becomes a format",
                   bool(fmts) and fmts[0]["url"].endswith("720.mp4"),
@@ -760,13 +924,13 @@ def main() -> int:
                   info.get("title") == "Example", str(info.get("title")))
             server._json_get = lambda url, headers, timeout=25: ("error", 403)
             try:
-                server.api_site_extract("https://hanime.tv/videos/hentai/x", html=page)
+                server.api_site_extract("https://api.test/videos/hentai/x", html=page)
                 check("api-site: a blocked api explains itself", False)
             except Exception as exc:  # noqa: BLE001
                 check("api-site: a blocked api explains itself",
                       "cookies" in str(exc) and "403" in str(exc), str(exc)[:70])
         finally:
-            server._json_get = real_json
+            server._json_get, server._API_SITES = real_json, real_api
         check("api-site: unknown hosts are left to the normal path",
               server.api_site_extract("https://example.com/x") is None)
 

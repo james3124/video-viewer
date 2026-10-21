@@ -33,7 +33,7 @@ Open **http://localhost:8080/** — served by the same process, so no CORS issue
 Check it after changing anything:
 
 ```bash
-python3 tools/backend_check.py    # 29 checks: proxy, HLS, cache, token, limits
+python3 tools/backend_check.py    # 123 checks: proxy, HLS, adapters, cache, token, limits
 python3 tools/wsgi_check.py      # the same handler through WSGI
 ```
 
@@ -95,7 +95,7 @@ and ~1,800 other sites. Measured on this deployment (2026-10):
 | YouTube | works, ~5 s cold, 54 formats on a 4K video | n/a |
 | TikTok | **audio only** — its video tokens are minted for the requesting session and 403 even in a real fresh browser; the music CDN (`tiktokcdn.com`) streams from anywhere | video expected to work — tokens minted under your session are normally self-contained (this is how cookie-based downloader sites operate); not yet verified on this deployment |
 | Facebook | `watch?v=` public videos work; some `/page/videos/` permalinks answer "Cannot parse data" and want a session (yt-dlp issue #17583) | both shapes work |
-| anime/18+ tube sites with obfuscated players | the two adapters below | n/a |
+| anime/18+ tube sites with obfuscated players | the three adapters below | n/a |
 
 The TikTok case is a CDN design, not a missing codec: `v16/v19-webapp-prime`
 URLs carry the fingerprint of whoever requested them (verified: a fresh,
@@ -111,15 +111,19 @@ guessing at site shapes is how extractors rot.
 
 | Host | What the adapter does |
 |---|---|
-| `hanime.tv` | the stream URL only exists in the JSON endpoint the site's own player calls |
+| `hanime.tv` | runs the player's own signed handshake: the page's vendor bundle carries a WebAssembly signer that attests `(unix second, window.origin)`; the adapter executes that blob in wasmtime (no JS engine, every import a stub), AES-256-GCM seals `{timestamp, directive, slug}` with the site's own key, POSTs it with the signature to `auth.hanime.tv/api/v11/handshake`, and reads the per-resolution HLS sources out of the answer's `x-token` header |
 | `watchhentai.net` | follows the player frame the page names, then runs that frame's own client-side decoder (`whDecodeMediaUrl`) to recover the real, per-quality MP4 URLs |
 | `sulasokvid.co` | replays the site's own three-step player flow server-side: `watch.php` → `video.php` (its Skip button's target), read the `/e/` embed its JS injects, then that embed's `POST /api/stream` answers with the HLS manifest. Skips the ad redirect and the "intro" gate by construction |
 
-Both only read what the site serves to any visitor — no login, no paywall, no
-signed token. The media URLs are obfuscated in the HTML, but the page decodes
-them for every browser that loads it, so the adapter just runs the same code.
-The CDN then requires the player frame as its `Referer`, which is why these
-formats report `needsProxy` and stream through `/api/play?...&proxy=1`.
+None of them touch a login or a paywall: each reads what the site serves to any
+visitor and runs the site's own decoder. For watchhentai the media URLs are
+obfuscated in the HTML; for hanime the handshake is signed, but by the same
+public blob the browser runs — the adapter never invents a credential, it just
+runs the site's own code faster than a browser tab would. hanime's HLS key is
+AES-128, so its playlists report `needsProxy` and `/api/hls` rewrites the
+`EXT-X-KEY` URI back through this server; the CDN itself serves segments as
+`.html` with a `text/html` type, which is why the proxy judges "is this a web
+page?" by the body and not the header.
 
 To add a site: diagnose it first — `.venv/bin/python tools/site_check.py <url>`
 prints which layer answered, what formats it found, and why it failed. If
@@ -248,6 +252,11 @@ instance answers `429` instead of forking itself to death.
 `ffmpeg` is optional at runtime: without it, video+audio merging is off and the
 other formats still play. If `ffmpeg` is not on the `PATH`, `imageio-ffmpeg`
 (requirements.txt) supplies one.
+
+`cryptography` and `wasmtime` are only used by the hanime adapter (sealing the
+handshake and running the site's signer blob). Without them every other site is
+unaffected; hanime then says which package to install and the UI still offers
+"Open on site".
 
 ## Deploying
 

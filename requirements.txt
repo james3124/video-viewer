@@ -6,3 +6,10 @@ imageio-ffmpeg>=0.5.1
 # sites put in front of their media CDNs. server.py detects it automatically and
 # silently skips --impersonate when it is not installed.
 curl_cffi>=0.7.0; platform_python_implementation != "PyPy"
+# hanime.tv signs its player API with a WebAssembly blob the site itself ships.
+# server.py runs that blob in wasmtime (no JS engine, no network, no disk — its
+# imports are stubs) and seals the handshake with AES-GCM from cryptography.
+# Both are optional: every other site works without them, and hanime then says
+# which package to install instead of failing silently.
+cryptography>=42
+wasmtime>=24
