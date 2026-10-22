@@ -291,6 +291,123 @@ class Hanime(BaseHTTPRequestHandler):
                            extra={"x-token": token})
 
 
+class Jvd(BaseHTTPRequestHandler):
+    """A tame javhdporn-shaped host: an RC4 `dex()` page, a play API with
+    alternates, and player frames whose `data-config` hides the sources.
+
+    Everything is sealed with the server's own `_jvd_rc4`, so the test drives
+    the real decrypt path instead of a stub. The decoy playlist points at
+    tiktokcdn.com (never fetched — the adapter only reads segment hostnames);
+    the genuine sources live on this host.
+    """
+    protocol_version = "HTTP/1.1"
+    seen: dict = {}
+
+    def log_message(self, *a):
+        pass
+
+    def _bytes(self, body: bytes, ctype: str, status: int = 200) -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    @staticmethod
+    def _seal(keyarg: str, salt: str, data: bytes) -> str:
+        import base64 as _b64                             # noqa: PLC0415
+        import server as _s                               # noqa: PLC0415
+        key = _b64.b64encode((keyarg + salt).encode()).decode()[::-1]
+        plain = _b64.b64encode(data)
+        stream = _s._jvd_rc4(key.encode(), b"\x00" * len(plain))
+        cipher = bytes(a ^ b for a, b in zip(plain, stream))
+        return _b64.b64encode(cipher).decode()
+
+    def _player(self, sources: list, vtt: str = "") -> bytes:
+        import base64 as _b64                             # noqa: PLC0415
+        keyarg = _b64.b64encode(self.path.encode()).decode()[4:20]
+        cfg = {"src": _b64.b64encode(json.dumps(sources).encode()).decode(),
+               "img": "", "vtt": vtt}
+        blob = self._seal(keyarg, "_0x59a0e4", json.dumps(cfg).encode())
+        return (f'<html><body><div id="jwplayer" data-config="{blob}">'
+                f"</div></body></html>").encode()
+
+    def do_GET(self):                       # noqa: N802
+        port = self.server.server_address[1]
+        base = f"http://127.0.0.1:{port}"
+        if self.path.startswith("/video/"):
+            slug = self.path.rstrip("/").rsplit("/", 1)[-1]
+            marker = {"with-file": "case-file", "ads-only": "case-ads",
+                      "real-hls": "case-hls"}.get(slug, "case-file")
+            mpu = self._seal("719679", "QxLUF1bgIAdeQX", marker.encode())
+            html = (f'<!doctype html><html><head><title>Test {slug}</title>'
+                    f'</head><body><div id="video-player-area" '
+                    f'data-video-id="719679"><div id="video-player" '
+                    f'data-mpu="{mpu}" data-ver="1"></div></div></body></html>')
+            return self._bytes(html.encode(), "text/html")
+        if self.path.startswith("/p/primary") or self.path.startswith("/p/nl"):
+            return self._bytes(self._player(
+                [{"file": f"{base}/ad/master.m3u8", "type": "hls",
+                  "label": "1080p"}]), "text/html")
+        if self.path.startswith("/p/fr"):
+            return self._bytes(self._player(
+                [{"file": f"{base}/real.mp4", "type": "mp4", "label": "1080p"}],
+                vtt=f"{base}/slides.jpg?length=9741"), "text/html")
+        if self.path.startswith("/p/real"):
+            return self._bytes(self._player(
+                [{"file": f"{base}/vod/master.m3u8", "type": "hls",
+                  "label": "720p"}]), "text/html")
+        if self.path == "/ad/master.m3u8":
+            return self._bytes(b"#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1,"
+                               b"RESOLUTION=1920x1080\nad-media.m3u8\n",
+                               "application/vnd.apple.mpegurl")
+        if self.path == "/ad/ad-media.m3u8":
+            return self._bytes(
+                b"#EXTM3U\n#EXT-X-TARGETDURATION:10\n#EXTINF:10.0,\n"
+                b"https://p16-ad-site-sign-sg.tiktokcdn.com/roll.jpg\n"
+                b"#EXTINF:10.0,\n"
+                b"https://p19-ad-site-sign-sg.tiktokcdn.com/roll.jpg\n",
+                "application/vnd.apple.mpegurl")
+        if self.path == "/vod/master.m3u8":
+            return self._bytes(b"#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1,"
+                               b"RESOLUTION=1280x720\nvod-media.m3u8\n",
+                               "application/vnd.apple.mpegurl")
+        if self.path == "/vod/vod-media.m3u8":
+            return self._bytes(
+                b"#EXTM3U\n#EXT-X-TARGETDURATION:10\n#EXTINF:10.0,\nseg0.ts\n",
+                "application/vnd.apple.mpegurl")
+        if self.path.startswith("/real.mp4"):
+            return self._bytes(b"\x00\x00\x00 ftypisom" + b"\x00" * 2048,
+                               "video/mp4")
+        return self._bytes(b"no", "text/plain", 404)
+
+    def do_POST(self):                      # noqa: N802
+        length = int(self.headers.get("Content-Length") or 0)
+        raw = self.rfile.read(length) if length else b""
+        if self.path != "/api/play/":
+            return self._bytes(b"", "text/plain", 404)
+        params = urllib.parse.parse_qs(raw.decode("utf-8", "replace"))
+        marker = (params.get("sources") or [""])[0]
+        port = self.server.server_address[1]
+        base = f"http://127.0.0.1:{port}"
+        Jvd.seen = {"sources": marker, "ver": (params.get("ver") or [""])[0],
+                    "origin": self.headers.get("Origin"),
+                    "xrw": self.headers.get("X-Requested-With")}
+        if marker == "case-ads":
+            alts = [("de", f"{base}/p/primary?t=1"), ("nl", f"{base}/p/nl?t=1")]
+        elif marker == "case-hls":
+            alts = [("primary", f"{base}/p/real?t=1")]
+        else:
+            alts = [("de", f"{base}/p/primary?t=1"), ("fr", f"{base}/p/fr?t=1")]
+        sealed = [{"data": self._seal("719679", "_0x58fe15", u.encode()),
+                   "lo": lo} for lo, u in alts]
+        out = {"status": True,
+               "data": self._seal("719679", "_0x58fe15", alts[0][1].encode()),
+               "reserve": self._seal("719679", "_0x58fe15",
+                                     json.dumps(sealed).encode())}
+        return self._bytes(json.dumps(out).encode(), "application/json")
+
+
 class Backend(BaseHTTPRequestHandler):
     """Routes straight into server.Handler without touching the socket layer."""
 
@@ -729,6 +846,81 @@ def main() -> int:
                 setattr(server, key, val)
             han.shutdown()
             han.server_close()
+
+        # 10d3 — javhdporn.net: RC4 dex() chain, ad decoys, direct preference ---
+        jvd = ThreadingHTTPServer(("127.0.0.1", 0), Jvd)
+        jport = jvd.server_address[1]
+        threading.Thread(target=jvd.serve_forever, daemon=True).start()
+        keep_base = server._JVD_BASE
+        try:
+            jbase = f"http://127.0.0.1:{jport}"
+            server._JVD_BASE = jbase
+            check("javhdporn: registered as a player-site adapter",
+                  "javhdporn.net" in server._PLAYER_SITES, "")
+            try:
+                server.javhdporn_extract(f"{jbase}/tag/uncensored")
+                check("javhdporn: a non-video page says so", False, "no raise")
+            except server.NotAVideoPage:
+                check("javhdporn: a non-video page says so", True, "")
+            except Exception as exc:  # noqa: BLE001
+                check("javhdporn: a non-video page says so", False,
+                      f"wrong error: {type(exc).__name__}")
+
+            try:
+                got = server.javhdporn_extract(f"{jbase}/video/with-file")
+            except Exception as exc:  # noqa: BLE001
+                check("javhdporn: prefers the real file over ad playlists", False,
+                      f"{type(exc).__name__}: {str(exc)[:80]}")
+                got = None
+            if got:
+                fmts = got.get("formats") or []
+                check("javhdporn: prefers the real file over ad playlists",
+                      len(fmts) == 1 and fmts[0]["ext"] == "mp4"
+                      and fmts[0]["url"].endswith("/real.mp4"),
+                      str([(f["format_id"], f["ext"]) for f in fmts]))
+                check("javhdporn: duration comes from the vtt length",
+                      got.get("duration") == 9741, str(got.get("duration")))
+                check("javhdporn: the dex chain reached the play api",
+                      Jvd.seen.get("sources") == "case-file"
+                      and Jvd.seen.get("ver") == "1"
+                      and Jvd.seen.get("xrw") == "XMLHttpRequest"
+                      and Jvd.seen.get("origin") == jbase,
+                      str(Jvd.seen)[:140])
+                entries = server.browsable_formats(got)
+                check("javhdporn: the file plays through the proxy",
+                      len(entries) == 1 and entries[0]["kind"] == "direct"
+                      and entries[0]["needsProxy"] is True
+                      and entries[0]["headers"].get("Referer", "")
+                      .endswith("/p/fr?t=1"),
+                      str(entries[0] if entries else None)[:120])
+
+            try:
+                server.javhdporn_extract(f"{jbase}/video/ads-only")
+                check("javhdporn: an all-ad video is refused", False, "no raise")
+            except server.NotAVideoPage:
+                check("javhdporn: an all-ad video is refused", False,
+                      "cried NotAVideoPage")
+            except RuntimeError as exc:  # noqa: BLE001
+                check("javhdporn: an all-ad video is refused",
+                      "ad" in str(exc), str(exc)[:80])
+            except Exception as exc:  # noqa: BLE001
+                check("javhdporn: an all-ad video is refused", False,
+                      f"wrong error: {type(exc).__name__}")
+
+            try:
+                got = server.javhdporn_extract(f"{jbase}/video/real-hls")
+                fmts = got.get("formats") or []
+                check("javhdporn: a genuine HLS source is accepted",
+                      len(fmts) == 1 and fmts[0]["ext"] == "m3u8"
+                      and fmts[0]["url"].endswith("/vod/master.m3u8"),
+                      str([(f["format_id"], f["ext"]) for f in fmts]))
+            except Exception as exc:  # noqa: BLE001
+                check("javhdporn: a genuine HLS source is accepted", False,
+                      f"{type(exc).__name__}: {str(exc)[:80]}")
+        finally:
+            server._JVD_BASE = keep_base
+            jvd.shutdown()
+            jvd.server_close()
 
         # 10e — /api/merge dl=1 for adapter-resolved HLS → ffmpeg transmux ------
         # The tame Zone doubles as a tiny HLS origin: master.m3u8 with two real

@@ -1520,11 +1520,298 @@ def hanime_extract(url: str, html: str | None = None) -> dict | None:
     }
 
 
+# --------------------------------------------------------------------------- #
+#  javhdporn.net — an RC4 `dex()` layer wrapped around the site's player API
+#
+#  The video page ships two base64 blobs (`data-mpu` and a version tag). The
+#  site's own `dex()` turns them into the token its `/api/play/` endpoint wants,
+#  and the endpoint answers with a player URL plus a `reserve` list of alternate
+#  players — every one of them sealed the same way. The player frame then carries
+#  a `data-config` blob that a second `dex()` pass opens (`src`/`img`/`vtt`).
+#  None of this is a paywall: the page runs it for every visitor, at no cost, so
+#  we run the same steps server-side instead of executing (or rehosting) its JS.
+#
+#  The one trap is that the first alternates are ad decoys: their master
+#  playlists look genuine (real bandwidth/resolution/codec metadata) but every
+#  media segment is a TikTok ad image. So we walk the alternates, prefer a
+#  progressive file when one is offered, and read a playlist's first segment
+#  before trusting it. A playlist whose segments are all ad-network images is
+#  skipped, exactly as the site's own player falls through to the next reserve.
+# --------------------------------------------------------------------------- #
+
+_JVD_BASE = "https://www.javhdporn.net"
+_JVD_UA = ("Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 "
+           "(KHTML, like Gecko) Chrome/120 Mobile Safari/537.36")
+# The salts are the site's, one per `data-ver`; the response always answers the
+# same salt, and stage two is a constant too. They are public — they are in the
+# page the browser already downloads.
+_JVD_REQ_SALT = {"1": "QxLUF1bgIAdeQX", "2": "SyntaxError"}
+_JVD_RESP_SALT = "_0x58fe15"
+_JVD_STAGE2_SALT = "_0x59a0e4"
+# A media playlist whose every segment lives on one of these is an ad roll, not
+# the video — the decoy providers render the same TikTok image 975 times.
+_JVD_AD_HOSTS = ("tiktokcdn.com",)
+
+_JVD_AREA_RE = re.compile(r'id="video-player-area"[^>]*data-video-id="(\d+)"')
+_JVD_VIDEO_ID_RE = re.compile(r'data-video-id="(\d+)"')
+_JVD_MPU_RE = re.compile(r'id="video-player"[^>]*data-mpu="([^"]+)"')
+_JVD_VER_RE = re.compile(r'id="video-player"[^>]*data-ver="([^"]+)"')
+_JVD_CONFIG_RE = re.compile(r'id="jwplayer"[^>]*data-config="([^"]+)"')
+_JVD_H1_RE = re.compile(r"<h1[^>]*>(.*?)</h1>", re.S | re.I)
+_JVD_TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.S | re.I)
+_JVD_LENGTH_RE = re.compile(r"[?&]length=(\d+)")
+
+
+def _jvd_b64d(text: str) -> bytes:
+    """The page's `atob` on a blob that may have lost its `=` padding."""
+    text = (text or "").strip()
+    return base64.b64decode(text + "=" * (-len(text) % 4))
+
+
+def _jvd_rc4(key: bytes, data: bytes) -> bytes:
+    """Textbook RC4 — the exact keystream the site's `dex()` builds."""
+    sbox = list(range(256))
+    j = 0
+    for i in range(256):
+        j = (j + sbox[i] + key[i % len(key)]) & 255
+        sbox[i], sbox[j] = sbox[j], sbox[i]
+    out = bytearray()
+    i = j = 0
+    for byte in data:
+        i = (i + 1) & 255
+        j = (j + sbox[i]) & 255
+        sbox[i], sbox[j] = sbox[j], sbox[i]
+        out.append(byte ^ sbox[(sbox[i] + sbox[j]) & 255])
+    return bytes(out)
+
+
+def _jvd_dex_str(keyarg: str, salt: str, blob: str) -> str:
+    """The site's `dex()`: key `base64(keyarg+salt)` reversed, RC4, base64 again."""
+    key = base64.b64encode((keyarg + salt).encode()).decode()[::-1]
+    return _jvd_b64d(_jvd_rc4(key.encode(), _jvd_b64d(blob)).decode("latin-1")
+                     ).decode("latin-1")
+
+
+def _jvd_http(method: str, url: str, headers: dict,
+              data: bytes | None = None,
+              timeout: int | None = None) -> tuple[int, str]:
+    """One browser-shaped request, preferring curl_cffi's TLS profile."""
+    timeout = SNIFF_TIMEOUT if timeout is None else timeout
+    try:
+        from curl_cffi import requests as _cr          # noqa: PLC0415
+        resp = _cr.request(method, url, headers=headers, data=data,
+                           timeout=timeout, impersonate="chrome")
+        return resp.status_code, resp.text
+    except ImportError:
+        pass
+    except Exception:  # noqa: BLE001
+        raise RuntimeError(f"could not reach {_host_of(url)}") from None
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.getcode() or 200, resp.read(2 << 20).decode("utf-8", "replace")
+    except urllib.error.HTTPError as exc:
+        return exc.code, exc.read(2 << 20).decode("utf-8", "replace")
+    except (urllib.error.URLError, OSError) as exc:
+        raise RuntimeError(
+            f"could not reach {_host_of(url)}: {getattr(exc, 'reason', exc)}") from None
+
+
+def _jvd_height(label: str) -> int | None:
+    m = re.search(r"(\d{3,4})\s*[pP]", label or "")
+    return int(m.group(1)) if m else None
+
+
+def _jvd_player(play_url: str, referer: str) -> tuple[list, dict, str]:
+    """Fetch one player frame and open its `data-config` → (sources, config, url)."""
+    play_url = "https:" + play_url if play_url.startswith("//") else play_url
+    headers = {"User-Agent": _JVD_UA, "Referer": referer}
+    status, page = _jvd_http("GET", play_url, headers)
+    match = _JVD_CONFIG_RE.search(page)
+    if not match:
+        raise RuntimeError(f"the player frame carried no config (HTTP {status})")
+    parsed = urllib.parse.urlparse(play_url)
+    # Stage-two key: base64(path[?query])[4:20] — the same slice the frame uses.
+    keyarg = base64.b64encode(
+        (parsed.path + (("?" + parsed.query) if parsed.query else "")).encode()
+    ).decode()[4:20]
+    cfg = json.loads(_jvd_dex_str(keyarg, _JVD_STAGE2_SALT, match.group(1)))
+    raw = cfg.get("src")
+    srcs = json.loads(_jvd_b64d(raw).decode("utf-8")) if isinstance(raw, str) else (raw or [])
+    return (srcs if isinstance(srcs, list) else []), cfg, play_url
+
+
+def _jvd_hls_is_video(playlist: str, referer: str) -> bool:
+    """True unless this HLS chain resolves to ad-image segments.
+
+    A decoy master playlist advertises real resolutions, so the only honest test
+    is to read a media playlist and look at what its segments actually are.
+    """
+    headers = {"User-Agent": _JVD_UA, "Referer": referer}
+    status, text = _jvd_http("GET", playlist, headers)
+    if status != 200 or not text.lstrip().startswith("#EXTM3U"):
+        return False
+    base = playlist
+    media = next((l.strip() for l in text.splitlines()
+                  if l.strip() and not l.strip().startswith("#")), None)
+    if media:                                  # a master → follow its first variant
+        base = urllib.parse.urljoin(playlist, media)
+        status, text = _jvd_http("GET", base, headers)
+        if status != 200 or not text.lstrip().startswith("#EXTM3U"):
+            return False
+    segs = [urllib.parse.urljoin(base, l.strip()) for l in text.splitlines()
+            if l.strip() and not l.strip().startswith("#")][:20]
+    if not segs:
+        return False
+
+    def is_ad(seg: str) -> bool:
+        host = (urllib.parse.urlparse(seg).hostname or "").lower()
+        return any(host == a or host.endswith("." + a) for a in _JVD_AD_HOSTS)
+
+    return not all(is_ad(seg) for seg in segs)
+
+
+def javhdporn_extract(url: str, html: str | None = None) -> dict | None:
+    """javhdporn.net: run the page's own `dex()` chain to reach the real stream.
+
+    The site offers several player "reserves" per video; some are ad decoys that
+    answer with an HLS chain of TikTok ad images. We take every alternate the
+    API hands us, keep a progressive file if any provides one, and otherwise use
+    the first playlist whose segments are actually video.
+    """
+    parsed = urllib.parse.urlparse(url)
+    if "/video/" not in parsed.path:
+        raise NotAVideoPage(
+            "javhdporn only plays single videos at /video/<slug> — this link is a "
+            "listing, a tag or a search page")
+    headers = {"User-Agent": _JVD_UA, "Referer": _JVD_BASE + "/"}
+    if html is None:
+        status, html = _jvd_http("GET", url, headers)
+        if status != 200:
+            raise RuntimeError(
+                f"javhdporn did not serve the page (HTTP {status}) — retry, or open "
+                f"the video on the site")
+
+    vid = (_JVD_AREA_RE.search(html) or _JVD_VIDEO_ID_RE.search(html))
+    mpu = _JVD_MPU_RE.search(html)
+    ver = _JVD_VER_RE.search(html)
+    if not (vid and mpu and ver):
+        raise RuntimeError(
+            "the javhdporn page carried no player data — the site changed its "
+            "markup, so the adapter needs updating")
+    vid, ver = vid.group(1), ver.group(1)
+    sources = _jvd_dex_str(vid, _JVD_REQ_SALT.get(ver, _JVD_RESP_SALT), mpu.group(1))
+
+    body = urllib.parse.urlencode({"sources": sources, "ver": ver}).encode()
+    status, text = _jvd_http("POST", _JVD_BASE + "/api/play/", {
+        **headers, "Referer": url, "Origin": _JVD_BASE,
+        "X-Requested-With": "XMLHttpRequest",
+        "Content-Type": "application/x-www-form-urlencoded"}, data=body)
+    try:
+        answer = json.loads(text)
+    except ValueError:
+        raise RuntimeError(
+            f"javhdporn's play api answered HTTP {status} without JSON — the site "
+            f"changed its player, so the adapter needs updating") from None
+    if not answer.get("status") or not answer.get("data"):
+        raise RuntimeError(
+            "javhdporn's play api refused the request — the site changed its "
+            "player, so the adapter needs updating")
+
+    alternates = [("primary", _jvd_dex_str(vid, _JVD_RESP_SALT, answer["data"]))]
+    try:
+        reserves = json.loads(_jvd_dex_str(vid, _JVD_RESP_SALT, answer.get("reserve") or ""))
+    except (ValueError, TypeError):
+        reserves = []
+    for item in reserves if isinstance(reserves, list) else []:
+        if isinstance(item, dict) and item.get("data"):
+            alternates.append((f"reserve:{item.get('lo') or '?'}",
+                               _jvd_dex_str(vid, _JVD_RESP_SALT, item["data"])))
+
+    direct, playlist, failures, duration = [], [], [], None
+    for label, play in alternates:
+        try:
+            srcs, cfg, play_url = _jvd_player(play, url)
+        except Exception as exc:  # noqa: BLE001
+            failures.append(f"{label}: {exc}")
+            continue
+        if duration is None and cfg.get("vtt"):
+            length = _JVD_LENGTH_RE.search(str(cfg["vtt"]))
+            if length:
+                duration = int(length.group(1)) or None
+        for src in srcs:
+            if not isinstance(src, dict) or not src.get("file"):
+                continue
+            file_ = str(src["file"])
+            stype = str(src.get("type") or "").lower()
+            entry = (label, play_url, file_, src)
+            if stype == "hls" or ".m3u8" in file_.lower():
+                playlist.append(entry)
+            else:
+                direct.append(entry)
+
+    formats: list[dict] = []
+
+    def add(entry, is_hls: bool) -> None:
+        label, play_url, file_, src = entry
+        note_ = str(src.get("label") or "")
+        ext = (src.get("type") or "").lower() if not is_hls else "m3u8"
+        if ext not in ("mp4", "m4v", "webm", "mov", "m3u8"):
+            ext = "m3u8" if is_hls else (urllib.parse.urlparse(file_).path.rsplit(".", 1)[-1] or "mp4").lower()
+        formats.append({
+            "format_id": f"jvd-{label}-{note_ or ('hls' if is_hls else ext)}",
+            "url": file_,
+            "ext": ext,
+            "protocol": "m3u8_native" if is_hls else "https",
+            "height": _jvd_height(note_),
+            "vcodec": None,
+            "acodec": None,
+            # The CDN wants the player frame as its Referer, like a browser sends
+            # it — needsProxy then routes the request (and HLS segments) via us.
+            "_sniffed": True,
+            "http_headers": {"User-Agent": DEFAULT_UA, "Referer": play_url},
+        })
+
+    # A progressive file plays natively and does not need hls.js, so prefer one.
+    for entry in direct:
+        add(entry, is_hls=False)
+    if not formats:
+        for entry in playlist:
+            if _jvd_hls_is_video(entry[2], entry[1]):
+                add(entry, is_hls=True)
+                break
+
+    if not formats:
+        detail = ("the alternates offered only ad playlists"
+                  if playlist else "no alternate answered")
+        raise RuntimeError(
+            f"javhdporn offered no playable source for this video ({detail}) — "
+            f"open it on the site instead"
+            + (f" [{'; '.join(failures)}]" if failures else ""))
+
+    formats.sort(key=lambda f: (f["protocol"] == "m3u8_native",
+                                -(f.get("height") or 0)))
+    heading = _JVD_H1_RE.search(html) or _JVD_TITLE_RE.search(html)
+    title = None
+    if heading:
+        title = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", "", heading.group(1))).strip()
+    note(f"javhdporn: decoded {len(formats)} source(s) from {len(alternates)} "
+         f"alternate player(s)")
+    return {
+        "title": title or "javhdporn video",
+        "extractor_key": "javhdporn",
+        "duration": duration,
+        "formats": formats,
+        "webpage_url": url,
+    }
+
+
 # Sites whose markup needs decoding by an adapter — a player frame to walk, or
 # (hanime) an API that signs every request. One named function per host.
 _PLAYER_SITES = {"watchhentai.net": watchhentai_extract,
                  "sulasokvid.co": sulasokvid_extract,
-                 "hanime.tv": hanime_extract}
+                 "hanime.tv": hanime_extract,
+                 "javhdporn.net": javhdporn_extract}
 
 
 class NotAVideoPage(RuntimeError):
