@@ -862,12 +862,29 @@
   });
 
   video.addEventListener('playing', () => status('Playing'));
-  video.addEventListener('pause', () => status('Paused'));
+  video.addEventListener('pause', () => { status('Paused'); reportPosition(true); });
+  video.addEventListener('play', () => reportPosition(true));
   video.addEventListener('waiting', () => status('Buffering…'));
   video.addEventListener('seeking', flash);
-  video.addEventListener('seeked', statusIfPlaying);
+  video.addEventListener('seeked', () => { statusIfPlaying(); reportPosition(true); });
 
   function statusIfPlaying() { if (!video.paused) status('Playing'); }
+
+  // Tell the backend where we are, throttled. This is what makes the cache
+  // window follow the playhead instead of the furthest prefetched byte.
+  const POS_EVERY = 4000;
+  let posSentAt = 0;
+  function reportPosition(force) {
+    if (typeof window.ViewerReportPosition !== 'function') return;
+    if (!currentUrl || !currentFmtId) return;      // raw URL or a local file
+    if (currentFmtId === '__merge__') return;       // stitched: not a cacheable file
+    const now = Date.now();
+    if (!force && now - posSentAt < POS_EVERY) return;
+    posSentAt = now;
+    const dur = isFinite(video.duration) ? video.duration : 0;
+    window.ViewerReportPosition(currentUrl, currentFmtId, video.currentTime, dur,
+                                 video.paused);
+  }
 
   video.addEventListener('timeupdate', () => {
     if (statusEl.classList.contains('playing') || video.paused) {
@@ -875,6 +892,7 @@
         isFinite(video.duration) ? '/ ' + fmtTime(video.duration) : '',
         video.playbackRate === 1 ? '' : video.playbackRate + '×'].filter(Boolean).join('  '));
     }
+    reportPosition(false);
   });
 
   const ERRORS = {

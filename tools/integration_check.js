@@ -110,6 +110,15 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   check('the title reached the page',
     /Kotowarenai/i.test(window.document.title), window.document.title);
 
+  // The playhead heartbeat is what makes the cache window follow playback
+  // rather than the furthest prefetched Range.
+  seen.length = 0;
+  window.ViewerReportPosition(TARGET, 'wh-1080', 195.5, 600, false);
+  await sleep(250);
+  check('the playhead heartbeat reaches the backend',
+    seen.some((u) => u.includes('/api/position') && u.includes('t=195.5')),
+    seen.find((u) => u.includes('/api/position')) || 'none');
+
   // The always-proxy toggle lives in the quality row of the happy-path panel.
   // Grab it here: the playlist mock below re-renders the panel without it, but
   // the captured element keeps its real change listener for the toggle test.

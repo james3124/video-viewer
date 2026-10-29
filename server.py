@@ -30,6 +30,7 @@ callers holding the secret can make the server fetch URLs for them.
 from __future__ import annotations
 
 import argparse
+import atexit
 import base64
 import binascii
 import collections
@@ -43,6 +44,7 @@ import os
 from html import unescape as html_unescape
 import re
 import shutil
+import signal
 import socket
 import stat as stat_mod
 import struct
@@ -129,6 +131,7 @@ CACHE_DIR = env("VIEWER_CACHE_DIR") or os.path.join(tempfile.gettempdir(), "view
 INFO_DIR = os.path.join(CACHE_DIR, "info")
 SUB_DIR = os.path.join(CACHE_DIR, "subs")
 YTDLP_DIR = os.path.join(CACHE_DIR, "yt-dlp")
+MEDIA_DIR = os.path.join(CACHE_DIR, "media")
 
 HAS_CURL_CFFI = _has_module("curl_cffi")
 IMPERSONATE = env("YTDLP_IMPERSONATE", default=("chrome" if HAS_CURL_CFFI else ""))
@@ -194,7 +197,7 @@ def note(msg: str) -> None:
 
 
 def ensure_dirs() -> None:
-    for d in (CACHE_DIR, INFO_DIR, SUB_DIR, YTDLP_DIR):
+    for d in (CACHE_DIR, INFO_DIR, SUB_DIR, YTDLP_DIR, MEDIA_DIR):
         try:
             os.makedirs(d, exist_ok=True)
         except OSError as exc:                 # read-only bundle filesystems
@@ -2329,6 +2332,10 @@ class Expired(Exception):
     """The CDN rejected our URL — it was signed and has now run out."""
 
 
+class Unreachable(RuntimeError):
+    """The source could not be contacted at all (offline, DNS, timeout)."""
+
+
 def _chunks(resp, prefix: bytes = b""):
     """Yield an already-read prefix, then the rest of the response body."""
     if prefix:
@@ -2614,7 +2621,8 @@ def resolve_target(page: str, fmt: str = "", fresh: bool = False) -> dict:
         raise ValueError("Refusing to fetch a private/loopback address")
     looks_like_media = bool(MEDIA_EXT_RE.search(page))
     if not fmt and (ytdlp_mode() == "none" or looks_like_media):
-        return {"url": page, "headers": {}, "kind": "direct", "id": None}
+        return {"url": page, "headers": {}, "kind": "direct", "id": None,
+                "ext": None, "title": None, "filesize": 0, "duration": None}
 
     info = get_info(page, fresh=fresh, playlist=PLAYLIST_PROBE)
     fmts = browsable_formats(info)
@@ -2628,7 +2636,8 @@ def resolve_target(page: str, fmt: str = "", fresh: bool = False) -> dict:
             raise RuntimeError(
                 "yt-dlp found nothing playable for this link — it may be private, "
                 "region-locked, deleted, or subscriber-only")
-        return {"url": page, "headers": {}, "kind": "direct", "id": None}
+        return {"url": page, "headers": {}, "kind": "direct", "id": None,
+                "ext": None, "title": None, "filesize": 0, "duration": None}
     if chosen["kind"] == "merge":
         return {"url": page, "headers": {}, "kind": "merge", "id": MERGE_ID}
     return {
@@ -2638,6 +2647,10 @@ def resolve_target(page: str, fmt: str = "", fresh: bool = False) -> dict:
         "id": chosen["id"],
         "ext": chosen.get("ext"),
         "title": info.get("title"),
+        # The windowed cache needs the full size and runtime to decide how
+        # much of the file to keep and where the playhead sits in it.
+        "filesize": chosen.get("size") or 0,
+        "duration": info.get("duration"),
     }
 
 
@@ -2649,6 +2662,553 @@ def resolve_headers(page: str, fmt: str = "") -> dict:
         return resolve_target(page, fmt).get("headers") or {}
     except Exception:  # noqa: BLE001
         return {}
+
+
+# --------------------------------------------------------------------------- #
+#  Media cache — a size-tiered, playhead-anchored window of the bytes in view
+#
+#  This is not an offline library. It keeps a rolling window that follows the
+#  playhead: for a 2.47 GB file it holds ~25 %, for a 100 MB file ~75 %, and as
+#  you play forward it drops what is behind you and fetches the next stretch.
+#  The window is deliberately short-lived: an idle entry is deleted after
+#  VIEWER_MEDIA_TTL (5 min by default), and the whole directory is wiped when
+#  the server exits — or on the next start when the previous process died.
+#
+#  Why server-side: the UI is opened over plain HTTP on a LAN address, and
+#  browsers only allow a Service Worker / Cache API in a secure context. There
+#  is no browser storage to lean on, so the bytes live next to server.py.
+# --------------------------------------------------------------------------- #
+
+MEDIA_CACHE = env_bool("VIEWER_MEDIA_CACHE",
+                       default=PLATFORM not in ("Vercel", "AWS Lambda", "Netlify"))
+MEDIA_TTL = env_int("VIEWER_MEDIA_TTL", default=300)          # idle seconds
+MEDIA_SWEEP = max(5, env_int("VIEWER_MEDIA_SWEEP", default=30))
+MEDIA_MAX_MB = env_int("VIEWER_MEDIA_MAX_MB", default=4096)   # global ceiling
+MEDIA_CHUNK = max(64 * 1024, env_int("VIEWER_MEDIA_CHUNK", default=1 << 20))
+CACHE_BACK = max(0, env_int("VIEWER_CACHE_BACK", default=10))  # seconds behind
+PREFETCH_BPS = max(0, env_int("VIEWER_PREFETCH_MBPS", default=8)) * 1_000_000
+CLEANUP_ON_EXIT = env_bool("VIEWER_MEDIA_CLEANUP_ON_EXIT", default=True)
+
+# Fraction of a file kept on disk, by total size (decimal MB, like a phone
+# shows it). Small files are cheap to keep most of; a multi-gigabyte file is
+# kept as a window around the playhead instead of eating the disk.
+_CACHE_TIERS = ((1_000_000_000, 0.25), (300_000_000, 0.35),
+                (100_000_000, 0.50), (0, 0.75))
+
+
+def cache_fraction(size: int) -> float:
+    """How much of a file of `size` bytes we are willing to keep."""
+    size = int(size or 0)
+    for floor, frac in _CACHE_TIERS:
+        if size >= floor:
+            return frac
+    return _CACHE_TIERS[-1][1]
+
+
+class MediaEntry:
+    """One (page, format) pair currently being cached."""
+
+    def __init__(self, key: str, page: str, fmt: str) -> None:
+        self.key = key
+        self.page = page
+        self.fmt = fmt
+        self.dir = os.path.join(MEDIA_DIR, key)
+        self.total = 0                 # bytes in the full file
+        self.duration = 0.0
+        self.fraction = 0.0
+        self.budget = 0                # bytes we are allowed to keep
+        self.url = ""                  # current upstream URL (may be signed)
+        self.headers: dict = {}
+        self.title = ""
+        self.ext = "mp4"
+        self.ctype = "video/mp4"
+        self.etag = ""
+        self.last_modified = ""
+        self.playhead = 0.0
+        self.has_position = False
+        self.position_at = 0.0
+        self.anchor = 0                # byte offset when no heartbeat has arrived
+        self.paused = False
+        self.present: set[int] = set()  # chunk indices fully written
+        self.ranges: dict[int, list] = {}   # partial chunk idx → [(start,end)]
+        self.inflight: set[int] = set()
+        self.on_disk = 0
+        self.last_used = time.time()
+        self.created = time.time()
+        self.player_until = 0.0
+        self.stop = threading.Event()
+        self.filler: threading.Thread | None = None
+        self.lock = threading.RLock()
+
+    def chunk_len(self, idx: int) -> int:
+        if not self.total:
+            return MEDIA_CHUNK
+        return max(0, min(MEDIA_CHUNK, self.total - idx * MEDIA_CHUNK))
+
+
+_MEDIA: dict[str, MediaEntry] = {}
+_MEDIA_LOCK = threading.RLock()
+_MEDIA_SWEEP_STARTED = False
+_MEDIA_CLOSING = threading.Event()
+_MEDIA_READY = False
+_MEDIA_FOREIGN = False     # another live process owns MEDIA_DIR
+
+
+# -- lifecycle -------------------------------------------------------------- #
+
+def _media_pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def media_startup() -> None:
+    """Claim media/ — wipe what a dead previous process left behind.
+
+    A SIGKILL, a power cut or the OS reaping the backend skips `atexit`, so the
+    "wipe on exit" guarantee is completed here on the next start. A live PID in
+    .owner means another instance is using the directory; leave it alone.
+    """
+    global _MEDIA_READY, _MEDIA_FOREIGN
+    if not MEDIA_CACHE or _MEDIA_READY:
+        return
+    _MEDIA_READY = True
+    _MEDIA_FOREIGN = False
+    _MEDIA_CLOSING.clear()
+    try:
+        os.makedirs(MEDIA_DIR, exist_ok=True)
+    except OSError:
+        return
+    owner = os.path.join(MEDIA_DIR, ".owner")
+    previous = 0
+    try:
+        with open(owner, "r", encoding="utf-8") as fh:
+            previous = int((fh.read() or "0").strip() or 0)
+    except (OSError, ValueError):
+        previous = 0
+    if previous and previous != os.getpid() and _media_pid_alive(previous):
+        _MEDIA_FOREIGN = True
+        note(f"media cache is owned by pid {previous} — caching is disabled here")
+        return
+    _MEDIA.clear()
+    for name in os.listdir(MEDIA_DIR):
+        path = os.path.join(MEDIA_DIR, name)
+        try:
+            if os.path.isdir(path):
+                shutil.rmtree(path, ignore_errors=True)
+            else:
+                os.remove(path)
+        except OSError:
+            pass
+    try:
+        with open(owner, "w", encoding="utf-8") as fh:
+            fh.write(str(os.getpid()))
+    except OSError:
+        pass
+    _media_start_sweeper()
+
+
+def media_shutdown() -> None:
+    """Stop workers and, by default, drop the whole cache. Never raises."""
+    global _MEDIA_READY, _MEDIA_SWEEP_STARTED, _MEDIA_FOREIGN
+    _MEDIA_CLOSING.set()
+    for ent in list(_MEDIA.values()):
+        ent.stop.set()
+    if CLEANUP_ON_EXIT and not _MEDIA_FOREIGN:
+        try:
+            shutil.rmtree(MEDIA_DIR, ignore_errors=True)
+        except Exception:  # noqa: BLE001
+            pass
+    _MEDIA.clear()
+    _MEDIA_READY = False
+    _MEDIA_SWEEP_STARTED = False
+    _MEDIA_FOREIGN = False
+
+
+def _media_start_sweeper() -> None:
+    global _MEDIA_SWEEP_STARTED
+    with _MEDIA_LOCK:
+        if _MEDIA_SWEEP_STARTED:
+            return
+        _MEDIA_SWEEP_STARTED = True
+    threading.Thread(target=_media_sweeper, daemon=True, name="media-sweeper").start()
+
+
+def _media_sweeper() -> None:
+    while not _MEDIA_CLOSING.wait(MEDIA_SWEEP):
+        _media_sweep_once()
+
+
+def _media_sweep_once(now: float | None = None) -> None:
+    now = time.time() if now is None else now
+    for ent in list(_MEDIA.values()):
+        if now - ent.last_used > MEDIA_TTL and now > ent.player_until:
+            _media_destroy(ent)
+    _media_enforce_quota()
+
+
+def _media_destroy(ent: MediaEntry) -> None:
+    ent.stop.set()
+    with _MEDIA_LOCK:
+        if _MEDIA.get(ent.key) is ent:
+            _MEDIA.pop(ent.key, None)
+    shutil.rmtree(ent.dir, ignore_errors=True)
+
+
+# -- entry lookup / metadata ------------------------------------------------ #
+
+def _media_key(page: str, fmt: str) -> str:
+    return hashlib.sha1(f"{page}\n{fmt}".encode("utf-8")).hexdigest()
+
+
+def _media_get(page: str, fmt: str, create: bool = True) -> MediaEntry | None:
+    if _MEDIA_FOREIGN:
+        return None
+    key = _media_key(page, fmt)
+    with _MEDIA_LOCK:
+        ent = _MEDIA.get(key)
+        if ent is None and create:
+            ent = MediaEntry(key, page, fmt)
+            _MEDIA[key] = ent
+        if ent is not None:
+            ent.last_used = time.time()
+        return ent
+
+
+def _media_set_total(ent: MediaEntry, total: int) -> None:
+    total = int(total or 0)
+    if total <= 0:
+        return
+    changed = False
+    with ent.lock:
+        if ent.total != total:
+            ent.total = total
+            ent.fraction = cache_fraction(total)
+            budget = int(total * ent.fraction)
+            cap = MEDIA_MAX_MB * 1_000_000 if MEDIA_MAX_MB > 0 else budget
+            budget = max(MEDIA_CHUNK, min(budget, cap))
+            ent.budget = max(MEDIA_CHUNK, (budget // MEDIA_CHUNK) * MEDIA_CHUNK)
+            changed = True
+    if changed:
+        _media_start_filler(ent)
+
+
+def _media_attach(ent: MediaEntry | None, target: dict) -> None:
+    """Refresh the upstream link and learn the total size, when known."""
+    if ent is None:
+        return
+    with ent.lock:
+        if target.get("url"):
+            ent.url = target["url"]
+        if target.get("headers") is not None:
+            ent.headers = dict(target.get("headers") or {})
+        if target.get("title"):
+            ent.title = str(target["title"])
+        if target.get("ext"):
+            ent.ext = str(target["ext"]).lower().lstrip(".") or ent.ext
+        dur = target.get("duration")
+        if dur:
+            try:
+                ent.duration = float(dur)
+            except (TypeError, ValueError):
+                pass
+        size = target.get("filesize") or target.get("filesize_approx") or 0
+        try:
+            size = int(size or 0)
+        except (TypeError, ValueError):
+            size = 0
+        if size > 0:
+            _media_set_total(ent, size)
+    _media_start_filler(ent)
+
+
+def _media_position(page: str, fmt: str, t: float | None, duration: float | None,
+                    paused: bool) -> MediaEntry | None:
+    ent = _media_get(page, fmt)
+    if ent is None:
+        return None
+    with ent.lock:
+        if duration and duration > 0:
+            ent.duration = float(duration)
+        if t is not None:
+            ent.playhead = max(0.0, float(t))
+            ent.has_position = True
+            ent.position_at = time.time()
+        ent.paused = bool(paused)
+        ent.last_used = time.time()
+    _media_start_filler(ent)
+    return ent
+
+
+# -- window math ------------------------------------------------------------ #
+
+def _media_window(ent: MediaEntry) -> tuple[int, int]:
+    """Byte window [start, end) the cache should hold right now.
+
+    The window is `budget` bytes wide, anchored just behind the playhead. Near
+    the end of a file it clamps and simply shrinks: we do not backfill content
+    the playhead has already passed.
+    """
+    with ent.lock:
+        total = ent.total
+        budget = ent.budget or MEDIA_CHUNK
+        if total <= 0:
+            return (0, 0)
+        if ent.has_position and ent.duration > 0:
+            ratio = max(0.0, min(1.0, ent.playhead / ent.duration))
+            anchor = int(total * ratio)
+            back = int(total * (CACHE_BACK / ent.duration))
+        else:
+            anchor = ent.anchor
+            back = 0
+        start = max(0, anchor - max(0, back))
+        end = min(total, start + budget)
+        if total - end < MEDIA_CHUNK:
+            # Include the final, partial chunk: otherwise the last few hundred
+            # KB of a file can never be served from cache.
+            end = total
+        if end <= start:                 # the anchor sat past the end
+            start, end = max(0, total - budget), total
+        return (start, end)
+
+
+def _media_plan_chunks(ent: MediaEntry) -> tuple[int, int]:
+    start, end = _media_window(ent)
+    if end <= start:
+        return (0, -1)
+    return (start // MEDIA_CHUNK, (end - 1) // MEDIA_CHUNK)
+
+
+# -- chunk storage ---------------------------------------------------------- #
+
+def _merge_span(spans: list, lo: int, hi: int) -> list:
+    out = []
+    for s, e in spans:
+        if e < lo or s > hi:
+            out.append((s, e))
+        else:
+            lo, hi = min(lo, s), max(hi, e)
+    out.append((lo, hi))
+    out.sort()
+    return out
+
+
+def _span_covers(spans: list, lo: int, hi: int) -> bool:
+    cur = lo
+    for s, e in sorted(spans):
+        if s > cur:
+            return False
+        cur = max(cur, e)
+        if cur >= hi:
+            return True
+    return cur >= hi
+
+
+def _media_write(ent: MediaEntry, offset: int, data: bytes) -> None:
+    if not data or _MEDIA_CLOSING.is_set():
+        return
+    with ent.lock:
+        pos = 0
+        while pos < len(data):
+            abs_off = offset + pos
+            idx = abs_off // MEDIA_CHUNK
+            within = abs_off - idx * MEDIA_CHUNK
+            take = min(MEDIA_CHUNK - within, len(data) - pos)
+            _media_write_piece(ent, idx, within, data[pos:pos + take])
+            pos += take
+        ent.last_used = time.time()
+
+
+def _media_write_piece(ent: MediaEntry, idx: int, within: int, piece: bytes) -> None:
+    if idx in ent.present:
+        return
+    length = ent.chunk_len(idx)
+    if length <= 0:
+        return
+    hi = min(within + len(piece), length)
+    if hi <= within:
+        return
+    try:
+        os.makedirs(ent.dir, exist_ok=True)
+        path = os.path.join(ent.dir, f"chunk_{idx}.bin")
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT, 0o600)
+        try:
+            os.pwrite(fd, piece[:hi - within], within)
+        finally:
+            os.close(fd)
+    except OSError:
+        return
+    spans = _merge_span(ent.ranges.get(idx, []), within, hi)
+    ent.ranges[idx] = spans
+    if _span_covers(spans, 0, length):
+        try:
+            os.truncate(path, length)
+        except OSError:
+            pass
+        ent.present.add(idx)
+        ent.ranges.pop(idx, None)
+        ent.on_disk += length
+
+
+def _media_remove_chunk(ent: MediaEntry, idx: int) -> None:
+    complete = idx in ent.present
+    length = ent.chunk_len(idx) if complete else 0
+    try:
+        os.remove(os.path.join(ent.dir, f"chunk_{idx}.bin"))
+    except OSError:
+        pass
+    ent.present.discard(idx)
+    ent.ranges.pop(idx, None)
+    ent.inflight.discard(idx)
+    if complete:
+        ent.on_disk = max(0, ent.on_disk - length)
+
+
+def _media_enforce(ent: MediaEntry) -> None:
+    """Drop everything outside the current window (and partial chunks too)."""
+    if not ent.total or not ent.budget:
+        return
+    lo, hi = _media_plan_chunks(ent)
+    if hi < lo:
+        return
+    with ent.lock:
+        for idx in list(set(ent.present) | set(ent.ranges)):
+            if idx < lo or idx > hi:
+                _media_remove_chunk(ent, idx)
+
+
+def _media_covers(ent: MediaEntry, start: int, end: int) -> bool:
+    """True when every chunk touching [start, end) is fully cached."""
+    if end <= start or not ent.total:
+        return False
+    first, last = start // MEDIA_CHUNK, (end - 1) // MEDIA_CHUNK
+    with ent.lock:
+        return all(idx in ent.present for idx in range(first, last + 1))
+
+
+def _media_disk_usage() -> int:
+    return sum(ent.on_disk for ent in list(_MEDIA.values()))
+
+
+def _media_enforce_quota() -> None:
+    if MEDIA_MAX_MB <= 0:
+        return
+    limit = MEDIA_MAX_MB * 1_000_000
+    if _media_disk_usage() <= limit:
+        return
+    now = time.time()
+    for ent in sorted(list(_MEDIA.values()), key=lambda e: e.last_used):
+        if _media_disk_usage() <= limit:
+            return
+        if now < ent.player_until:
+            continue
+        _media_destroy(ent)
+
+
+# -- background filler ------------------------------------------------------ #
+
+def _media_start_filler(ent: MediaEntry | None) -> None:
+    if not MEDIA_CACHE or ent is None or not ent.total:
+        return
+    with ent.lock:
+        if ent.filler is not None and ent.filler.is_alive():
+            return
+        ent.stop.clear()
+        ent.filler = threading.Thread(target=_media_fill, args=(ent,), daemon=True,
+                                      name=f"media-{ent.key[:8]}")
+        ent.filler.start()
+
+
+def _media_fetch_chunk(ent: MediaEntry, idx: int) -> None:
+    with ent.lock:
+        if idx in ent.present or idx in ent.inflight or not ent.url or not ent.total:
+            return
+        ent.inflight.add(idx)
+        url = ent.url
+        headers = dict(ent.headers)
+        start = idx * MEDIA_CHUNK
+        end = min(ent.total, start + MEDIA_CHUNK) - 1
+    headers["Range"] = f"bytes={start}-{end}"
+    resp = None
+    try:
+        for attempt in (0, 1):
+            try:
+                resp = guarded_urlopen(url, headers, timeout=PROXY_TIMEOUT)
+                break
+            except urllib.error.HTTPError as exc:
+                if attempt or exc.code not in EXPIRY_CODES:
+                    return
+                try:                     # signed URL expired → re-resolve once
+                    target = resolve_target(ent.page, ent.fmt, fresh=True)
+                except Exception:        # noqa: BLE001
+                    return
+                if not target.get("url"):
+                    return
+                with ent.lock:
+                    ent.url = target["url"]
+                    ent.headers = dict(target.get("headers") or {})
+                    url = ent.url
+                    headers = {**ent.headers,
+                               "Range": f"bytes={start}-{end}"}
+            except (urllib.error.URLError, OSError):
+                return
+        if resp is None:
+            return
+        with resp:
+            status = getattr(resp, "status", 200) or 200
+            if start > 0 and status != 206:
+                return                   # server ignored Range → wrong offset
+            ctype = (resp.headers.get("Content-Type") or "").split(";")[0].lower()
+            if ctype in ("text/html", "application/xhtml+xml", "application/json"):
+                return
+            got = 0
+            want = end - start + 1
+            while got < want:
+                buf = resp.read(min(STREAM_CHUNK, want - got))
+                if not buf:
+                    break
+                _media_write(ent, start + got, buf)
+                got += len(buf)
+            if PREFETCH_BPS and got:
+                time.sleep(min(1.0, got / PREFETCH_BPS))
+    finally:
+        with ent.lock:
+            ent.inflight.discard(idx)
+
+
+def _media_fill(ent: MediaEntry) -> None:
+    while not _MEDIA_CLOSING.is_set() and not ent.stop.is_set():
+        try:
+            with ent.lock:
+                ready = bool(ent.total and ent.budget and ent.url and not ent.paused)
+                player_until = ent.player_until
+            if not ready:
+                ent.stop.wait(0.5)
+                continue
+            if time.time() < player_until:
+                ent.stop.wait(0.25)      # never compete with the playing stream
+                continue
+            lo, hi = _media_plan_chunks(ent)
+            if hi < lo:
+                ent.stop.wait(0.5)
+                continue
+            missing = [i for i in range(lo, hi + 1)
+                       if i not in ent.present and i not in ent.inflight]
+            if not missing:
+                _media_enforce(ent)
+                ent.stop.wait(0.5)
+                continue
+            _media_fetch_chunk(ent, missing[0])
+        except Exception:  # noqa: BLE001
+            ent.stop.wait(1.0)
 
 
 def safe_filename(title: str, ext: str = "mp4") -> str:
@@ -2992,6 +3552,7 @@ class Handler(BaseHTTPRequestHandler):
                 "/api/merge": lambda: self._api_merge(q, head),
                 "/api/hls": lambda: self._api_hls(q, head),
                 "/api/subsrc": lambda: self._api_subsrc(q, head),
+                "/api/position": lambda: self._api_position(q, head),
                 "/api/ui-log": lambda: self._api_ui_log(q, head),
             }
             fn = routes.get(path)
@@ -3055,12 +3616,19 @@ class Handler(BaseHTTPRequestHandler):
                 "impersonate": IMPERSONATE if impersonate_ready() else None,
                 "subtitles": True,
                 "cache": True,
+                "cacheWindow": bool(MEDIA_CACHE),
                 "download": True,
             },
             "tokenRequired": bool(TOKEN),
             "staticBuild": static_build(),
             "platform": PLATFORM or "self-hosted",
             "cache": {"dir": CACHE_DIR, "entries": len(_MEM), **STATS},
+            "mediaCache": {
+                "enabled": bool(MEDIA_CACHE),
+                "entries": len(_MEDIA),
+                "bytes": _media_disk_usage(),
+                "ttl": MEDIA_TTL,
+            },
             "notices": notice[-4:],
         }, cache="no-store")
 
@@ -3126,6 +3694,15 @@ class Handler(BaseHTTPRequestHandler):
         merge = merge_offer(fmts, url)
         if merge:
             fmts.insert(0, merge)
+        if MEDIA_CACHE:
+            for f in fmts:
+                if f.get("kind") != "direct":
+                    continue
+                ent = _media_get(url, f["id"], create=False)
+                if ent is not None:
+                    f["cachedBytes"] = ent.on_disk
+                    if ent.budget:
+                        f["cacheBudget"] = ent.budget
 
         payload = {
             "ok": True, "url": url, "extractable": bool(fmts),
@@ -3140,6 +3717,9 @@ class Handler(BaseHTTPRequestHandler):
             "autoFormatId": chosen["id"] if chosen else None,
             "subtitles": subtitle_tracks(info),
             "needsProxyHint": bool(chosen and chosen["needsProxy"]),
+            # Direct formats are routed through /api/play?proxy=1 when this is
+            # true, which is what lets the windowed cache see the bytes.
+            "cacheEnabled": bool(MEDIA_CACHE),
         }
         if is_playlist and entries:
             payload["playlist"] = {"title": info.get("title"), "count": len(entries),
@@ -3191,15 +3771,30 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_error_json(friendly(exc), 502)
             return
 
+        # Cache-first: if we already hold the requested byte range, serve it
+        # without touching the network. This is what keeps playback alive when
+        # the CDN drops a connection, and it also makes seeking inside the
+        # window instant.
+        ent = None
+        if MEDIA_CACHE and q.get("proxy") == "1":
+            ent = _media_get(src, fmt, create=False)
+            if ent is not None and self._media_serve(ent, head=head):
+                return
+
         try:
             target = resolve_target(src, fmt, fresh=q.get("fresh") == "1")
         except ValueError as exc:
             return self._send_error_json(friendly(exc), 400)
         except Exception as exc:  # noqa: BLE001
             if not MEDIA_EXT_RE.search(src):
+                # The extractor is down, but the bytes in the window are still
+                # perfectly good: play those before reporting a failure.
+                if ent is not None and self._media_serve(ent, head=head):
+                    return
                 return self._send_error_json(friendly(exc), 502)
             # A plain media URL: just fetch it, no extraction needed.
-            target = {"url": src, "headers": {}, "kind": "direct", "id": None}
+            target = {"url": src, "headers": {}, "kind": "direct", "id": None,
+                      "ext": None, "title": None, "filesize": 0, "duration": None}
 
         if target["kind"] == "merge":
             link = f"/api/merge?url={urllib.parse.quote(src, safe='')}"
@@ -3210,12 +3805,151 @@ class Handler(BaseHTTPRequestHandler):
         if q.get("proxy") != "1":
             return self._redirect(target["url"])
 
+        if MEDIA_CACHE and target["kind"] == "direct":
+            key_fmt = fmt or str(target.get("id") or "")
+            ent = _media_get(src, key_fmt)
+            _media_attach(ent, target)
+            if self._media_serve(ent, head=head):
+                return
+        else:
+            ent = None
+
         try:
-            self._proxy_with_retry(src, fmt, target, head=head, reject_html=True)
-        except Expired as exc:
+            self._proxy_with_retry(src, fmt, target, head=head, reject_html=True,
+                                   media=ent)
+        except (Expired, Unreachable) as exc:
+            if ent is not None and self._media_serve(ent, head=head):
+                return
+            if ent is not None and ent.total:
+                # The cache knows this file but not this stretch of it. Say so
+                # plainly instead of blaming the CDN for a mere miss.
+                return self._send_error_json(
+                    "This part isn't cached yet and the source is unreachable — "
+                    "rewind a little and try again.", 503)
             self._send_error_json(
                 f"{friendly(exc)} — reload, pick another quality, or try 'Force proxy'.",
                 502)
+
+    # -- windowed media cache ------------------------------------------------- #
+
+    def _media_serve(self, ent, head: bool = False) -> bool:
+        """Answer this request from disk when the Range is fully cached.
+
+        Returns False when any part of the requested range is missing, so the
+        caller streams (and tees) from upstream instead. Never sends a truncated
+        206: a partial answer would look like a corrupt video to the browser.
+        """
+        rng = self.headers.get("Range") or ""
+        m = re.fullmatch(r"\s*bytes=(\d*)-(\d*)\s*", rng)
+        if not m or not ent.total:
+            return False
+        total = ent.total
+        if m.group(1):
+            start = int(m.group(1))
+            end = int(m.group(2)) if m.group(2) else total - 1
+        elif m.group(2):
+            n = int(m.group(2))
+            if n <= 0:
+                return False
+            start, end = max(0, total - n), total - 1
+        else:
+            return False
+        if start >= total:
+            return False
+        end = min(end, total - 1)
+        if end < start or not _media_covers(ent, start, end + 1):
+            return False
+
+        now = time.time()
+        ent.player_until = now + 3
+        ent.last_used = now
+        length = end - start + 1
+        try:
+            self.send_response(206)
+            self.send_header("Content-Type", ent.ctype or "video/mp4")
+            self.send_header("Accept-Ranges", "bytes")
+            self.send_header("Content-Length", str(length))
+            self.send_header("Content-Range", f"bytes {start}-{end}/{total}")
+            if ent.etag:
+                self.send_header("ETag", ent.etag)
+            if ent.last_modified:
+                self.send_header("Last-Modified", ent.last_modified)
+            # It is a cache, but a deliberately disposable one: the browser
+            # must ask us again so eviction and TTL stay authoritative.
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Viewer-Cache", "hit")
+            self._cors()
+            self.end_headers()
+            if head:
+                return True
+            # Hold the entry lock while reading so a concurrent eviction cannot
+            # unlink a chunk between the coverage check and the read.
+            with ent.lock:
+                self._media_write_out(ent, start, end)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        return True
+
+    def _media_write_out(self, ent, start: int, end: int) -> None:
+        """Write cached chunks [start, end] to the client, one chunk at a time."""
+        idx = start // MEDIA_CHUNK
+        pos = start
+        while pos <= end:
+            base = idx * MEDIA_CHUNK
+            lo = pos - base
+            hi = min(ent.chunk_len(idx), end - base + 1)
+            if hi <= lo:
+                pos = base + hi
+                idx += 1
+                continue
+            path = os.path.join(ent.dir, f"chunk_{idx}.bin")
+            try:
+                with open(path, "rb") as fh:
+                    fh.seek(lo)
+                    left = hi - lo
+                    while left > 0:
+                        buf = fh.read(min(STREAM_CHUNK, left))
+                        if not buf:
+                            break
+                        self.wfile.write(buf)
+                        left -= len(buf)
+            except OSError:
+                return
+            pos = base + hi
+            idx += 1
+
+    def _api_position(self, q: dict, head: bool = False) -> None:
+        """The player tells us where it is, so the window can follow it.
+
+        Range requests alone cannot distinguish "watching at 3:15" from
+        "prefetching 500 MB ahead", so the UI sends a throttled heartbeat.
+        """
+        src = q.get("url", "") or q.get("u", "")
+        fmt = q.get("fmt", "") or q.get("f", "")
+        if not valid_url(src):
+            return self._send_error_json("Missing/invalid ?url=", 400)
+        if not MEDIA_CACHE:
+            return self._send_json({"ok": True, "cache": False})
+        try:
+            t = float(q.get("t") or 0)
+        except (TypeError, ValueError):
+            t = 0.0
+        try:
+            dur = float(q.get("d") or q.get("duration") or 0)
+        except (TypeError, ValueError):
+            dur = 0.0
+        paused = str(q.get("paused") or "").lower() in ("1", "true", "yes")
+        ent = _media_position(src, fmt, t, dur, paused)
+        if ent is None:
+            return self._send_json({"ok": True, "cache": False})
+        start, end = _media_window(ent)
+        self._send_json({
+            "ok": True, "cache": True,
+            "cachedBytes": ent.on_disk,
+            "budgetBytes": ent.budget,
+            "windowStart": start, "windowEnd": end,
+            "ttl": MEDIA_TTL,
+        })
 
     def _redirect(self, url: str) -> None:
         try:
@@ -3230,12 +3964,14 @@ class Handler(BaseHTTPRequestHandler):
 
     def _proxy_with_retry(self, page: str, fmt: str, target: dict,
                           head: bool = False, allow_refresh: bool = True,
-                          reject_html: bool = False, disposition: str | None = None) -> None:
+                          reject_html: bool = False, disposition: str | None = None,
+                          media=None) -> None:
         """Stream `target`, re-extracting once if the CDN says the URL expired."""
         for attempt in (0, 1):
             try:
                 self._proxy(target["url"], target.get("headers") or {}, head=head,
-                            reject_html=reject_html, disposition=disposition)
+                            reject_html=reject_html, disposition=disposition,
+                            media=media)
                 return
             except Expired:
                 if (attempt or not allow_refresh or ytdlp_mode() == "none"
@@ -3246,6 +3982,9 @@ class Handler(BaseHTTPRequestHandler):
                     raise
                 note(f"expired CDN url for {page[:70]} — re-extracted and retrying")
                 target = retried
+                if media is not None:
+                    # Keep the cache entry on the fresh link, not the dead one.
+                    _media_attach(media, retried)
 
     def _open_upstream(self, url: str, headers: dict, head: bool = False):
         merged = {"User-Agent": DEFAULT_UA, "Accept": "*/*", "Accept-Encoding": "identity"}
@@ -3259,7 +3998,21 @@ class Handler(BaseHTTPRequestHandler):
         return guarded_urlopen(url, merged, head=head, timeout=PROXY_TIMEOUT)
 
     def _proxy(self, url: str, headers: dict, head: bool = False,
-               reject_html: bool = False, disposition: str | None = None) -> None:
+               reject_html: bool = False, disposition: str | None = None,
+               media=None) -> None:
+        if media is not None:
+            # A player request is in flight: park the prefetcher so the two do
+            # not compete for the same upstream link or the LAN.
+            now = time.time()
+            media.player_until = now + 3
+            media.last_used = now
+            if not (media.has_position and now - media.position_at <= 10):
+                m = re.match(r"\s*bytes=(\d+)-", self.headers.get("Range") or "")
+                if m:
+                    media.anchor = int(m.group(1))
+                    if media.duration > 0 and media.total > 0:
+                        media.playhead = media.duration * (media.anchor / media.total)
+                        media.has_position = True
         try:
             resp = self._open_upstream(url, headers, head)
         except urllib.error.HTTPError as exc:
@@ -3273,13 +4026,17 @@ class Handler(BaseHTTPRequestHandler):
                               or f"The CDN refused the stream ({code})") from exc
             raise RuntimeError(f"Upstream returned {code}") from exc
         except urllib.error.URLError as exc:
-            raise RuntimeError(f"Upstream refused the request ({exc.reason})") from exc
+            raise Unreachable(session_bound_media_note(url)
+                              or f"Upstream refused the request ({exc.reason})") from exc
+        except OSError as exc:
+            raise Unreachable(f"Upstream is unreachable ({exc})") from exc
 
         self._send_upstream(resp, head=head, reject_html=reject_html,
-                            disposition=disposition)
+                            disposition=disposition, media=media)
 
     def _send_upstream(self, resp, head: bool = False, reject_html: bool = False,
-                       prefix: bytes = b"", disposition: str | None = None) -> None:
+                       prefix: bytes = b"", disposition: str | None = None,
+                       media=None) -> None:
         """Mirror an upstream response to the client (self-framing when needed)."""
         with resp:
             up = {k.lower(): v for k, v in resp.getheaders()}
@@ -3298,6 +4055,28 @@ class Handler(BaseHTTPRequestHandler):
                         "the host answered with a web page instead of media — the link "
                         "expired, needs cookies, or is region-locked")
             chunked = "content-length" not in up and not head
+
+            # Where this response lands in the file, so the tee writes the
+            # bytes at the right offset even for a 206 that starts mid-file.
+            media_pos = None
+            if media is not None:
+                media.ctype = up.get("content-type") or media.ctype
+                media.etag = up.get("etag") or media.etag
+                media.last_modified = up.get("last-modified") or media.last_modified
+                cr = up.get("content-range") or ""
+                m = re.search(r"bytes\s+(\d+)-(\d+)/(\d+|\*)", cr)
+                if m:
+                    media_pos = int(m.group(1))
+                    if m.group(3) != "*":
+                        _media_set_total(media, int(m.group(3)))
+                elif up.get("content-length"):
+                    media_pos = 0
+                    try:
+                        _media_set_total(media, int(up["content-length"]))
+                    except (TypeError, ValueError):
+                        pass
+                if not media.total:
+                    media_pos = None      # unknown size: no window to roll
             try:
                 self.send_response(getattr(resp, "status", None) or resp.getcode() or 200)
                 for k, v in resp.getheaders():
@@ -3321,13 +4100,23 @@ class Handler(BaseHTTPRequestHandler):
                 self.end_headers()
                 if head:
                     return
+                media_tick = 0
                 for buf in _chunks(resp, prefix):
+                    if media is not None and media_pos is not None:
+                        _media_write(media, media_pos, buf)
+                        media_pos += len(buf)
+                        media_tick += len(buf)
+                        if media_tick >= 8 * MEDIA_CHUNK:
+                            media_tick = 0
+                            _media_enforce(media)
                     if chunked:
                         self.wfile.write(b"%X\r\n" % len(buf) + buf + b"\r\n")
                     else:
                         self.wfile.write(buf)
                 if chunked:
                     self.wfile.write(b"0\r\n\r\n")
+                if media is not None and media_pos is not None:
+                    _media_enforce(media)
             except (BrokenPipeError, ConnectionResetError):
                 pass
 
@@ -3805,7 +4594,7 @@ handler = Handler          # alias: Vercel's older Python runtime looks for this
 
 def main() -> None:
     global ROOT, CACHE_TTL, TOKEN, COOKIES, YT_DLP, FFMPEG
-    global CACHE_DIR, INFO_DIR, SUB_DIR, YTDLP_DIR
+    global CACHE_DIR, INFO_DIR, SUB_DIR, YTDLP_DIR, MEDIA_DIR
 
     ap = argparse.ArgumentParser(description="Viewer — yt-dlp backed video server")
     ap.add_argument("--host", default=env("HOST", default="127.0.0.1"))
@@ -3839,12 +4628,25 @@ def main() -> None:
         INFO_DIR = os.path.join(CACHE_DIR, "info")
         SUB_DIR = os.path.join(CACHE_DIR, "subs")
         YTDLP_DIR = os.path.join(CACHE_DIR, "yt-dlp")
+        MEDIA_DIR = os.path.join(CACHE_DIR, "media")
     _BASE_ARGS.clear()          # rebuilt with the final cookie/impersonate setup
     YT_DLP = (shutil.which("yt-dlp") or shutil.which("yt_dlp")
               or (LOCAL_BIN if os.access(LOCAL_BIN, os.X_OK) else None))
     FFMPEG = _ffmpeg_path()
 
     ensure_dirs()
+    media_startup()
+    atexit.register(media_shutdown)
+
+    def _stop(signum, frame):
+        media_shutdown()
+        raise KeyboardInterrupt
+
+    for _sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            signal.signal(_sig, _stop)
+        except (ValueError, OSError):
+            pass
     if FFMPEG is None:
         note("ffmpeg not found — merging separate video+audio tracks will fail")
     if ytdlp_mode() == "none":

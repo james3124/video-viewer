@@ -27,6 +27,7 @@
     ffmpeg: false,
     modes: new Map(),       // page URL → chosen format id
     lastInfo: null,
+    cacheEnabled: false,    // backend keeps a short window of the bytes in view
   };
 
   const ALWAYS_KEY = 'viewer.alwaysProxy';
@@ -127,8 +128,10 @@
       // CDNs that demand extra headers (Referer/Cookie) refuse the browser's
       // plain request, so those go straight through the backend. The per-device
       // toggle goes further: when it is set, the browser never touches the CDN
-      // directly — every stream is re-fetched by this server.
-      proxied: !!fmt.needsProxy || alwaysProxy(),
+      // directly — every stream is re-fetched by this server. The windowed
+      // cache needs the bytes to pass through us too, so it forces the proxy
+      // for direct formats whenever the backend says caching is available.
+      proxied: !!fmt.needsProxy || alwaysProxy() || state.cacheEnabled,
     };
   }
 
@@ -161,6 +164,7 @@
     // so say we are working rather than leaving a dead-looking page.
     setStatus('Resolving — the backend is working on this link…');
     const data = await info(pageUrl, fresh);
+    state.cacheEnabled = !!(data && data.cacheEnabled);
 
     if (data && data.extractable === false) {
       // A playlist still deserves its entry list, even with nothing to play.
@@ -408,6 +412,24 @@
 
   /** Auth header for HEAD requests app.js makes itself (download pre-flight). */
   window.ViewerAuthHeaders = () => authHeaders();
+
+  /** Tell the backend where the playhead is, so its cache window can follow it.
+   *  Range requests alone cannot tell "watching at 3:15" from "buffering ahead". */
+  window.ViewerReportPosition = function (pageUrl, fmt, t, duration, paused) {
+    if (!state.cacheEnabled || !pageUrl || !fmt) return;
+    if (!/^https?:/i.test(pageUrl)) return;
+    const q = `url=${encodeURIComponent(pageUrl)}&fmt=${encodeURIComponent(fmt)}`
+      + `&t=${(Math.max(0, t || 0)).toFixed(1)}`
+      + `&d=${(Math.max(0, duration || 0)).toFixed(1)}`
+      + (paused ? '&paused=1' : '');
+    try {
+      fetch(withToken(`${state.base}/api/position?${q}`), {
+        cache: 'no-store',
+        keepalive: true,
+        headers: authHeaders(),
+      }).catch(() => {});
+    } catch (_) { /* the heartbeat is best-effort */ }
+  };
 
   /** Register with app.js once the backend answers. */
   function registerResolver() {

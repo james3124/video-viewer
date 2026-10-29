@@ -115,6 +115,56 @@ class CDN(BaseHTTPRequestHandler):
 HX = {"ts": b""}   # filled by the merge test with a real tiny encode
 
 
+class Vault(BaseHTTPRequestHandler):
+    """A deterministic Range-capable media origin for the windowed cache."""
+
+    protocol_version = "HTTP/1.1"
+    body = b""
+    up = True
+    hits = 0
+
+    def log_message(self, *a):
+        pass
+
+    def do_GET(self):                        # noqa: N802
+        self._send(True)
+
+    def do_HEAD(self):                       # noqa: N802
+        self._send(False)
+
+    def _send(self, body: bool) -> None:
+        Vault.hits += 1
+        if not Vault.up:
+            self.send_response(503)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        data = Vault.body
+        rng = self.headers.get("Range")
+        partial = False
+        start, end = 0, len(data) - 1
+        if rng and rng.startswith("bytes="):
+            first, _, last = rng[6:].partition("-")
+            try:
+                start = int(first or 0)
+                end = int(last) if last else len(data) - 1
+            except ValueError:
+                start, end = 0, len(data) - 1
+            end = min(end, len(data) - 1)
+            partial = True
+        chunk = data[start:end + 1]
+        self.send_response(206 if partial else 200)
+        self.send_header("Content-Type", "video/mp4")
+        self.send_header("Accept-Ranges", "bytes")
+        self.send_header("ETag", '"vault-v1"')
+        if partial:
+            self.send_header("Content-Range", f"bytes {start}-{end}/{len(data)}")
+        self.send_header("Content-Length", str(len(chunk)))
+        self.end_headers()
+        if body:
+            self.wfile.write(chunk)
+
+
 class Zone(BaseHTTPRequestHandler):
     """A tame origin on 127.0.0.1, for the media redirect guard exercises."""
 
@@ -458,6 +508,7 @@ def main() -> int:
     server.INFO_DIR = os.path.join(tmp, "info")
     server.SUB_DIR = os.path.join(tmp, "subs")
     server.YTDLP_DIR = os.path.join(tmp, "yt-dlp")
+    server.MEDIA_DIR = os.path.join(tmp, "media")
     server.ensure_dirs()
 
     cdn = ThreadingHTTPServer(("127.0.0.1", 0), CDN)
@@ -1332,6 +1383,172 @@ def main() -> int:
                       "no single file" in str(exc), str(exc)[:60])
         finally:
             server.get_info = real_get
+
+        # 17 — windowed media cache ------------------------------------------
+        # Stop any prefetchers left over from the proxy tests above, then start
+        # with a clean, small-chunk cache so the arithmetic is easy to see.
+        server.media_shutdown()
+        server.MEDIA_CACHE = True
+        server.MEDIA_CHUNK = 65536
+        server.MEDIA_MAX_MB = 0          # quota off for the window tests
+        server.MEDIA_TTL = 300
+        server.MEDIA_SWEEP = 30
+        server._MEDIA.clear()
+        server.media_startup()
+
+        check("media: size tiers follow the 75/50/35/25 % table",
+              [server.cache_fraction(n) for n in
+               (99_999_999, 100_000_000, 299_999_999, 300_000_000,
+                999_999_999, 1_000_000_000)]
+              == [0.75, 0.50, 0.50, 0.35, 0.35, 0.25],
+              str([server.cache_fraction(n) for n in
+                   (99_999_999, 100_000_000, 299_999_999, 300_000_000,
+                    999_999_999, 1_000_000_000)]))
+
+        # 100 MB / 10 min, playhead at 3:15 → ~75 MB from just behind 3:15
+        big = server.MediaEntry("synthetic-big", "p", "f")
+        big.total, big.duration = 100_000_000, 600
+        big.fraction = server.cache_fraction(big.total)
+        big.budget = 75_000_000
+        big.playhead, big.has_position = 195, True
+        lo, hi = server._media_window(big)
+        check("media: a 100 MB file keeps ~75 % from the playhead",
+              0 < lo < 32_500_000 and hi == 100_000_000 and hi - lo > 60_000_000,
+              f"{lo}..{hi} ({(hi - lo) // 1_000_000} MB)")
+
+        huge = server.MediaEntry("synthetic-huge", "p", "f")
+        huge.total, huge.duration = 2_469_331_593, 9741.3
+        huge.fraction = server.cache_fraction(huge.total)
+        huge.budget = (int(huge.total * huge.fraction) // server.MEDIA_CHUNK
+                       * server.MEDIA_CHUNK)
+        huge.playhead, huge.has_position = 195, True
+        lo, hi = server._media_window(huge)
+        check("media: a 2.47 GB file keeps ~25 % around the playhead",
+              0.20 < (hi - lo) / huge.total <= 0.26,
+              f"{(hi - lo) / huge.total:.3f} of the file")
+
+        body = bytes((i * 7 + 11) & 0xFF for i in range(8 * 65536))
+        Vault.body = body
+        Vault.up = True
+        vault = ThreadingHTTPServer(("127.0.0.1", 0), Vault)
+        vport = vault.server_address[1]
+        threading.Thread(target=vault.serve_forever, daemon=True).start()
+        vault_url = f"http://127.0.0.1:{vport}/clip.mp4"
+        ent = server._media_get(vault_url, "")
+        ent.paused = True                # keep the prefetcher out of the checks
+        server._media_set_total(ent, len(body))
+        try:
+            st, hd, got = fetch(bport, "/api/play" + q(vault_url, proxy="1"),
+                                {"Range": "bytes=0-131071"})
+            check("media: a proxied range is teed into the cache",
+                  st == 206 and got == body[:131072]
+                  and {0, 1} <= ent.present and ent.total == len(body),
+                  f"{st} present={sorted(ent.present)} total={ent.total}")
+
+            hits = Vault.hits
+            Vault.up = False
+            st, hd, got = fetch(bport, "/api/play" + q(vault_url, proxy="1"),
+                                {"Range": "bytes=0-131071"})
+            check("media: a cached range survives the source going away",
+                  st == 206 and hd.get("X-Viewer-Cache") == "hit"
+                  and got == body[:131072] and Vault.hits == hits,
+                  f"{st} {hd.get('Content-Range')} upstream={Vault.hits - hits}")
+
+            st, hd, got = fetch(bport, "/api/play" + q(vault_url, proxy="1"),
+                                {"Range": "bytes=393216-524287"})
+            check("media: an uncached range offline is a clear 503, not a truncated 206",
+                  st == 503, f"{st} {got[:80]!r}")
+
+            st, hd, raw = fetch(bport, "/api/position" +
+                                q(vault_url, fmt="", t="15", d="30", paused="1"))
+            pos = json.loads(raw) if raw else {}
+            check("media: the heartbeat moves the window to the playhead",
+                  st == 200 and pos.get("cache") is True
+                  and pos.get("budgetBytes") == 393216
+                  and 80_000 < pos.get("windowStart", 0) < 95_000
+                  and 470_000 < pos.get("windowEnd", 0) <= 524288,
+                  str(pos))
+
+            Vault.up = True
+            ent.has_position = False     # no recent heartbeat → range anchoring
+            ent.duration = 0             # no byte↔time back-buffer in this check
+            ent.position_at = 0
+            st, hd, got = fetch(bport, "/api/play" + q(vault_url, proxy="1"),
+                                {"Range": "bytes=393216-524287"})
+            # The tee writes the bytes before the client sees them, but the
+            # eviction pass runs just after the last write; give it a moment.
+            deadline = time.time() + 2
+            while time.time() < deadline and any(i < 6 for i in list(ent.present)):
+                time.sleep(0.02)
+            check("media: playing forward drops the chunks behind the window",
+                  st == 206 and got == body[393216:524288]
+                  and 0 not in ent.present and 6 in ent.present,
+                  f"present={sorted(ent.present)} anchor={ent.anchor} "
+                  f"win={server._media_window(ent)} hp={ent.has_position} "
+                  f"d={ent.duration} paused={ent.paused} budget={ent.budget}")
+
+            first = ent.filler
+            server._media_start_filler(ent)
+            check("media: only one prefetcher runs per entry",
+                  ent.filler is first and (first is None or first.is_alive()))
+
+            ent.last_used = time.time() - server.MEDIA_TTL - 5
+            ent.player_until = 0
+            server._media_sweep_once()
+            check("media: an idle entry is deleted after the TTL",
+                  server._media_get(vault_url, "", create=False) is None
+                  and not os.path.isdir(os.path.join(server.MEDIA_DIR, ent.key)))
+
+            older = server._media_get("https://q.test/a", "1")
+            newer = server._media_get("https://q.test/b", "1")
+            older.on_disk, newer.on_disk = 700_000, 700_000
+            older.last_used = time.time() - 10
+            newer.last_used = time.time()
+            older.player_until = newer.player_until = 0
+            server.MEDIA_MAX_MB = 1
+            server._media_enforce_quota()
+            check("media: the global quota evicts the least recently used",
+                  server._media_get("https://q.test/a", "1", create=False) is None
+                  and server._media_get("https://q.test/b", "1",
+                                        create=False) is not None)
+            server.MEDIA_MAX_MB = 0
+
+            os.makedirs(os.path.join(server.MEDIA_DIR, "junk"), exist_ok=True)
+            with open(os.path.join(server.MEDIA_DIR, "junk", "x.bin"), "wb") as fh:
+                fh.write(b"x")
+            server.media_shutdown()
+            check("media: the cache is gone when the server exits",
+                  not os.path.exists(server.MEDIA_DIR))
+
+            os.makedirs(os.path.join(server.MEDIA_DIR, "leftover"), exist_ok=True)
+            with open(os.path.join(server.MEDIA_DIR, "leftover", "chunk_0.bin"),
+                      "wb") as fh:
+                fh.write(b"x")
+            with open(os.path.join(server.MEDIA_DIR, ".owner"), "w",
+                      encoding="utf-8") as fh:
+                fh.write("99999999")
+            server.media_startup()
+            check("media: a crashed process's cache is wiped on startup",
+                  os.path.exists(os.path.join(server.MEDIA_DIR, ".owner"))
+                  and not os.path.exists(os.path.join(server.MEDIA_DIR, "leftover")),
+                  str(os.listdir(server.MEDIA_DIR)))
+
+            os.makedirs(os.path.join(server.MEDIA_DIR, "live"), exist_ok=True)
+            live_marker = os.path.join(server.MEDIA_DIR, "live", "chunk_0.bin")
+            with open(live_marker, "wb") as fh:
+                fh.write(b"x")
+            with open(os.path.join(server.MEDIA_DIR, ".owner"), "w",
+                      encoding="utf-8") as fh:
+                fh.write(str(os.getppid()))
+            server._MEDIA_READY = False
+            server.media_startup()
+            check("media: a live owner's cache is left alone",
+                  os.path.exists(live_marker))
+        finally:
+            Vault.up = True
+            server.media_shutdown()
+            vault.shutdown()
+            vault.server_close()
     finally:
         backend.shutdown()
         cdn.shutdown()

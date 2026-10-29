@@ -201,7 +201,7 @@ Run the DOM test after touching `app.js` or the markup:
 ```bash
 cd tools && npm install && cd .. && \
 NODE_PATH=tools/node_modules node tools/ui_check.js      # 32 UI checks
-NODE_PATH=tools/node_modules node tools/integration_check.js   # 14 end-to-end
+NODE_PATH=tools/node_modules node tools/integration_check.js   # 15 end-to-end
 ```
 (The backend needs its own check-run before these: `tools/backend_check.py`.)
 
@@ -212,6 +212,7 @@ NODE_PATH=tools/node_modules node tools/integration_check.js   # 14 end-to-end
 | yt-dlp info | memory LRU | `VIEWER_MAX_CACHE` 256 entries, `VIEWER_TTL` 900 s |
 | yt-dlp info | disk JSON in `VIEWER_CACHE_DIR` | same TTL — survives restarts, warms up cold serverless containers |
 | failures | memory | `VIEWER_NEG_TTL` 45 s, so a dead link is not hammered |
+| playback window | disk `VIEWER_CACHE_DIR/media` | size-tiered, follows the playhead, gone after 5 min idle **and** on exit |
 | HTTP | `ETag` + `Cache-Control: public, max-age=…` | browser/CDN skip the round trip entirely (`VIEWER_HTTP_CACHE=0` to disable) |
 | static files | `ETag` + `Last-Modified` | revalidate → instant 304s |
 | HLS manifests | `Cache-Control: public, max-age=15` | `VIEWER_MANIFEST_TTL` |
@@ -222,6 +223,30 @@ and only `VIEWER_YTDLP_CONCURRENCY` (4) extractions may run at once — a busy
 instance answers `429` instead of forking itself to death.
 `GET /api/health` reports hit/miss/refresh counters and the cache directory.
 
+### Playback window
+
+Direct MP4s are fetched through `/api/play?proxy=1`, and the bytes you are
+watching are tee'd to disk. The window is sized by the **whole file**, so a
+small file keeps most of itself and a huge one keeps only a slice:
+
+| File size | Kept |
+| --- | --- |
+| under 100 MB | 75 % |
+| 100–299 MB | 50 % |
+| 300–999 MB | 35 % |
+| 1 GB and up | 25 % |
+
+It is anchored to the playhead (reported every few seconds by the UI), not to
+the furthest prefetched byte. As playback advances, chunks behind the window are
+unlinked and the next stretch is fetched in the background, throttled to
+`VIEWER_PREFETCH_MBPS`. A part that is *not* in the window returns a clear `503`
+when the source is unreachable instead of a truncated `206` that looks like a
+corrupt video. The whole directory is wiped on a graceful exit, and a stale
+`.owner` PID is detected on startup so a crash cannot leave the cache behind.
+
+HLS is not windowed yet — it still streams through `/api/hls` (Phase 2).
+
+
 ## Configuration (environment)
 
 | Variable | Default | Meaning |
@@ -229,6 +254,14 @@ instance answers `429` instead of forking itself to death.
 | `VIEWER_TOKEN` | *(empty)* | shared secret; `?token=` or `X-Viewer-Token` on every `/api/*` except `/api/health` |
 | `HOST` / `PORT` | `127.0.0.1` / `8080` | bind address (Render sets both for you) |
 | `VIEWER_CACHE_DIR` | `$TMPDIR/viewer-cache` | cache root (must be writable) |
+| `VIEWER_MEDIA_CACHE` | `1` (off on serverless) | windowed playback cache on/off |
+| `VIEWER_MEDIA_TTL` | `300` | seconds an idle playback window survives |
+| `VIEWER_MEDIA_SWEEP` | `30` | how often the idle/quota sweeper runs |
+| `VIEWER_MEDIA_MAX_MB` | `4096` | global ceiling for all playback windows |
+| `VIEWER_MEDIA_CHUNK` | `1048576` | cache chunk size in bytes |
+| `VIEWER_CACHE_BACK` | `10` | seconds of already-played video kept behind the playhead |
+| `VIEWER_PREFETCH_MBPS` | `8` | ceiling for the background window filler |
+| `VIEWER_MEDIA_CLEANUP_ON_EXIT` | `1` | wipe the playback window when the server exits |
 | `VIEWER_TTL` | `900` | how long an extraction stays valid |
 | `VIEWER_NEG_TTL` | `45` | how long a failure is remembered |
 | `VIEWER_MAX_CACHE` | `256` | in-memory entries |
