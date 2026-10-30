@@ -431,6 +431,22 @@
     } catch (_) { /* the heartbeat is best-effort */ }
   };
 
+  /** Tell the backend the browser regained internet, so it re-extracts any
+   *  stale signed URLs for this (page, fmt) pair and restarts the cache
+   *  prefetcher. Returns the fetch promise so the caller can react. */
+  window.ViewerReconnect = function (pageUrl, fmt) {
+    if (!state.cacheEnabled || !pageUrl || !fmt) return Promise.resolve();
+    if (!/^https?:/i.test(pageUrl)) return Promise.resolve();
+    const q = `url=${encodeURIComponent(pageUrl)}&fmt=${encodeURIComponent(fmt)}`;
+    try {
+      return fetch(withToken(`${state.base}/api/reconnect?${q}`), {
+        cache: 'no-store',
+        keepalive: true,
+        headers: authHeaders(),
+      });
+    } catch (_) { /* best-effort */ return Promise.resolve(); }
+  };
+
   /** Register with app.js once the backend answers. */
   function registerResolver() {
     window.ViewerResolvers = window.ViewerResolvers || [];

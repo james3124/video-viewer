@@ -1,6 +1,7 @@
 __pycache__/
 *.pyc
 /.venv/
+/.kilo/
 /server.log
 /data/data/
 /node_modules/
@@ -14,3 +15,4 @@ viewer-subs/
 # re-downloads it locally when you want a standalone copy.
 bin/yt-dlp
 cookies.txt
+

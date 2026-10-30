@@ -989,6 +989,43 @@
   function setMeta(text) { metaEl.textContent = text; }
 
   /* ------------------------------------------------------------------ *
+   *  Offline / online: keep playing from cache, resume when back
+   * ------------------------------------------------------------------ */
+  function reconnect() {
+    if (!currentUrl || !currentFmtId) return;
+    if (currentFmtId === '__merge__') return;   // stitched: not cacheable
+    if (typeof window.ViewerReconnect !== 'function') return;
+    const resumeAt = video.currentTime;          // remember where we were
+    status('Internet back — refreshing stream…');
+    window.ViewerReconnect(currentUrl, currentFmtId).then(() => {
+      if (currentKind === 'hls' && hls) {
+        try { hls.startLoad(); } catch (_) {}    // hls.js resumes from current segment
+      } else if (currentKind === 'native' && lastAttempt && lastAttempt.proxyUrl) {
+        // Do not re-set video.src — that restarts from 0. Just refresh the
+        // backend URL and resume from where we were. Only touch src if the
+        // element is hard-errored / uninitialized.
+        const needReload = video.error || video.readyState === 0;
+        if (needReload) {
+          video.src = lastAttempt.proxyUrl;
+          video.addEventListener('loadedmetadata', () => {
+            video.currentTime = resumeAt;
+            tryAutoplay();
+          }, { once: true });
+        } else {
+          tryAutoplay();
+        }
+      }
+    }).catch(() => {});
+  }
+
+  window.addEventListener('offline', () => {
+    if (currentKind === 'native' || currentKind === 'hls') {
+      status('Offline — playing from cache');
+    }
+  });
+  window.addEventListener('online', reconnect);
+
+  /* ------------------------------------------------------------------ *
    *  Boot: ?url=… / #url=…, with or without backend
    * ------------------------------------------------------------------ */
   function boot() {

@@ -511,14 +511,17 @@ def base_ytdlp_args(impersonate: bool = True) -> list[str]:
 def ytdlp_cmd(args: list[str], impersonate: bool = True) -> list[str]:
     """Command line for the subprocess paths (merge, subtitle conversion).
 
-    Prefers the console script, falls back to `python -m yt_dlp` when PATH does
-    not have it (some sandboxes) — both work.
+    Prefer the importable module: it runs under this interpreter, so it sees
+    the same optional packages as the server (notably curl_cffi, which the
+    impersonation flag needs). A bare console-script zipapp may be pinned to a
+    different Python where those packages are missing — the child then dies
+    with `Impersonate target "chrome" is not available` before writing a byte.
     """
     base = base_ytdlp_args(impersonate)
-    if YT_DLP:
-        return [YT_DLP, *base, *EXTRA_ARGS, *args]
     if ytdlp_module() is not None:
         return [sys.executable, "-m", "yt_dlp", *base, *EXTRA_ARGS, *args]
+    if YT_DLP:
+        return [YT_DLP, *base, *EXTRA_ARGS, *args]
     raise RuntimeError("yt-dlp is not installed on this server")
 
 
@@ -528,6 +531,29 @@ def run_yt_dlp(args: list[str], timeout: int | None = None,
     proc = subprocess.run(ytdlp_cmd(args, impersonate), capture_output=True, text=True,
                           timeout=timeout or YTDLP_TIMEOUT)
     return proc.returncode, proc.stdout, proc.stderr
+
+
+def _drain_stderr(proc: subprocess.Popen, label: str) -> None:
+    """Consume a child's stderr so a chatty failure cannot block the pipe.
+
+    Only the last few lines are kept, and only the final one is logged when the
+    child failed. Without a reader, 64 KiB of yt-dlp/ffmpeg diagnostics fills
+    the pipe and the process hangs forever — which looks like a silent 0-byte
+    stream on the phone.
+    """
+    tail: list[str] = []
+    try:
+        for raw in proc.stderr:
+            line = raw.decode("utf-8", "replace").strip()
+            if not line:
+                continue
+            tail.append(line)
+            if len(tail) > 6:
+                tail.pop(0)
+    except (OSError, ValueError):
+        pass
+    if tail and proc.returncode not in (0, None):
+        note(f"{label}: {tail[-1][:300]}")
 
 
 # --------------------------------------------------------------------------- #
@@ -2688,6 +2714,7 @@ MEDIA_CHUNK = max(64 * 1024, env_int("VIEWER_MEDIA_CHUNK", default=1 << 20))
 CACHE_BACK = max(0, env_int("VIEWER_CACHE_BACK", default=10))  # seconds behind
 PREFETCH_BPS = max(0, env_int("VIEWER_PREFETCH_MBPS", default=8)) * 1_000_000
 CLEANUP_ON_EXIT = env_bool("VIEWER_MEDIA_CLEANUP_ON_EXIT", default=True)
+RECONNECT_PROBE_INTERVAL = max(2, env_int("VIEWER_RECONNECT_PROBE", default=10))
 
 # Fraction of a file kept on disk, by total size (decimal MB, like a phone
 # shows it). Small files are cheap to keep most of; a multi-gigabyte file is
@@ -2739,6 +2766,7 @@ class MediaEntry:
         self.stop = threading.Event()
         self.filler: threading.Thread | None = None
         self.lock = threading.RLock()
+        self.stale_since: float | None = None   # network suspected down since
 
     def chunk_len(self, idx: int) -> int:
         if not self.total:
@@ -3131,6 +3159,16 @@ def _media_fetch_chunk(ent: MediaEntry, idx: int) -> None:
     with ent.lock:
         if idx in ent.present or idx in ent.inflight or not ent.url or not ent.total:
             return
+        # If we previously flagged this entry as unreachable, only re-probe the
+        # signed URL once every RECONNECT_PROBE_INTERVAL — otherwise each
+        # missing-chunk retry would hammer a host that is still offline.
+        now = time.time()
+        if ent.stale_since is not None and now - ent.stale_since < RECONNECT_PROBE_INTERVAL:
+            # Still within the cool-down: mark inflight so _media_fill skips
+            # this chunk until the probe interval elapses, then return without
+            # touching the network.
+            ent.inflight.add(idx)
+            return
         ent.inflight.add(idx)
         url = ent.url
         headers = dict(ent.headers)
@@ -3155,10 +3193,14 @@ def _media_fetch_chunk(ent: MediaEntry, idx: int) -> None:
                 with ent.lock:
                     ent.url = target["url"]
                     ent.headers = dict(target.get("headers") or {})
+                    ent.stale_since = None
                     url = ent.url
                     headers = {**ent.headers,
                                "Range": f"bytes={start}-{end}"}
             except (urllib.error.URLError, OSError):
+                with ent.lock:
+                    if ent.stale_since is None:
+                        ent.stale_since = now
                 return
         if resp is None:
             return
@@ -3177,6 +3219,8 @@ def _media_fetch_chunk(ent: MediaEntry, idx: int) -> None:
                     break
                 _media_write(ent, start + got, buf)
                 got += len(buf)
+            with ent.lock:
+                ent.stale_since = None   # network is back
             if PREFETCH_BPS and got:
                 time.sleep(min(1.0, got / PREFETCH_BPS))
     finally:
@@ -3387,6 +3431,48 @@ EXPOSE = ("Content-Length, Content-Range, Accept-Ranges, Content-Type, ETag, "
           "Last-Modified, X-Viewer-Cache, X-Viewer-Reason")
 
 
+_SIG_PATH_KEYS = {"expire", "sig", "ei", "ip", "source", "id", "requiressl",
+                  "ratebypass", "pfa", "sgovp", "sparams", "signature",
+                  "signature-ttl", "playlist_type", "txp", "epbp", "mt",
+                  "fvip", "keepalive", "fexp", "clen", "dur", "gir", "lmt",
+                  "rqh", "xpc", "cps", "met", "mh", "mm", "mn", "ms", "mv",
+                  "mvi", "pl", "rms", "pcm2", "gcr", "ph", "initcwndbps",
+                  "bui", "spc", "vprv", "lsig", "lsparams"}
+_SIG_QUERY_KEYS = {"expire", "sig", "ei", "ip", "signature", "signature-ttl"}
+
+
+def _normalize_url(url: str) -> str:
+    """Strip signature-bound parts from a URL so two URLs for the same
+    segment (different signatures) normalize to the same value."""
+    parsed = urllib.parse.urlparse(url)
+    path_parts = [p for p in parsed.path.split("/") if p
+                  and p not in _SIG_PATH_KEYS]
+    query = {k: v for k, v in urllib.parse.parse_qs(parsed.query).items()
+             if k not in _SIG_QUERY_KEYS}
+    new_query = urllib.parse.urlencode(query, doseq=True)
+    return urllib.parse.urlunparse(parsed._replace(
+        path="/".join(path_parts), query=new_query))
+
+
+def _find_matching_segment(text: str, final: str,
+                           requested_url: str) -> str | None:
+    """Find a segment URL in playlist `text` that matches `requested_url`.
+
+    Two URLs match when they identify the same segment — i.e. their paths are
+    the same apart from signature-related parameters (expire, sig, ei, ip, …)
+    that change on every re-extraction.
+    """
+    target = _normalize_url(requested_url)
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        seg_url = urllib.parse.urljoin(final, stripped)
+        if _normalize_url(seg_url) == target:
+            return seg_url
+    return None
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = f"Viewer/{VERSION}"
     protocol_version = "HTTP/1.1"
@@ -3554,6 +3640,7 @@ class Handler(BaseHTTPRequestHandler):
                 "/api/subsrc": lambda: self._api_subsrc(q, head),
                 "/api/position": lambda: self._api_position(q, head),
                 "/api/ui-log": lambda: self._api_ui_log(q, head),
+                "/api/reconnect": lambda: self._api_reconnect(q, head),
             }
             fn = routes.get(path)
             if fn is not None:
@@ -3694,6 +3781,11 @@ class Handler(BaseHTTPRequestHandler):
         merge = merge_offer(fmts, url)
         if merge:
             fmts.insert(0, merge)
+            # A video-only HLS variant is not a better default than the merge:
+            # it plays silently. When the only muxed option is the ffmpeg
+            # stitched stream, prefer it so "play" actually has sound.
+            if chosen and not chosen.get("hasAudio") and chosen.get("kind") in ("hls", "dash"):
+                chosen = merge
         if MEDIA_CACHE:
             for f in fmts:
                 if f.get("kind") != "direct":
@@ -3951,6 +4043,35 @@ class Handler(BaseHTTPRequestHandler):
             "ttl": MEDIA_TTL,
         })
 
+    def _api_reconnect(self, q: dict, head: bool = False) -> None:
+        """Frontend calls this when the browser regains internet.
+
+        Forces a fresh re-extraction of the cached (page, fmt) pair so stale
+        signed URLs are replaced with live ones, then restarts the prefetcher
+        so the cache window refills. Best-effort: never raises.
+        """
+        src = q.get("url", "") or q.get("u", "")
+        fmt = q.get("fmt", "") or q.get("f", "")
+        if not valid_url(src):
+            return self._send_error_json("Missing/invalid ?url=", 400)
+        if not MEDIA_CACHE:
+            return self._send_json({"ok": True, "cache": False})
+        ent = _media_get(src, fmt, create=False)
+        if ent is None:
+            return self._send_json({"ok": False, "reason": "not cached"})
+        try:
+            target = resolve_target(src, fmt, fresh=True)
+        except Exception as exc:  # noqa: BLE001
+            return self._send_json({"ok": False, "reason": friendly(exc)})
+        if not target.get("url"):
+            return self._send_json({"ok": False, "reason": "no url"})
+        with ent.lock:
+            ent.url = target["url"]
+            ent.headers = dict(target.get("headers") or {})
+            ent.stale_since = None
+        _media_start_filler(ent)
+        self._send_json({"ok": True, "refreshed": True, "url": target["url"]})
+
     def _redirect(self, url: str) -> None:
         try:
             self.send_response(302)
@@ -4138,7 +4259,7 @@ class Handler(BaseHTTPRequestHandler):
             if not valid_url(target_url):
                 return self._send_error_json("Missing/invalid ?u=", 400)
             manifest, headers = target_url, resolve_headers(page, fmt)
-            allow_refresh = False
+            allow_refresh = bool(page and fmt)
         else:
             allow_refresh = True
             if valid_url(target_url):
@@ -4188,6 +4309,25 @@ class Handler(BaseHTTPRequestHandler):
 
             body = peek + resp.read(4 << 20)          # playlists are small
             text = body.decode("utf-8", "replace")
+
+            if raw:
+                # Raw segment/key request, but re-extraction returned a
+                # playlist — the segment URL expired. Find the matching
+                # segment in the fresh playlist and serve it instead.
+                segment_url = _find_matching_segment(text, final, target_url)
+                if segment_url:
+                    try:
+                        resp2 = self._open_upstream(segment_url, headers)
+                        with resp2:
+                            peek2 = resp2.read(512)
+                            if peek2.lstrip()[:7] != b"#EXTM3U":
+                                return self._send_upstream(
+                                    resp2, head=head, reject_html=True,
+                                    prefix=peek2)
+                    except Exception:  # noqa: BLE001
+                        pass
+                return self._send_error_json(
+                    "Segment URL expired — refresh the playlist", 502)
 
         token = f"&token={urllib.parse.quote(TOKEN, safe='')}" if TOKEN else ""
 
@@ -4288,14 +4428,16 @@ class Handler(BaseHTTPRequestHandler):
              + last["line"].decode("utf-8", "replace").strip()[:200])
 
     def _api_merge(self, q: dict, head: bool = False) -> None:
-        """Stream video+audio as one ffmp4:
+        """Stream video+audio as one fMP4.
 
-            yt-dlp -f 'bv*+ba' -o - <page>  |  ffmpeg -i pipe:0 -c copy -f mp4 pipe:1
+        yt-dlp resolves the signed URLs (`--get-url`); ffmpeg fetches them and
+        muxes video+audio straight to the client, so playback starts at once
+        and runs for the whole file instead of downloading to disk first.
         """
         page = q.get("url", "")
         fmt = q.get("fmt", "") or q.get("f", "")
-        sel = q.get("sel", "") or "bv*+ba/b"
-        sort = q.get("sort", "") or "vcodec:h264:vp9:av1,+res:1080"
+        sel = q.get("sel", "") or "bv*[ext=mp4]+ba[ext=m4a]/bv*[ext=mp4]+ba/b[ext=mp4]/bv*+ba/b"
+        sort = q.get("sort", "") or "vcodec:h264:vp9:av1,acodec:mp4a:opus,+res:1080"
         download = q.get("dl") == "1"
         if not valid_url(page):
             return self._send_error_json("Missing/invalid ?url=", 400)
@@ -4334,10 +4476,41 @@ class Handler(BaseHTTPRequestHandler):
             if target and target.get("kind") == "hls":
                 return self._stream_hls_transmux(q, target, head, download)
 
-        dl = ytdlp_cmd(["--no-playlist", "--newline", "--concurrent-fragments", "4",
-                        "-S", sort, "-f", sel, "-o", "-", page])
+        # Let yt-dlp do only the extraction and hand us the signed URLs
+        # (--get-url); ffmpeg does the downloading. When yt-dlp writes to
+        # stdout it cannot run its own merge post-processor, so `-o -` gives
+        # video *only*, and the old `yt-dlp -o - | ffmpeg -i pipe:0` path
+        # produced silent video that died a few seconds in. Two -i inputs let
+        # ffmpeg fetch the video and audio URLs in parallel and interleave the
+        # fragments itself, so the whole file streams as one fMP4 with sound.
+        url_args = ["--no-playlist", "--get-url", "-S", sort, "-f", sel, page]
+        try:
+            _, url_out, url_err = run_yt_dlp(url_args, timeout=YTDLP_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            return self._send_error_json(
+                "yt-dlp timed out resolving the video — try again", 504)
+        urls = [line.strip() for line in url_out.splitlines() if line.strip()]
+        if not urls:
+            err = " ".join(url_err.split())[-300:] or "yt-dlp returned no URL"
+            note(f"merge/yt-dlp: {err}")
+            # Nothing has been sent yet, so this is a real error — not the
+            # silent 0-byte 200 that made the bug so hard to see.
+            return self._send_error_json(f"yt-dlp could not resolve the video: {err}", 502)
+
+        cookie = cookies_path()
+        inputs: list[str] = []
+        for u in urls:
+            inputs += ["-user_agent", DEFAULT_UA,
+                       # Signed CDN URLs are bound to the player page: without
+                       # its Referer they answer 403, which is what killed the
+                       # earlier ffmpeg hand-off.
+                       "-headers", f"User-Agent: {DEFAULT_UA}\r\nReferer: {page}\r\n"]
+            if cookie and os.path.isfile(cookie):
+                inputs += ["-cookiefile", cookie]
+            inputs += ["-i", u]
+        maps = ["-map", "0:v:0", "-map", "1:a:0"] if len(urls) == 2 else ["-map", "0"]
         out = [FFMPEG, "-hide_banner", "-loglevel", "error", "-nostdin",
-               "-i", "pipe:0", "-c", "copy",
+               *inputs, *maps, "-c", "copy",
                "-movflags", "+frag_keyframe+empty_moov", "-f", "mp4", "pipe:1"]
 
         if head:
@@ -4356,7 +4529,6 @@ class Handler(BaseHTTPRequestHandler):
         try:
             self.send_response(200)
             self.send_header("Content-Type", "video/mp4")
-            # No Content-Length: stream until the pipeline ends.
             self.send_header("Cache-Control", "no-store")
             if download:
                 self.send_header("Content-Disposition", safe_filename("video", "mp4"))
@@ -4367,28 +4539,30 @@ class Handler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             return
 
-        note(f"{'download ' if download else 'merge '}{sel} ← {page[:70]}")
-        pipe_in = subprocess.Popen(dl, stdout=subprocess.PIPE,
-                                   stderr=subprocess.PIPE, bufsize=1 << 16)
-        pipe_out = subprocess.Popen(out, stdin=pipe_in.stdout,
-                                    stdout=self.wfile, stderr=subprocess.PIPE,
-                                    bufsize=1 << 16)
-        pipe_in.stdout.close()          # only the child needs that end
-        try:
-            pipe_out.wait()
-        finally:
+        note(f"{'download ' if download else 'merge '}{sel} "
+             f"({len(urls)} input{'s' if len(urls) > 1 else ''}) ← {page[:70]}")
+        proc = subprocess.Popen(out, stdout=self.wfile, stderr=subprocess.PIPE,
+                                bufsize=1 << 16)
+        last = {"line": ""}
+
+        def drain() -> None:
             try:
-                if pipe_in.poll() is None:
-                    pipe_in.kill()
-                if pipe_out.poll() is None:
-                    pipe_out.kill()
-            except OSError:
+                for raw in iter(proc.stderr.readline, b""):
+                    line = raw.decode("utf-8", "replace").strip()
+                    if line:
+                        last["line"] = line[:300]
+            except (OSError, ValueError):
                 pass
-            for proc in (pipe_in, pipe_out):
-                try:
-                    proc.stderr.close()
-                except OSError:
-                    pass
+
+        threading.Thread(target=drain, daemon=True).start()
+        try:
+            proc.wait()
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+        if proc.returncode not in (0, None):
+            note(f"merge/ffmpeg: {last['line'] or f'exited {proc.returncode}'}")
 
     # -- UI telemetry ----------------------------------------------------------- #
     def _api_ui_log(self, q: dict, head: bool = False) -> None:
