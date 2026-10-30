@@ -3164,10 +3164,10 @@ def _media_fetch_chunk(ent: MediaEntry, idx: int) -> None:
         # missing-chunk retry would hammer a host that is still offline.
         now = time.time()
         if ent.stale_since is not None and now - ent.stale_since < RECONNECT_PROBE_INTERVAL:
-            # Still within the cool-down: mark inflight so _media_fill skips
-            # this chunk until the probe interval elapses, then return without
-            # touching the network.
-            ent.inflight.add(idx)
+            # Still within the cool-down: let the caller back off. Do NOT mark
+            # the chunk inflight — `inflight` is cleared only by a fetch, so a
+            # leaked entry would never be retried, even after the network is
+            # back. _media_fill waits out the interval instead.
             return
         ent.inflight.add(idx)
         url = ent.url
@@ -3199,8 +3199,9 @@ def _media_fetch_chunk(ent: MediaEntry, idx: int) -> None:
                                "Range": f"bytes={start}-{end}"}
             except (urllib.error.URLError, OSError):
                 with ent.lock:
-                    if ent.stale_since is None:
-                        ent.stale_since = now
+                    # Re-stamp on every failure: the cooldown means "probe the
+                    # host once per interval", not "probe for 10s then hammer".
+                    ent.stale_since = now
                 return
         if resp is None:
             return
@@ -3240,6 +3241,15 @@ def _media_fill(ent: MediaEntry) -> None:
             if time.time() < player_until:
                 ent.stop.wait(0.25)      # never compete with the playing stream
                 continue
+            with ent.lock:
+                stale = ent.stale_since
+            if stale is not None:
+                left = RECONNECT_PROBE_INTERVAL - (time.time() - stale)
+                if left > 0:
+                    # Host looked unreachable: wait out the probe interval
+                    # instead of spinning on the same missing chunk.
+                    ent.stop.wait(min(left, 1.0))
+                    continue
             lo, hi = _media_plan_chunks(ent)
             if hi < lo:
                 ent.stop.wait(0.5)

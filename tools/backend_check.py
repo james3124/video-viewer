@@ -1459,6 +1459,25 @@ def main() -> int:
             check("media: an uncached range offline is a clear 503, not a truncated 206",
                   st == 503, f"{st} {got[:80]!r}")
 
+            # A failed fetch marks the entry stale for a cool-down. It must not
+            # mark the chunk inflight, because `inflight` is only cleared by a
+            # fetch that actually runs — the chunk would never be retried, even
+            # after the network is back.
+            stale = server._media_get("https://stale.test/clip.mp4", "")
+            stale.url = "http://127.0.0.1:1/clip.mp4"   # nothing listens there
+            stale.total = len(body)
+            old_interval = server.RECONNECT_PROBE_INTERVAL
+            server.RECONNECT_PROBE_INTERVAL = 60
+            try:
+                server._media_fetch_chunk(stale, 0)     # fails → stale
+                server._media_fetch_chunk(stale, 0)     # cool-down → skip
+                check("media: a stale chunk stays retryable (no inflight leak)",
+                      stale.stale_since is not None and not stale.inflight,
+                      f"stale={stale.stale_since} inflight={sorted(stale.inflight)}")
+            finally:
+                server.RECONNECT_PROBE_INTERVAL = old_interval
+                server._media_destroy(stale)
+
             st, hd, raw = fetch(bport, "/api/position" +
                                 q(vault_url, fmt="", t="15", d="30", paused="1"))
             pos = json.loads(raw) if raw else {}
