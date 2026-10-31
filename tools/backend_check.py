@@ -595,6 +595,18 @@ def main() -> int:
         check("play: 302 to the CDN when proxy is not requested",
               st == 302 and "Location" in hd, str(st))
 
+        # 5b — downloads are files, not something to play inline ---------------
+        # An Android WebView that renders video/mp4 ignores Content-Disposition
+        # and never starts the download; octet-stream + attachment is what makes
+        # the browser's download manager take it.
+        st, hd, body = fetch(bport, "/api/play" + q(page, fmt="720", dl="1"))
+        check("download: a direct file is an attachment, not inline video",
+              st == 200
+              and hd.get("Content-Type") == "application/octet-stream"
+              and "attachment" in hd.get("Content-Disposition", "")
+              and len(body) == 7168,
+              f"{st} {hd.get('Content-Type', '')} {len(body)}B")
+
         # 6 — HLS: manifest rewrite + key + segments ---------------------------
         st, hd, manifest = fetch(bport, "/api/hls" + q(page, fmt="hls"))
         text = manifest.decode()
@@ -1087,7 +1099,8 @@ def main() -> int:
                     st, hd, body = fetch(
                         bport, f"/api/merge?{urllib.parse.urlencode({'url': page, 'fmt': 'h1', 'dl': '1'})}")
                     check("merge: hls dl transmuxes to a real mp4",
-                          st == 200 and hd.get("Content-Type") == "video/mp4"
+                          st == 200
+                          and hd.get("Content-Type") == "application/octet-stream"
                           and b"ftyp" in body[:32] and len(body) > 1000,
                           f"{st} {len(body)}B {hd.get('Content-Type', '')}")
                     check("merge: the saved file is named for the video",
@@ -1098,7 +1111,8 @@ def main() -> int:
                         bport, f"/api/merge?{urllib.parse.urlencode({'url': page, 'fmt': 'h1', 'dl': '1'})}",
                         method="HEAD")
                     check("merge: a HEAD download probe answers disposition, no body",
-                          st == 200 and hd.get("Content-Type") == "video/mp4"
+                          st == 200
+                          and hd.get("Content-Type") == "application/octet-stream"
                           and not body
                           and "attachment" in hd.get("Content-Disposition", ""),
                           f"{st} {bool(body)}")

@@ -4331,10 +4331,15 @@ class Handler(BaseHTTPRequestHandler):
                 for k, v in resp.getheaders():
                     if k.lower() in HOP_BY_HOP or k.lower() in PROXY_DROP:
                         continue
-                    if disposition and k.lower() == "content-disposition":
+                    if disposition and k.lower() in ("content-disposition",
+                                                     "content-type"):
                         continue
                     self.send_header(k, v)
                 if disposition:
+                    # A download is a file, not a video to open: WebViews that
+                    # render video/mp4 inline ignore Content-Disposition and
+                    # never hand the bytes to the download manager.
+                    self.send_header("Content-Type", "application/octet-stream")
                     # Makes the browser save the file even when the request that
                     # started it was cross-origin (the `download` attribute cannot
                     # do that, and is ignored for cross-origin media).
@@ -4530,7 +4535,8 @@ class Handler(BaseHTTPRequestHandler):
         if head:
             try:
                 self.send_response(200)
-                self.send_header("Content-Type", "video/mp4")
+                self.send_header("Content-Type",
+                                 "application/octet-stream" if download else "video/mp4")
                 self.send_header("Cache-Control", "no-store")
                 if download:
                     self.send_header("Content-Disposition", name)
@@ -4542,7 +4548,12 @@ class Handler(BaseHTTPRequestHandler):
 
         try:
             self.send_response(200)
-            self.send_header("Content-Type", "video/mp4")
+            # A download is a file, not something to open in the player: some
+            # Android WebViews ignore Content-Disposition for renderable types
+            # like video/mp4 and try to play the bytes inline instead of handing
+            # them to the download manager.
+            self.send_header("Content-Type",
+                             "application/octet-stream" if download else "video/mp4")
             # No Content-Length: stream until the pipeline ends.
             self.send_header("Cache-Control", "no-store")
             if download:
@@ -4671,7 +4682,8 @@ class Handler(BaseHTTPRequestHandler):
         if head:
             try:
                 self.send_response(200)
-                self.send_header("Content-Type", "video/mp4")
+                self.send_header("Content-Type",
+                                 "application/octet-stream" if download else "video/mp4")
                 self.send_header("Cache-Control", "no-store")
                 if download:
                     self.send_header("Content-Disposition", safe_filename("video", "mp4"))
@@ -4683,7 +4695,8 @@ class Handler(BaseHTTPRequestHandler):
 
         try:
             self.send_response(200)
-            self.send_header("Content-Type", "video/mp4")
+            self.send_header("Content-Type",
+                             "application/octet-stream" if download else "video/mp4")
             self.send_header("Cache-Control", "no-store")
             if download:
                 self.send_header("Content-Disposition", safe_filename("video", "mp4"))

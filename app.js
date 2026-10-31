@@ -269,9 +269,24 @@
     const url = downloadUrl();
     if (!url) return error('Nothing to download for this source.');
     clearError();
-    status('Preparing download…');
-    // Ask first, so a "no single file here" answer becomes a message instead of
-    // a browser tab full of JSON.
+    // Start the download synchronously, inside the tap. An <a>.click() that
+    // runs after an `await` is no longer a user gesture, and Android
+    // WebView/Chrome silently drops it — the server then sees only the HEAD
+    // pre-flight and nothing else, which looks like "download failed".
+    // `download` marks it as a file rather than a navigation; the server also
+    // answers with Content-Disposition and application/octet-stream.
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = '';
+    a.rel = 'noopener';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    status('Downloading…');
+    wakeControls();
+
+    // The pre-flight now only explains a refusal (the click has already been
+    // dispatched, so a failure here means the saved file would be an error).
     try {
       const res = await fetch(url, {
         method: 'HEAD', cache: 'no-store',
@@ -283,16 +298,10 @@
         try { msg = (await res.json()).error || msg; } catch (_) { /* html error page */ }
         return error('Download not available: ' + msg);
       }
-      const a = document.createElement('a');
-      a.href = url;
-      a.rel = 'noopener';
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
       status('Downloading…');
-      wakeControls();
     } catch (err) {
-      error('Download failed: ' + ((err && err.message) || err));
+      error('Could not reach the backend for the download: '
+        + ((err && err.message) || err));
     }
   }
 
