@@ -2523,7 +2523,23 @@ def browsable_formats(info: dict) -> list[dict]:
             return
         proto = (f.get("protocol") or "").lower()
         ext = (f.get("ext") or "").lower()
-        sized = bool(f.get("height") or f.get("width"))
+        # Generic/embed extractors (tnaflix's html5 player) report no width or
+        # height at all, but the file name usually states the quality:
+        # "...-1080p_60fps.mp4". Recover it so the buttons are not all "audio
+        # only" and the default is not an arbitrary one.
+        height, width = f.get("height"), f.get("width")
+        if not height:
+            m = re.search(r"[_-](\d{3,4})p(?:[_-]|\.|$)", url, re.I)
+            if m:
+                height = int(m.group(1))
+        fps = f.get("fps")
+        if not fps:
+            m = re.search(r"[_-](\d{2,3})fps", url, re.I)
+            if m:
+                fps = int(m.group(1))
+        sized = bool(height or width)
+        is_stream = ("m3u8" in proto or "mpd" in proto
+                     or ext in ("m3u8", "mpd"))
         # Several extractors (Pornhub and others) report vcodec/acodec as null
         # even for perfectly playable progressive files. null means "unknown";
         # only the string "none" means the track is genuinely absent. Calling
@@ -2533,8 +2549,13 @@ def browsable_formats(info: dict) -> list[dict]:
         has_video = v_state == "yes" or (v_state == "unknown" and sized)
         has_audio = (a_state == "yes"
                      or (a_state == "unknown" and (sized or ext in AUDIO_EXTS)))
-        is_stream = ("m3u8" in proto or "mpd" in proto
-                     or ext in ("m3u8", "mpd"))
+        if (v_state == "unknown" and a_state == "unknown"
+                and not is_stream and ext in MUXED_OK_EXT):
+            # A progressive container with no codec metadata at all is a video
+            # file, not an audio track. tnaflix reports null/null and no size;
+            # without this every quality looked like "audio only" and nothing
+            # played.
+            has_video = has_audio = True
         if (not has_audio and v_state == "no" and is_stream and not sized):
             # A stream rendition with no video track is the audio rendition.
             # yt-dlp rarely probes acodec from a media playlist (hentaihaven
@@ -2564,14 +2585,14 @@ def browsable_formats(info: dict) -> list[dict]:
                 # A file we found ourselves. When we know the resolution, lead
                 # with it — "1080p · mp4" is the only thing that tells the
                 # quality buttons apart when a site offers several.
-                label = f"{f['height']}p · {ext or 'media'}" if f.get("height") \
+                label = f"{height}p · {ext or 'media'}" if height \
                     else f"{ext or 'media'} · found in the page"
             elif has_video and has_audio:
-                label = f"{f['height']}p" if f.get("height") else (f.get("format_note") or "video+audio")
+                label = f"{height}p" if height else (f.get("format_note") or "video+audio")
                 if ext:
                     label += f" · {ext}"
             elif has_video:
-                label = f"{f['height']}p · {ext or 'video'} · no audio"
+                label = f"{height}p · {ext or 'video'} · no audio"
             else:
                 label = f"audio only · {ext or 'audio'}"
 
@@ -2583,9 +2604,9 @@ def browsable_formats(info: dict) -> list[dict]:
             "label": label,
             "kind": kind,                      # direct | hls | dash | merge
             "ext": ext,
-            "width": f.get("width"),
-            "height": f.get("height"),
-            "fps": round(f["fps"]) if f.get("fps") else None,
+            "width": width,
+            "height": height,
+            "fps": round(fps) if fps else None,
             "hasAudio": has_audio,
             "hasVideo": has_video,
             "size": size,

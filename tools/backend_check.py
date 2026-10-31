@@ -833,6 +833,28 @@ def main() -> int:
               and 'CODECS="avc1.4d4028,mp4a.40.2"' in master,
               master.replace("\n", " | ")[:160])
 
+        # 10c3 — generic embed: null/null MP4s with the quality in the name -----
+        generic = server.browsable_formats(
+            {"id": "tna", "title": "t", "url": "https://tna.test/v/1", "formats": [
+                {"format_id": "0", "ext": "mp4", "protocol": "https",
+                 "vcodec": None, "acodec": None,
+                 "url": "https://cdn.test/clip-1080p_60fps.mp4?rs=1"},
+                {"format_id": "1", "ext": "mp4", "protocol": "https",
+                 "vcodec": None, "acodec": None,
+                 "url": "https://cdn.test/clip-720p_60fps.mp4?rs=1"},
+            ]})
+        check("formats: an unsized null/null mp4 is video+audio, not audio only",
+              len(generic) == 2
+              and all(e["hasVideo"] and e["hasAudio"] for e in generic)
+              and [e["height"] for e in generic] == [1080, 720]
+              and all(e["fps"] == 60 for e in generic)
+              and generic[0]["label"].startswith("1080p"),
+              str([(e["height"], e["fps"], e["hasVideo"], e["hasAudio"],
+                    e["label"]) for e in generic]))
+        check("formats: generic mp4 quality is the default (not an audio track)",
+              server.best_format(generic) is not None
+              and server.best_format(generic)["id"] == "0", "")
+
         # 10d — sulasokvid adapter against a tame embed host ---------------------
         sula = ThreadingHTTPServer(("127.0.0.1", 0), Sula)
         sport = sula.server_address[1]
