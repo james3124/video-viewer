@@ -2381,6 +2381,7 @@ def _chunks(resp, prefix: bytes = b""):
 # --------------------------------------------------------------------------- #
 
 MERGE_ID = "__merge__"      # synthetic format id for the ffmpeg-stitched stream
+HLSMUX = "__hlsmux__:"      # synthetic format id for a video+audio HLS pair
 MUXED_OK_EXT = ("mp4", "m4v", "webm", "mov", "mkv")
 AUDIO_EXTS = {"m4a", "mp3", "aac", "opus", "ogg", "oga", "wav", "flac", "weba"}
 
@@ -2447,6 +2448,71 @@ def static_build() -> str:
     return hashlib.sha1(f"{int(newest)}".encode()).hexdigest()[:10]
 
 
+def _same_site(a: str, b: str) -> bool:
+    """True when two playlist URLs live on the same registrable host."""
+    def host(u: str) -> str:
+        try:
+            name = (urllib.parse.urlparse(u).hostname or "").lower()
+        except ValueError:
+            return ""
+        parts = [p for p in name.split(".") if p]
+        return ".".join(parts[-2:]) if len(parts) >= 2 else name
+    ha, hb = host(a), host(b)
+    return bool(ha) and ha == hb
+
+
+def hls_audio_mux(fmts: list[dict]) -> list[dict]:
+    """Add a playable format for HLS sites that split video and audio.
+
+    Some CDNs hand yt-dlp one playlist per track: a video rendition and a
+    completely separate audio rendition. Every reported format is then half
+    of the picture, so the browser gets silent video. For each video rendition
+    with an audio sibling on the same host, add a synthetic format naming both;
+    /api/hls turns it into a real master playlist (EXT-X-MEDIA) so hls.js can
+    fetch picture and sound in step, without transcoding or extra bandwidth.
+    """
+    vids = [f for f in fmts if f["kind"] == "hls" and f.get("hasVideo")
+            and not f.get("hasAudio")]
+    auds = [f for f in fmts if f["kind"] == "hls" and f.get("hasAudio")
+            and not f.get("hasVideo")]
+    if not vids or not auds:
+        return fmts
+    extra = []
+    for v in vids:
+        a = next((a for a in auds if _same_site(v["url"], a["url"])), None)
+        if a is None:
+            continue
+        extra.append(dict(v, **{
+            "id": f"{HLSMUX}{v['id']}:{a['id']}",
+            "label": f"{v['height']}p · HLS + audio" if v.get("height")
+                     else "HLS + audio",
+            "hasAudio": True,
+            "muxAudio": a["url"],
+            "muxAudioId": a["id"],
+            "muxVideoId": v["id"],
+        }))
+    return extra + fmts
+
+
+def hls_master_text(video_url: str, audio_url: str, *, width=None, height=None,
+                    vcodec=None) -> str:
+    """A master playlist joining a video-only and an audio-only rendition."""
+    codec = str(vcodec or "")
+    if not re.match(r"^(avc1|hvc1|hev1|vp0?9|av01)", codec, re.I):
+        codec = "avc1.42E01E"
+    bandwidth = max(1_000_000, int(width or 0) * int(height or 0) * 4)
+    attrs = (f'BANDWIDTH={bandwidth},CODECS="{codec},mp4a.40.2",AUDIO="aud"')
+    if width and height:
+        attrs += f",RESOLUTION={int(width)}x{int(height)}"
+    return ("#EXTM3U\n"
+            "#EXT-X-VERSION:7\n"
+            "#EXT-X-INDEPENDENT-SEGMENTS\n"
+            '#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aud",NAME="Default",'
+            f'DEFAULT=YES,AUTOSELECT=YES,URI="{audio_url}"\n'
+            f"#EXT-X-STREAM-INF:{attrs}\n"
+            f"{video_url}\n")
+
+
 def browsable_formats(info: dict) -> list[dict]:
     """Slim, browser-usable view over whatever yt-dlp reported."""
     fmts, seen = [], set()
@@ -2467,6 +2533,15 @@ def browsable_formats(info: dict) -> list[dict]:
         has_video = v_state == "yes" or (v_state == "unknown" and sized)
         has_audio = (a_state == "yes"
                      or (a_state == "unknown" and (sized or ext in AUDIO_EXTS)))
+        is_stream = ("m3u8" in proto or "mpd" in proto
+                     or ext in ("m3u8", "mpd"))
+        if (not has_audio and v_state == "no" and is_stream and not sized):
+            # A stream rendition with no video track is the audio rendition.
+            # yt-dlp rarely probes acodec from a media playlist (hentaihaven
+            # reports vcodec "none" and acodec null), so without this it looks
+            # like neither picture nor sound and gets dropped from the pairing
+            # below — leaving the video-only playlist as the only default.
+            has_audio = True
         if f.get("_sniffed"):                 # we found the file ourselves
             has_video = has_audio = True
 
@@ -2474,8 +2549,11 @@ def browsable_formats(info: dict) -> list[dict]:
             kind = "hls"
             # A quality label matters when a site offers one playlist per
             # resolution (hanime): without it every button would read "HLS".
-            label = (f"{f['format_note']} · HLS" if f.get("format_note")
-                     else "HLS (adaptive stream)")
+            base = (f"{f['format_note']} · HLS" if f.get("format_note")
+                    else "HLS (adaptive stream)")
+            # Sites that split video and audio get an extra paired entry; the
+            # raw video-only rendition stays, but says why it is silent.
+            label = base if has_audio else f"{base} · no audio"
         elif "mpd" in proto or ext == "mpd" or "http_dash_segments" in proto:
             kind, label = "dash", "DASH (not playable directly)"
         elif ext == "mhtml":
@@ -2515,6 +2593,7 @@ def browsable_formats(info: dict) -> list[dict]:
             "url": url,
             "protocol": proto,
             "expiresIn": f.get("expires_in"),
+            "vcodec": f.get("vcodec"),
             "sniffed": bool(f.get("_sniffed")),
             # Anything beyond a plain UA has to be re-fetched by us: <video> and
             # hls.js cannot attach Referer/Cookie cross-origin. That single flag
@@ -2549,6 +2628,7 @@ def browsable_formats(info: dict) -> list[dict]:
         })
 
     rank = {"direct": 0, "hls": 1, "merge": 2, "dash": 3}
+    fmts = hls_audio_mux(fmts)
     fmts.sort(key=lambda e: (
         rank.get(e["kind"], 4),
         -(e["height"] or 0),
@@ -2570,7 +2650,12 @@ def best_format(fmts: list[dict]) -> dict | None:
         if (f.get("height") or 0) <= 1080 and f["ext"] in MUXED_OK_EXT:
             return f
     hls = [f for f in fmts if f["kind"] == "hls" and f.get("hasVideo")]
-    for group in ([f for f in both if f["ext"] in MUXED_OK_EXT], hls, both, fmts):
+    # A split-rendition site (separate video and audio playlists) gets a
+    # synthetic video+audio HLS entry; that is the one with sound, so prefer it
+    # over the raw video-only rendition whenever both are on offer.
+    hls_both = [f for f in hls if f.get("hasAudio")]
+    for group in ([f for f in both if f["ext"] in MUXED_OK_EXT], hls_both,
+                  hls, both, fmts):
         if group:
             return group[0]
     return None
@@ -2673,6 +2758,12 @@ def resolve_target(page: str, fmt: str = "", fresh: bool = False) -> dict:
         "id": chosen["id"],
         "ext": chosen.get("ext"),
         "title": info.get("title"),
+        # Two-rendition HLS: the synthetic format carries the audio playlist
+        # alongside the video one, and /api/hls stitches a master from them.
+        "audio_url": chosen.get("muxAudio") or "",
+        "width": chosen.get("width"),
+        "height": chosen.get("height"),
+        "vcodec": chosen.get("vcodec"),
         # The windowed cache needs the full size and runtime to decide how
         # much of the file to keep and where the playhead sits in it.
         "filesize": chosen.get("size") or 0,
@@ -3462,6 +3553,12 @@ def _normalize_url(url: str) -> str:
     new_query = urllib.parse.urlencode(query, doseq=True)
     return urllib.parse.urlunparse(parsed._replace(
         path="/".join(path_parts), query=new_query))
+
+
+def _is_playlist_url(url: str) -> bool:
+    """True for a media/master playlist URL (not a segment or key)."""
+    path = (urllib.parse.urlparse(url).path or "").lower()
+    return path.endswith(".m3u8") or path.endswith(".mpd")
 
 
 def _find_matching_segment(text: str, final: str,
@@ -4264,6 +4361,7 @@ class Handler(BaseHTTPRequestHandler):
         fmt = q.get("fmt") or q.get("f") or ""
         target_url = q.get("u") or ""
         raw = q.get("raw") == "1"
+        target = None
 
         if raw:
             if not valid_url(target_url):
@@ -4288,6 +4386,41 @@ class Handler(BaseHTTPRequestHandler):
                 headers = target.get("headers") or {}
         if not valid_url(manifest):
             return self._send_error_json("Missing/invalid ?url=", 400)
+
+        token = f"&token={urllib.parse.quote(TOKEN, safe='')}" if TOKEN else ""
+
+        def point_at(absolute: str) -> str:
+            return (f"/api/hls?raw=1&u={urllib.parse.quote(absolute, safe='')}"
+                    f"&url={urllib.parse.quote(page, safe='')}"
+                    f"&fmt={urllib.parse.quote(fmt, safe='')}{token}")
+
+        def serve_playlist(text: str, final: str) -> None:
+            out = []
+            for line in text.splitlines():
+                stripped = line.strip()
+                if not stripped:
+                    out.append(line)
+                elif stripped.startswith("#"):
+                    # EXT-X-KEY / EXT-X-MAP / EXT-X-PART carry URIs in attributes.
+                    out.append(_URI_ATTR.sub(
+                        lambda m: m.group(1) + point_at(
+                            urllib.parse.urljoin(final, m.group(2))) + m.group(3),
+                        line))
+                else:
+                    out.append(point_at(urllib.parse.urljoin(final, stripped)))
+            self._raw(("\n".join(out) + "\n").encode("utf-8"),
+                      "application/vnd.apple.mpegurl",
+                      cache=f"public, max-age={MANIFEST_TTL}", head_only=head)
+
+        if not raw and target and target.get("audio_url"):
+            # Two-rendition HLS: serve a master that names the audio playlist,
+            # then let hls.js fetch both through the same rewriting path.
+            return serve_playlist(
+                hls_master_text(target["url"], target["audio_url"],
+                                width=target.get("width"),
+                                height=target.get("height"),
+                                vcodec=target.get("vcodec")),
+                target["url"])
 
         resp = None
         for attempt in (0, 1):
@@ -4320,7 +4453,7 @@ class Handler(BaseHTTPRequestHandler):
             body = peek + resp.read(4 << 20)          # playlists are small
             text = body.decode("utf-8", "replace")
 
-            if raw:
+            if raw and not _is_playlist_url(target_url):
                 # Raw segment/key request, but re-extraction returned a
                 # playlist — the segment URL expired. Find the matching
                 # segment in the fresh playlist and serve it instead.
@@ -4339,28 +4472,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send_error_json(
                     "Segment URL expired — refresh the playlist", 502)
 
-        token = f"&token={urllib.parse.quote(TOKEN, safe='')}" if TOKEN else ""
-
-        def point_at(absolute: str) -> str:
-            return (f"/api/hls?raw=1&u={urllib.parse.quote(absolute, safe='')}"
-                    f"&url={urllib.parse.quote(page, safe='')}"
-                    f"&fmt={urllib.parse.quote(fmt, safe='')}{token}")
-
-        out = []
-        for line in text.splitlines():
-            stripped = line.strip()
-            if not stripped:
-                out.append(line)
-            elif stripped.startswith("#"):
-                # EXT-X-KEY / EXT-X-MAP / EXT-X-PART carry URIs in attributes.
-                out.append(_URI_ATTR.sub(
-                    lambda m: m.group(1) + point_at(
-                        urllib.parse.urljoin(final, m.group(2))) + m.group(3), line))
-            else:
-                out.append(point_at(urllib.parse.urljoin(final, stripped)))
-        self._raw(("\n".join(out) + "\n").encode("utf-8"),
-                  "application/vnd.apple.mpegurl",
-                  cache=f"public, max-age={MANIFEST_TTL}", head_only=head)
+        serve_playlist(text, final)
 
     # -- merge ---------------------------------------------------------------- #
     def _stream_hls_transmux(self, q: dict, target: dict, head: bool,
@@ -4373,9 +4485,21 @@ class Handler(BaseHTTPRequestHandler):
         headers = target.get("headers") or {}
         name = safe_filename(target.get("title") or "video", "mp4")
         cmd = [FFMPEG, "-hide_banner", "-loglevel", "error", "-nostdin"]
-        if headers:
-            cmd += ["-headers", "".join(f"{k}: {v}\r\n" for k, v in headers.items())]
-        cmd += ["-i", target["url"], "-c", "copy",
+        header_arg = (["-headers", "".join(f"{k}: {v}\r\n"
+                                           for k, v in headers.items())]
+                      if headers else [])
+
+        def add_input(u: str) -> None:
+            cmd.extend(header_arg)
+            cmd.extend(["-i", u])
+
+        add_input(target["url"])
+        if target.get("audio_url"):
+            # Split-rendition HLS: the audio lives in its own playlist, so take
+            # picture from the first input and sound from the second.
+            add_input(target["audio_url"])
+            cmd += ["-map", "0:v:0", "-map", "1:a:0"]
+        cmd += ["-c", "copy",
                 # HLS ships its AAC audio as ADTS frames; a bare copy dies the
                 # moment the audio starts ("Malformed AAC bitstream") and the
                 # download collapses to a few seconds of video.

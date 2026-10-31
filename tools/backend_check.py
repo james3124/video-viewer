@@ -609,6 +609,17 @@ def main() -> int:
         st, hd, body = fetch(bport, seg)
         check("hls: rewritten segment streams through the proxy",
               st == 200 and len(body) > 0, f"{st}, {len(body)}B")
+        # A master playlist points at media playlists through the same raw=1
+        # entry point. Those responses are playlists by design and must be
+        # rewritten, not mistaken for an expired segment (the old 502).
+        st, hd, body = fetch(bport, "/api/hls?" + urllib.parse.urlencode(
+            {"raw": "1", "u": f"{cdn_base}/master.m3u8",
+             "url": page, "fmt": "hls"}))
+        raw_text = body.decode("utf-8", "replace")
+        check("hls: a raw playlist request is rewritten, not refused as expired",
+              st == 200 and raw_text.startswith("#EXTM3U")
+              and any(l.startswith("/api/hls") for l in raw_text.splitlines()),
+              f"{st} {raw_text[:70]!r}")
 
         # 7 — caching ----------------------------------------------------------
         before = calls["n"]
@@ -776,6 +787,51 @@ def main() -> int:
                   f"{len(entries)} entry(ies)")
         finally:
             server.ALWAYS_PROXY = real_always
+
+        # 10c2 — split-rendition HLS (video playlist + audio playlist) --------
+        split_info = {"id": "hh", "title": "t", "url": "http://hh.test/watch/1",
+                      "duration": 394, "formats": [
+                          {"format_id": "hls-2077", "ext": "mp4",
+                           "protocol": "m3u8_native", "vcodec": "avc1.4d4028",
+                           "acodec": "none", "height": 720, "width": 1280,
+                           "url": "https://cdn.test/7sop/v.m3u8"},
+                          {"format_id": "hls-800", "ext": "mp4",
+                           "protocol": "m3u8_native", "vcodec": "avc1.4d4028",
+                           "acodec": "none", "height": 360, "width": 640,
+                           "url": "https://cdn.test/3cop/v.m3u8"},
+                          # yt-dlp reports no acodec at all for a media-only
+                          # audio playlist: vcodec "none", acodec null.
+                          {"format_id": "hls-audio-English", "ext": "mp4",
+                           "protocol": "m3u8_native", "vcodec": "none",
+                           "acodec": None, "resolution": "audio only",
+                           "url": "https://cdn.test/snd/a.m3u8"},
+                      ]}
+        split = server.browsable_formats(split_info)
+        audio_fmt = next((f for f in split if f["id"] == "hls-audio-English"), None)
+        check("hls split: a vcodec=none rendition is audio, not nothing",
+              audio_fmt is not None and audio_fmt["hasAudio"] is True
+              and audio_fmt["hasVideo"] is False, str(audio_fmt))
+        muxed = [f for f in split if str(f["id"]).startswith(server.HLSMUX)]
+        check("hls split: each video rendition gets a video+audio entry",
+              sorted(f["height"] for f in muxed) == [360, 720]
+              and all(f["hasAudio"] and f["hasVideo"] for f in muxed),
+              str([(f["id"], f["height"]) for f in muxed]))
+        pick = server.best_format(split)
+        check("hls split: the default is the one with sound",
+              pick is not None and pick.get("hasAudio") is True
+              and str(pick["id"]).startswith(server.HLSMUX),
+              str(pick and pick["id"]))
+        master = server.hls_master_text(
+            "https://cdn.test/7sop/v.m3u8", "https://cdn.test/snd/a.m3u8",
+            width=1280, height=720, vcodec="avc1.4d4028")
+        check("hls split: the synthesized master names the audio group",
+              master.startswith("#EXTM3U")
+              and 'TYPE=AUDIO' in master
+              and 'URI="https://cdn.test/snd/a.m3u8"' in master
+              and 'AUDIO="aud"' in master
+              and master.rstrip().endswith("https://cdn.test/7sop/v.m3u8")
+              and 'CODECS="avc1.4d4028,mp4a.40.2"' in master,
+              master.replace("\n", " | ")[:160])
 
         # 10d — sulasokvid adapter against a tame embed host ---------------------
         sula = ThreadingHTTPServer(("127.0.0.1", 0), Sula)
