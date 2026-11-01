@@ -18,6 +18,9 @@ import hashlib
 import json
 import os
 import shutil
+import socket
+import socketserver
+import struct
 import subprocess
 import sys
 import tempfile
@@ -256,6 +259,70 @@ class Sula(BaseHTTPRequestHandler):
             self.send_response(400)
             self.send_header("Content-Length", "0")
             self.end_headers()
+
+
+class SulaMirrors(BaseHTTPRequestHandler):
+    """A sulasokvid page with two mirrors: the default one is dead StreamRuby,
+    the doodstream one still serves the file through pass_md5."""
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *a):
+        pass
+
+    def _bytes(self, body: bytes, ctype: str, status: int = 200,
+               extra: dict | None = None) -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        for key, val in (extra or {}).items():
+            self.send_header(key, val)
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
+
+    def do_GET(self):                       # noqa: N802
+        port = self.server.server_address[1]
+        parsed = urllib.parse.urlparse(self.path)
+        if parsed.path == "/video.php":
+            title = "<title>Mirror Cat</title>"
+            if "s=doodstream" in (parsed.query or ""):
+                body = (f"<html><head>{title}</head><body>"
+                        f'<iframe src="http://127.0.0.1:{port}/e/doodok?c_poster=x">'
+                        f"</iframe></body></html>").encode()
+            else:
+                body = (f"<html><head>{title}</head><body>"
+                        f"<script>iframe.src = 'http://127.0.0.1:{port}/e/deadfail';"
+                        f"</script>"
+                        f'<a href="?id=mir&s=doodstream">Player 2</a>'
+                        f"</body></html>").encode()
+            return self._bytes(body, "text/html")
+        if parsed.path == "/e/deadfail":
+            return self._bytes(b"<html><title>StreamRuby \xc2\xb7 Video "
+                               b"unavailable</title></html>", "text/html")
+        if parsed.path == "/e/doodok":
+            body = (b"<html><body><script>"
+                    b"$('#x').click(function(){"
+                    b"$.get('/pass_md5/abc/def', function(data){"
+                    b" dpload(data); dsplayer.src({type:'video/mp4',"
+                    b" src: data + makePlay() + '?token=zzz'}); }); });"
+                    b"</script></body></html>")
+            return self._bytes(body, "text/html")
+        if parsed.path == "/pass_md5/abc/def":
+            return self._bytes(f"http://127.0.0.1:{port}/media/".encode(),
+                               "text/plain")
+        if parsed.path.startswith("/media/"):
+            return self._bytes(b"\0" * 1000, "video/mp4",
+                               extra={"Accept-Ranges": "bytes"})
+        self._bytes(b"no", "text/plain", 404)
+
+    do_HEAD = do_GET                       # noqa: N815
+
+    def do_POST(self):                      # noqa: N802
+        length = int(self.headers.get("Content-Length") or 0)
+        body = self.rfile.read(length) if length else b""
+        if self.path == "/api/stream" and b"deadfail" in body:
+            return self._bytes(b'["error", 404]', "application/json")
+        self._bytes(b"no", "text/plain", 404)
 
 
 class Hanime(BaseHTTPRequestHandler):
@@ -607,6 +674,16 @@ def main() -> int:
               and len(body) == 7168,
               f"{st} {hd.get('Content-Type', '')} {len(body)}B")
 
+        # A stitched stream has no single file to fetch: its download must be
+        # muxed by /api/merge (video *and* audio), never one of the halves.
+        for stitch in (server.MERGE_ID, server.HLSMUX + "137:140"):
+            st, hd, _ = fetch(bport, "/api/play" + q(page, fmt=stitch, dl="1"))
+            loc = hd.get("Location", "")
+            check(f"download: {stitch} is handed to the muxer, not a half-stream",
+                  st == 302 and "/api/merge?" in loc
+                  and f"fmt={urllib.parse.quote(stitch, safe='')}" in loc,
+                  f"{st} {loc[:90]}")
+
         # 6 — HLS: manifest rewrite + key + segments ---------------------------
         st, hd, manifest = fetch(bport, "/api/hls" + q(page, fmt="hls"))
         text = manifest.decode()
@@ -873,7 +950,8 @@ def main() -> int:
         threading.Thread(target=sula.serve_forever, daemon=True).start()
         try:
             check("sulasok: registered as a player site",
-                  "sulasokvid.co" in server._PLAYER_SITES, "")
+                  "sulasokvid.co" in server._PLAYER_SITES
+                  and "sulasokvids.icu" in server._PLAYER_SITES, "")
             try:
                 server.sulasokvid_extract("http://127.0.0.1:1/some-listing")
                 check("sulasok: a non-watch page says so", False, "no raise")
@@ -909,6 +987,38 @@ def main() -> int:
         finally:
             sula.shutdown()
             sula.server_close()
+
+        # 10d1 — sulasokvid mirror fallback: the default player is dead, a
+        # later mirror (doodstream pass_md5) still has the file. The adapter
+        # must walk the mirrors instead of trusting the first embed.
+        mir = ThreadingHTTPServer(("127.0.0.1", 0), SulaMirrors)
+        mport = mir.server_address[1]
+        threading.Thread(target=mir.serve_forever, daemon=True).start()
+        try:
+            got = server.sulasokvid_extract(
+                f"http://127.0.0.1:{mport}/watch.php?id=mir")
+            fmt = (got.get("formats") or [{}])[0]
+            check("sulasok: a dead mirror falls through to a live one",
+                  got.get("title") == "Mirror Cat"
+                  and fmt.get("format_id") == "doodstream"
+                  and fmt.get("url", "").startswith(
+                      f"http://127.0.0.1:{mport}/media/")
+                  and "token=zzz&expiry=" in fmt.get("url", ""),
+                  f"title={got.get('title')!r} fmt={fmt.get('format_id')!r} "
+                  f"url={fmt.get('url', '')[:70]!r}")
+            check("sulasok: a doodstream mp4 keeps its Referer",
+                  fmt.get("http_headers", {}).get("Referer", "")
+                  .endswith("/e/doodok"), "")
+            entries = server.browsable_formats(
+                {"id": "m", "title": "t", "url": got["webpage_url"],
+                 "formats": [fmt]})
+            check("sulasok: the doodstream mp4 is proxied",
+                  len(entries) == 1 and entries[0]["kind"] == "direct"
+                  and entries[0]["needsProxy"] is True,
+                  f"kind={entries[0]['kind'] if entries else None}")
+        finally:
+            mir.shutdown()
+            mir.server_close()
 
         # 10d2 — hanime.tv: signed player handshake ---------------------------
         han = ThreadingHTTPServer(("127.0.0.1", 0), Hanime)
@@ -1473,8 +1583,92 @@ def main() -> int:
             except Exception as exc:  # noqa: BLE001
                 check("download: refuses when only HLS exists",
                       "no single file" in str(exc), str(exc)[:60])
+
+            # A split-rendition site (YouTube) has no complete direct file, only
+            # a video-only and an audio-only track. Neither is a download worth
+            # starting, so the pick must fail and let the caller mux instead of
+            # silently saving a silent film.
+            split_only = {"formats": [
+                {"format_id": "137", "ext": "mp4", "protocol": "https",
+                 "height": 1080, "url": "https://cdn.test/v-1080.mp4",
+                 "vcodec": "avc1", "acodec": "none"},
+                {"format_id": "140", "ext": "m4a", "protocol": "https",
+                 "url": "https://cdn.test/a-128.m4a",
+                 "vcodec": "none", "acodec": "mp4a"},
+            ], "title": "Split"}
+            server.get_info = lambda url, **kw: split_only
+            try:
+                server.resolve_download("https://site.test/v")
+                check("download: a video-only/audio-only pair is not a file", False)
+            except Exception as exc:  # noqa: BLE001
+                check("download: a video-only/audio-only pair is not a file",
+                      "no single file" in str(exc), str(exc)[:60])
+            # ...but naming one explicitly still honours the user's choice.
+            check("download: an explicit video-only id is still honoured",
+                  server.resolve_download("https://site.test/v", "137")["url"]
+                  .endswith("v-1080.mp4"))
         finally:
             server.get_info = real_get
+
+        # 16b — HTTP keep-alive -----------------------------------------------
+        # A kept-alive socket must not pin a worker forever, and a browser that
+        # walks away from one is normal. Both used to leave a handler thread
+        # blocked in readline and print a ConnectionResetError traceback.
+
+        def _read_response(sock):
+            data = b""
+            while b"\r\n\r\n" not in data:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    raise RuntimeError("closed before headers")
+                data += chunk
+            head, _, body = data.partition(b"\r\n\r\n")
+            length = 0
+            for line in head.split(b"\r\n")[1:]:
+                key, _, val = line.partition(b":")
+                if key.strip().lower() == b"content-length":
+                    length = int(val.strip())
+            while len(body) < length:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                body += chunk
+            return head, body
+
+        real_ka = server.Handler.timeout
+        try:
+            server.Handler.timeout = 1          # reap an idle connection fast
+            ka = socket.create_connection(("127.0.0.1", bport), timeout=5)
+            try:
+                ka.sendall(b"GET /api/health HTTP/1.1\r\nHost: localhost\r\n"
+                           b"Connection: keep-alive\r\n\r\n")
+                _read_response(ka)
+                # Say nothing more, exactly like a browser that walked away.
+                ka.settimeout(5)
+                try:
+                    reaped = ka.recv(1) == b""
+                except (ConnectionResetError, socket.timeout):
+                    reaped = True
+                check("keep-alive: an idle connection is reaped, not pinned",
+                      reaped, "" if reaped else "socket stayed open")
+            finally:
+                ka.close()
+        finally:
+            server.Handler.timeout = real_ka
+
+        # A client that resets mid-connection must not take the server (or the
+        # log) down: handle() swallows the RST.
+        check("keep-alive: the handler owns the connection loop",
+              server.Handler.handle is not socketserver.BaseRequestHandler.handle)
+        rst = socket.create_connection(("127.0.0.1", bport), timeout=5)
+        rst.sendall(b"GET /api/health HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        rst.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER,
+                       struct.pack("ii", 1, 0))
+        rst.close()                              # RST, not a clean FIN
+        time.sleep(0.1)
+        st, _hd, _b = fetch(bport, "/api/health")
+        check("keep-alive: a reset connection does not break the server",
+              st == 200, str(st))
 
         # 17 — windowed media cache ------------------------------------------
         # Stop any prefetchers left over from the proxy tests above, then start

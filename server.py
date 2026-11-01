@@ -41,12 +41,14 @@ import importlib.util
 import io
 import json
 import os
+import random
 from html import unescape as html_unescape
 import re
 import shutil
 import signal
 import socket
 import stat as stat_mod
+import string
 import struct
 import subprocess
 import sys
@@ -847,6 +849,33 @@ def _json_post(url: str, payload: dict, headers: dict, timeout: int = 25):
         return ("error", 0)
 
 
+def _fetch_text(url: str, headers: dict, timeout: int = 25) -> str | None:
+    """GET a page as text, preferring curl_cffi's browser TLS profile.
+
+    Player hosts sit behind bot checks that key on the TLS fingerprint, which
+    urllib cannot fake; curl_cffi is the same tool yt-dlp uses. Returns None on
+    any failure so callers can try the next player instead of crashing.
+    """
+    try:
+        from curl_cffi import requests as _cr          # noqa: PLC0415
+        resp = _cr.get(url, headers=headers, timeout=timeout,
+                       impersonate="chrome")
+        if resp.status_code == 200:
+            return resp.text
+        return None
+    except ImportError:
+        pass
+    except Exception:  # noqa: BLE001
+        pass
+    req = urllib.request.Request(url, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            charset = resp.headers.get_content_charset() or "utf-8"
+            return resp.read(4 << 20).decode(charset, "replace")
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _media_urls_from_json(obj, depth: int = 0) -> list[str]:
     """Collect media URLs from a JSON payload without knowing its exact shape."""
     if depth > 8:
@@ -1080,43 +1109,91 @@ def watchhentai_extract(url: str, html: str | None = None) -> dict | None:
     }
 
 
+# The player frame is named either by inline script (`iframe.src = '…/e/code'`)
+# or by a plain attribute (`<iframe src="…/e/code?poster=…">`). Both shapes are
+# in use on the same site depending on which mirror rendered the page.
 _SULASOK_EMBED_RE = re.compile(
-    r"""iframe\.src\s*=\s*["']([^"']+?/e/[A-Za-z0-9_-]+)["']""", re.I)
+    r"""(?:iframe\.src\s*=\s*|src\s*=\s*)["']"""
+    r"""((?:https?:)?//[^"']+?/e/[A-Za-z0-9_-]+)""", re.I)
+# The watch page lists one link per mirror: `?id=<id>&s=<player>`.
+_SULASOK_PLAYER_RE = re.compile(r"[?&]s=([A-Za-z0-9_-]+)")
 _SULASOK_TITLE_RE = re.compile(r"<title>([^<]+)</title>", re.I)
 
+# Players the site has offered over time, tried even when the page stops
+# advertising them: the link list is the first thing to go stale.
+_SULASOK_PLAYERS = ("", "streamruby", "doodstream", "vidara")
 
-def sulasokvid_extract(url: str, html: str | None = None) -> dict | None:
-    """sulasokvid.co: watch.php is a gate — the real player is an /e/ embed.
+# DoodStream's embed asks for `/pass_md5/<path>` and uses the returned prefix
+# plus ten random characters and a token as the real media URL.
+_DOOD_PASS_RE = re.compile(r"""\$\.get\(\s*["'](/pass_md5/[^"']+)["']""", re.I)
+_DOOD_TOKEN_RE = re.compile(r"token=([A-Za-z0-9]+)")
+_DOOD_DEAD = ("video unavailable", "no longer here", "file was removed",
+              "file not found", "this video has been removed")
 
-    The page's own flow: watch.php shows an "intro" webp whose Skip button
-    builds video.php, whose inline JS injects an embed iframe from the player
-    host, whose /api/stream answers a plain POST with the HLS manifest. Every
-    step is served to every visitor; the only gate is the ad redirect, which
-    running the same steps server-side skips by construction.
+
+def _doodstream_extract(embed_url: str) -> dict | None:
+    """DoodStream-family /e/<code>: pass_md5 → prefix → signed mp4.
+
+    Returns None when the page is not DoodStream, or when its video is gone, so
+    the caller can move on to the next embed.
     """
-    parsed = urllib.parse.urlparse(url)
-    video_id = (urllib.parse.parse_qs(parsed.query).get("id") or [""])[0]
-    if not video_id or not parsed.path.endswith(("/watch.php", "/video.php")):
-        # A listing/home page carries no single video — same reasoning as the
-        # series pages on watchhentai: say so instead of burning 20 s on yt-dlp.
-        raise NotAVideoPage(
-            "this sulasokvid page lists videos — open a watch link (…/watch.php?id=…)")
-    if parsed.path.endswith("/watch.php"):
-        # video.php is where the site's own Skip button takes the browser.
-        url = urllib.parse.urlunparse(parsed._replace(
-            path=parsed.path[:-len("watch.php")] + "video.php"))
-    if html is None or not parsed.path.endswith("/video.php"):
-        page = _fetch_html(url)
-        if not page:
-            raise RuntimeError("the sulasokvid page did not load — retry, or check the link")
-        _, html = page
+    parsed = urllib.parse.urlparse(embed_url)
+    origin = f"{parsed.scheme}://{parsed.netloc}"
+    headers = {"User-Agent": DEFAULT_UA, "Referer": origin + "/",
+               "Accept": "text/html,application/xhtml+xml,*/*;q=0.8"}
+    html = _fetch_text(embed_url, headers)
+    if not html:
+        return None
+    low = html.lower()
+    if any(marker in low for marker in _DOOD_DEAD):
+        return None
+    m = _DOOD_PASS_RE.search(html)
+    tok = _DOOD_TOKEN_RE.search(html)
+    if not m or not tok:
+        return None
+    base = _fetch_text(
+        urllib.parse.urljoin(embed_url, m.group(1)),
+        {"User-Agent": DEFAULT_UA, "Referer": embed_url,
+         "X-Requested-With": "XMLHttpRequest"})
+    base = (base or "").strip()
+    if not base.startswith("http"):
+        return None
+    # makePlay(): ten random alnum characters, then the token and expiry.
+    suffix = "".join(random.choice(string.ascii_letters + string.digits)
+                     for _ in range(10))
+    mp4 = f"{base}{suffix}?token={tok.group(1)}&expiry={int(time.time() * 1000)}"
+    media_headers = {"User-Agent": DEFAULT_UA, "Referer": embed_url}
+    try:
+        req = urllib.request.Request(mp4, headers=media_headers, method="HEAD")
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            ctype = (resp.headers.get("Content-Type") or "").lower()
+            if resp.status not in (200, 206):
+                return None
+            if ctype and "video" not in ctype and "octet-stream" not in ctype:
+                return None
+            size = resp.headers.get("Content-Length")
+    except urllib.error.HTTPError as exc:
+        if exc.code in (404, 410):
+            return None
+    except Exception:  # noqa: BLE001
+        pass
+    fmt = {
+        "format_id": "doodstream",
+        "url": mp4,
+        "ext": "mp4",
+        "protocol": "https",
+        "vcodec": None,
+        "acodec": None,
+        "_sniffed": True,
+        "http_headers": media_headers,
+    }
+    if size and size.isdigit():
+        fmt["filesize"] = int(size)
+    return fmt
 
-    m = _SULASOK_EMBED_RE.search(html)
-    if not m:
-        raise RuntimeError(
-            "the sulasokvid page named no player embed — its markup changed, so "
-            "the adapter needs updating")
-    embed_url = m.group(1)
+
+def _sulasok_streamruby(embed_url: str) -> dict | None:
+    """StreamRuby: POST the filecode to /api/stream, which names the manifest."""
     embed = urllib.parse.urlparse(embed_url)
     stream = _json_post(
         f"{embed.scheme}://{embed.netloc}/api/stream",
@@ -1128,30 +1205,107 @@ def sulasokvid_extract(url: str, html: str | None = None) -> dict | None:
     )
     streaming = stream.get("streaming_url") if isinstance(stream, dict) else None
     if not streaming:
-        raise RuntimeError(
-            "the player's stream API answered without a stream URL — its scheme "
-            "changed, so the adapter needs updating")
-
-    # The manifest token is bound to the extracting IP, so this stream can only
-    # play from this server anyway — needsProxy (Referer header) is correct,
-    # not just polite.
-    note("resolved the sulasokvid player embed to an HLS manifest")
-    t = _SULASOK_TITLE_RE.search(html)
+        return None
     return {
-        "title": html_unescape(t.group(1)).strip()[:160] or None if t else None,
-        "extractor_key": "sulasokvid",
-        "formats": [{
-            "format_id": "sulasok-hls",
-            "url": streaming,
-            "ext": "m3u8",
-            "protocol": "https",
-            "vcodec": None,
-            "acodec": None,
-            "_sniffed": True,
-            "http_headers": {"User-Agent": DEFAULT_UA, "Referer": embed_url},
-        }],
-        "webpage_url": url,
+        "format_id": "sulasok-hls",
+        "url": streaming,
+        "ext": "m3u8",
+        "protocol": "https",
+        "vcodec": None,
+        "acodec": None,
+        "_sniffed": True,
+        # The manifest token is bound to the extracting IP, so this stream can
+        # only play from this server anyway — needsProxy is correct, not polite.
+        "http_headers": {"User-Agent": DEFAULT_UA, "Referer": embed_url},
     }
+
+
+def _sulasok_embeds(html: str, page_url: str) -> list[str]:
+    out: list[str] = []
+    for raw in _SULASOK_EMBED_RE.findall(html):
+        url = urllib.parse.urljoin(page_url, raw)
+        if url not in out:
+            out.append(url)
+    return out
+
+
+def sulasokvid_extract(url: str, html: str | None = None) -> dict | None:
+    """sulasokvid: watch.php is a gate — the real player is an /e/ embed.
+
+    The page's own flow: watch.php shows an "intro" webp whose Skip button
+    builds video.php, whose inline JS injects an embed iframe from one of
+    several mirrors (`&s=streamruby`, `&s=doodstream`, `&s=vidara`). Each mirror
+    is a different player family, and mirrors die independently — the default
+    one is often a "Video unavailable" page while another still serves the
+    file. Walk every advertised mirror, plus the known ones, until one yields a
+    stream the server can fetch.
+    """
+    parsed = urllib.parse.urlparse(url)
+    video_id = (urllib.parse.parse_qs(parsed.query).get("id") or [""])[0]
+    if not video_id or not parsed.path.endswith(("/watch.php", "/video.php")):
+        # A listing/home page carries no single video — same reasoning as the
+        # series pages on watchhentai: say so instead of burning 20 s on yt-dlp.
+        raise NotAVideoPage(
+            "this sulasokvid page lists videos — open a watch link (…/watch.php?id=…)")
+    # video.php is where the site's own Skip button takes the browser.
+    page_path = parsed.path.rsplit("/", 1)[0] + "/video.php"
+    base_url = urllib.parse.urlunparse(parsed._replace(
+        path=page_path, query=f"id={urllib.parse.quote(video_id)}", fragment=""))
+
+    have_video_page = parsed.path.endswith("/video.php")
+    if html is None or not have_video_page:
+        page = _fetch_html(base_url)
+        if not page:
+            raise RuntimeError("the sulasokvid page did not load — retry, or check the link")
+        _, html = page
+
+    variants = list(_SULASOK_PLAYERS)
+    for name in _SULASOK_PLAYER_RE.findall(html):
+        if name not in variants:
+            variants.append(name)
+
+    title = None
+    t = _SULASOK_TITLE_RE.search(html)
+    if t:
+        title = html_unescape(t.group(1)).strip()[:160] or None
+
+    errors: list[str] = []
+    for name in variants:
+        page_url = base_url + (f"&s={name}" if name else "")
+        page_html = html
+        if name:
+            page = _fetch_html(page_url)
+            if not page:
+                errors.append(f"{name}: page did not load")
+                continue
+            _, page_html = page
+        embeds = _sulasok_embeds(page_html, page_url)
+        if not embeds:
+            errors.append(f"{name or 'default'}: no player embed")
+            continue
+        for embed_url in embeds:
+            fmt = _doodstream_extract(embed_url) or _sulasok_streamruby(embed_url)
+            if not fmt:
+                continue
+            # The embed page carries the real title; the gate page's title is
+            # the video's too, so only fill a gap.
+            if not title:
+                m = _SULASOK_TITLE_RE.search(page_html)
+                if m:
+                    title = html_unescape(m.group(1)).strip()[:160] or None
+            note(f"resolved the sulasokvid player ({name or 'default'}) "
+                 f"to a stream")
+            return {
+                "title": title,
+                "extractor_key": "sulasokvid",
+                "formats": [fmt],
+                "webpage_url": base_url,
+            }
+    detail = "; ".join(errors[-4:]) or "no player embed on any mirror"
+    raise RuntimeError(
+        "the sulasokvid player offered no working stream — every mirror "
+        f"failed ({detail}); its markup or players changed, so the adapter "
+        "needs updating")
 
 
 # --------------------------------------------------------------------------- #
@@ -1839,6 +1993,7 @@ def javhdporn_extract(url: str, html: str | None = None) -> dict | None:
 # (hanime) an API that signs every request. One named function per host.
 _PLAYER_SITES = {"watchhentai.net": watchhentai_extract,
                  "sulasokvid.co": sulasokvid_extract,
+                 "sulasokvids.icu": sulasokvid_extract,
                  "hanime.tv": hanime_extract,
                  "javhdporn.net": javhdporn_extract}
 
@@ -3395,6 +3550,9 @@ def resolve_download(page: str, fmt: str = "") -> dict:
     Adaptive HLS is not a file, so it is skipped: saving an .m3u8 as .mp4 would
     be worse than saying why. A plain media URL counts even when the extractor
     reports no codecs — the container tells the browser what it is anyway.
+    A default pick must also carry both tracks: a split-rendition site leaves
+    only video-only and audio-only files to choose from, and neither is a
+    download worth starting, so we refuse and let the caller mux instead.
     """
     info = get_info(page, playlist=PLAYLIST_PROBE)
     fmts = browsable_formats(info)
@@ -3402,6 +3560,14 @@ def resolve_download(page: str, fmt: str = "") -> dict:
 
     chosen = next((f for f in direct if fmt and f["id"] == fmt), None)
     if chosen is None:
+        # A default download has to be a self-contained file — picture *and*
+        # sound. Sites that split the tracks (YouTube) offer only video-only
+        # and audio-only direct formats, and picking one of those saved a
+        # silent film. With nothing complete here we raise, and the caller
+        # falls back to the ffmpeg merge that muxes the two renditions.
+        complete = [f for f in direct
+                    if f.get("hasVideo") and f.get("hasAudio")]
+
         def rank(f: dict) -> tuple:
             # Default downloads should be playable anywhere and not enormous:
             # mp4 first, capped at 1080p, then webm/mkv, then anything bigger.
@@ -3410,8 +3576,8 @@ def resolve_download(page: str, fmt: str = "") -> dict:
                     1 if f["ext"] in MUXED_OK_EXT and not big else
                     2 if f["ext"] in MUXED_OK_EXT else 3,
                     -(f.get("height") or 0))
-        direct.sort(key=rank)
-        chosen = direct[0] if direct else None
+        complete.sort(key=rank)
+        chosen = complete[0] if complete else None
 
     if chosen is None:
         kinds = sorted({f["kind"] for f in fmts}) or ["nothing"]
@@ -3601,9 +3767,34 @@ def _find_matching_segment(text: str, final: str,
     return None
 
 
+# An HTTP/1.1 keep-alive connection holds a handler thread while it waits for
+# the next request. BaseHTTPServer leaves the socket timeout unset, so a browser
+# that opens a connection and walks away pins that thread until it chooses to
+# close it. Reap idle connections; a client that hangs up mid-wait sends an RST,
+# which is normal and must not become a traceback in the log.
+KEEPALIVE_TIMEOUT = max(5, env_int("VIEWER_KEEPALIVE_TIMEOUT", default=75))
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = f"Viewer/{VERSION}"
     protocol_version = "HTTP/1.1"
+    timeout = KEEPALIVE_TIMEOUT
+
+    # -- connection lifetime ----------------------------------------------- #
+    def handle(self) -> None:
+        try:
+            super().handle()
+        except (ConnectionResetError, BrokenPipeError, TimeoutError):
+            # The browser closed an idle keep-alive socket (or stopped reading
+            # a stream). Nothing was lost and nothing needs reporting.
+            self.close_connection = True
+
+    def finish(self) -> None:
+        try:
+            super().finish()
+        except OSError:
+            # Flushing/closing a socket the peer already reset.
+            pass
 
     # -- plumbing --------------------------------------------------------- #
     def _cors(self, preflight: bool = False) -> None:
@@ -3962,6 +4153,16 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_error_json("Refusing to proxy our own API", 400)
 
         if q.get("dl") == "1":
+            if fmt == MERGE_ID or fmt.startswith(HLSMUX):
+                # What is on screen has no single file behind it: it is stitched
+                # from separate video and audio renditions. Saving one source
+                # would give silent (or sound-only) video, so hand the job to
+                # /api/merge, which muxes both tracks into one file.
+                link = (f"/api/merge?url={urllib.parse.quote(src, safe='')}&dl=1"
+                        f"&fmt={urllib.parse.quote(fmt, safe='')}")
+                if TOKEN:
+                    link += f"&token={urllib.parse.quote(TOKEN, safe='')}"
+                return self._redirect(link)
             try:
                 target = resolve_download(src, fmt)
             except ValueError as exc:
