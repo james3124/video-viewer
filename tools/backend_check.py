@@ -325,6 +325,49 @@ class SulaMirrors(BaseHTTPRequestHandler):
         self._bytes(b"no", "text/plain", 404)
 
 
+class TumblrPost(BaseHTTPRequestHandler):
+    """A tumblish canonical embed: og:video names a native mp4, with its
+    480p sibling available only by guessing the rendition suffix."""
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *a):
+        pass
+
+    def _bytes(self, body: bytes, ctype: str, status: int = 200) -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
+
+    def do_GET(self):                       # noqa: N802
+        port = self.server.server_address[1]
+        path = urllib.parse.urlparse(self.path).path
+        if path == "/maskofthedragon/626907179849564160":
+            body = (f'<html><head><meta property="og:title" content="mona talking">'
+                    f'<meta property="og:video" '
+                    f'content="http://127.0.0.1:{port}/media/native_720.mp4">'
+                    f"</head></html>").encode()
+            return self._bytes(body, "text/html")
+        if path == "/prozdvoices/673201091169681408":
+            body = (b'<html><head><meta property="og:title" content="voice acting">'
+                    b'<meta property="og:video" '
+                    b'content="https://youtube.test/watch?v=abc">'
+                    b"</head></html>")
+            return self._bytes(body, "text/html")
+        if path == "/quietblog/626907179849564160":
+            return self._bytes(b"<html><head><title>a text post</title>"
+                               b"</head></html>", "text/html")
+        if path == "/media/native_720.mp4":
+            return self._bytes(b"\0" * 1400, "video/mp4")
+        if path == "/media/native_480.mp4":
+            return self._bytes(b"\0" * 800, "video/mp4")
+        self._bytes(b"no", "text/plain", 404)
+
+    do_HEAD = do_GET                       # noqa: N815
+
+
 class Hanime(BaseHTTPRequestHandler):
     """A tame hanime-shaped host: page → player bundle → csrf → handshake → HLS.
 
@@ -1019,6 +1062,91 @@ def main() -> int:
         finally:
             mir.shutdown()
             mir.server_close()
+
+        # 10d1a — vimeo: the watch page wants a login, the public player
+        # embed does not. The adapter rewrites, it does not re-implement.
+        real_extract = server._extract
+        seen: dict = {}
+
+        def fake_extract(u, *a, **kw):
+            seen["url"] = u
+            return {"title": "Vimeo Video", "extractor_key": "Vimeo",
+                    "formats": [{"format_id": "hls-1",
+                                 "url": "https://cdn.test/v.m3u8",
+                                 "ext": "mp4", "protocol": "m3u8_native",
+                                 "http_headers": {}}],
+                    "webpage_url": u}
+
+        check("vimeo: registered as a player site",
+              "vimeo.com" in server._PLAYER_SITES, "")
+        try:
+            server._extract = fake_extract
+            got = server.vimeo_extract("https://vimeo.com/76979871")
+            check("vimeo: the watch page is resolved via the player embed",
+                  seen.get("url") == "https://player.vimeo.com/video/76979871"
+                  and got.get("webpage_url") == "https://vimeo.com/76979871",
+                  f"called={seen.get('url')!r}")
+            check("vimeo: an already-canonical player URL is left to yt-dlp",
+                  server.vimeo_extract(
+                      "https://player.vimeo.com/video/76979871") is None, "")
+            try:
+                server.vimeo_extract("https://vimeo.com/staff")
+                check("vimeo: a channel page says so", False, "no raise")
+            except server.NotAVideoPage:
+                check("vimeo: a channel page says so", True, "")
+        finally:
+            server._extract = real_extract
+
+        # 10d1b — tumblr: the blog subdomain 403s, the canonical www embed
+        # carries og:video; native mp4s get their 480p sibling probed.
+        tum = ThreadingHTTPServer(("127.0.0.1", 0), TumblrPost)
+        tport = tum.server_address[1]
+        threading.Thread(target=tum.serve_forever, daemon=True).start()
+        real_embed = server._TUMBLR_EMBED_URL
+        server._TUMBLR_EMBED_URL = (
+            f"http://127.0.0.1:{tport}/{{blog}}/{{post_id}}?is_embed=true")
+        try:
+            check("tumblr: registered as a player site",
+                  "tumblr.com" in server._PLAYER_SITES, "")
+            check("tumblr: www post URLs split into blog + id",
+                  server._tumblr_post_ids(urllib.parse.urlparse(
+                      "https://www.tumblr.com/maskofthedragon/626907179849564160"))
+                  == ("maskofthedragon", "626907179849564160"), "")
+            got = server.tumblr_extract(
+                "https://maskofthedragon.tumblr.com/post/626907179849564160/"
+                "mona-talking-in-english")
+            heights = [f.get("height") for f in got.get("formats") or []]
+            check("tumblr: og:video resolves a native mp4 and its 480p sibling",
+                  heights == [720, 480]
+                  and got["formats"][0].get("filesize") == 1400
+                  and got["formats"][0].get("_sniffed") is True,
+                  f"heights={heights}")
+            seen.clear()
+            try:
+                server._extract = fake_extract
+                got = server.tumblr_extract(
+                    "https://prozdvoices.tumblr.com/post/673201091169681408/"
+                    "what-recording-voice-acting-sounds-like")
+                check("tumblr: an embedded provider is handed to yt-dlp",
+                      seen.get("url") == "https://youtube.test/watch?v=abc"
+                      and got.get("webpage_url", "").startswith(
+                          "https://prozdvoices.tumblr.com/post/"),
+                      f"called={seen.get('url')!r}")
+            finally:
+                server._extract = real_extract
+            try:
+                server.tumblr_extract(
+                    "https://quietblog.tumblr.com/post/626907179849564160")
+                check("tumblr: a post without video says so", False, "no raise")
+            except server.NotAVideoPage:
+                check("tumblr: a post without video says so", True, "")
+            check("tumblr: a direct media URL is not treated as a post",
+                  server.tumblr_extract(
+                      "https://va.media.tumblr.com/tumblr_x_720.mp4") is None, "")
+        finally:
+            server._TUMBLR_EMBED_URL = real_embed
+            tum.shutdown()
+            tum.server_close()
 
         # 10d2 — hanime.tv: signed player handshake ---------------------------
         han = ThreadingHTTPServer(("127.0.0.1", 0), Hanime)

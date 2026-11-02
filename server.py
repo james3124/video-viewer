@@ -1989,11 +1989,179 @@ def javhdporn_extract(url: str, html: str | None = None) -> dict | None:
     }
 
 
+_TUMBLR_POST_RE = re.compile(r"/(?:post/)?(\d{8,})(?:[/?#]|$)")
+_TUMBLR_META_RE = re.compile(r"<meta\b[^>]*>", re.I)
+_TUMBLR_CONTENT_RE = re.compile(r"""content\s*=\s*["']([^"']+)["']""", re.I)
+_TUMBLR_MP4_RE = re.compile(r"_(\d+)\.mp4(?:$|\?)", re.I)
+_TUMBLR_MEDIA_HOSTS = {"www", "assets", "static", "va", "safe", "64.media",
+                       "media", "embed", "api"}
+# The canonical embed renders for anonymous clients; the blog subdomain does not.
+_TUMBLR_EMBED_URL = "https://www.tumblr.com/{blog}/{post_id}?is_embed=true"
+
+
+def _tumblr_post_ids(parsed) -> tuple[str, str] | None:
+    """Return (blog, post_id) for the two URL shapes Tumblr still serves."""
+    host = (parsed.hostname or "").lower()
+    parts = [p for p in parsed.path.split("/") if p]
+    if host in ("tumblr.com", "www.tumblr.com"):
+        if len(parts) >= 2 and parts[1].isdigit():
+            return parts[0], parts[1]
+        return None
+    if not host.endswith(".tumblr.com"):
+        return None
+    blog = host[:-len(".tumblr.com")]
+    if blog in _TUMBLR_MEDIA_HOSTS or "." in blog:
+        return None
+    m = _TUMBLR_POST_RE.search(parsed.path)
+    return (blog, m.group(1)) if m else None
+
+
+def _tumblr_meta(html: str, prop: str) -> str | None:
+    for tag in _TUMBLR_META_RE.findall(html):
+        if not re.search(r"""property\s*=\s*["']%s["']""" % re.escape(prop),
+                         tag, re.I):
+            continue
+        m = _TUMBLR_CONTENT_RE.search(tag)
+        if m:
+            return html_unescape(m.group(1))
+    return None
+
+
+def tumblr_extract(url: str, html: str | None = None) -> dict | None:
+    """Tumblr post pages 403 a server, but the canonical www embed renders.
+
+    `https://www.tumblr.com/<blog>/<id>?is_embed=true` carries the post's real
+    media in `og:video` (a native `va.media.tumblr.com/*.mp4` for uploads, or
+    the provider URL for YouTube/Instagram embeds). Resolve that, and hand
+    provider embeds to yt-dlp; never fetch the blog subdomain itself.
+    """
+    parsed = urllib.parse.urlparse(url)
+    if parsed.path.lower().endswith((".mp4", ".m3u8", ".webm")):
+        return None                       # a direct file, not a post
+    host = (parsed.hostname or "").lower()
+    if host not in ("tumblr.com", "www.tumblr.com") and host.endswith(".tumblr.com"):
+        blog = host[:-len(".tumblr.com")]
+        if blog in _TUMBLR_MEDIA_HOSTS or "." in blog:
+            return None                   # an asset/media host, not a post
+    ids = _tumblr_post_ids(parsed)
+    if not ids:
+        raise NotAVideoPage(
+            "this tumblr page is a blog or dashboard — open a post link "
+            "(…tumblr.com/post/<id>)")
+    blog, post_id = ids
+    embed_url = _TUMBLR_EMBED_URL.format(blog=blog, post_id=post_id)
+    if html is None:
+        html = _fetch_text(embed_url, {
+            "User-Agent": DEFAULT_UA,
+            "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
+            "Referer": "https://www.tumblr.com/",
+        })
+    if not html:
+        raise RuntimeError("the tumblr post did not load — retry, or check the link")
+
+    media = (_tumblr_meta(html, "og:video")
+             or _tumblr_meta(html, "og:video:url")
+             or _tumblr_meta(html, "og:video:secure_url"))
+    if not media:
+        raise NotAVideoPage(
+            "this tumblr post has no video — open a post with a video")
+
+    title = _tumblr_meta(html, "og:title")
+    if title:
+        title = title.strip()[:160] or None
+
+    if media.lower().endswith((".mp4", ".webm", ".m3u8")):
+        # Native upload: og:video names one rendition; the sibling 480p is
+        # usually present too, so probe the downscale rather than inventing it.
+        candidates = [media]
+        m = _TUMBLR_MP4_RE.search(media)
+        if m and int(m.group(1)) > 480:
+            alt = (media[:m.start()] + "_480"
+                   + media[m.start() + 1 + len(m.group(1)):])
+            if alt not in candidates:
+                candidates.append(alt)
+        formats = []
+        for idx, candidate in enumerate(candidates):
+            height = None
+            hm = _TUMBLR_MP4_RE.search(candidate)
+            if hm:
+                height = int(hm.group(1))
+            try:
+                req = urllib.request.Request(
+                    candidate, headers={"User-Agent": DEFAULT_UA}, method="HEAD")
+                with urllib.request.urlopen(req, timeout=20) as resp:
+                    if resp.status not in (200, 206):
+                        continue
+                    ctype = (resp.headers.get("Content-Type") or "").lower()
+                    if ctype and "video" not in ctype:
+                        continue
+                    size = resp.headers.get("Content-Length")
+            except Exception:  # noqa: BLE001
+                if idx:                   # only the og:video URL is required
+                    continue
+                size = None
+            fmt = {
+                "format_id": f"tumblr-{height}" if height else "tumblr",
+                "url": candidate,
+                "ext": "mp4",
+                "protocol": "https",
+                "vcodec": None,
+                "acodec": None,
+                "_sniffed": True,
+                "http_headers": {"User-Agent": DEFAULT_UA, "Referer": url},
+            }
+            if height:
+                fmt["height"] = height
+                fmt["width"] = round(height * 16 / 9)
+            if size and size.isdigit():
+                fmt["filesize"] = int(size)
+            formats.append(fmt)
+        if not formats:
+            raise RuntimeError("the tumblr video file refused the request")
+        formats.sort(key=lambda f: -(f.get("height") or 0))
+        note(f"tumblr: resolved a native video ({len(formats)} rendition(s))")
+        return {"title": title, "extractor_key": "tumblr",
+                "formats": formats, "webpage_url": url}
+
+    # The post embeds another provider (YouTube, Instagram, …): let yt-dlp do
+    # that host's work, keeping this post as the identity shown to the user.
+    info = _extract(media)
+    info["webpage_url"] = url
+    note("tumblr: resolved through the post's embedded provider")
+    return info
+
+
+_VIMEO_ID_RE = re.compile(r"/(?:video/)?(\d{5,})(?:[/?#]|$)")
+
+
+def vimeo_extract(url: str, html: str | None = None) -> dict | None:
+    """vimeo.com watch pages now demand a login from yt-dlp's web client.
+
+    The public player embed (`player.vimeo.com/video/<id>`) serves the same
+    video and format list to anonymous visitors, so resolve through it while
+    keeping the user's URL as the page identity.
+    """
+    parsed = urllib.parse.urlparse(url)
+    if (parsed.hostname or "").lower().startswith("player."):
+        return None                      # already canonical; let yt-dlp run
+    m = _VIMEO_ID_RE.search(parsed.path)
+    if not m:
+        raise NotAVideoPage(
+            "this vimeo page is a channel or listing — open a video link "
+            "(vimeo.com/<id>)")
+    info = _extract(f"https://player.vimeo.com/video/{m.group(1)}")
+    info["webpage_url"] = url
+    note("vimeo: resolved through the public player (the watch page needs a login)")
+    return info
+
+
 # Sites whose markup needs decoding by an adapter — a player frame to walk, or
 # (hanime) an API that signs every request. One named function per host.
 _PLAYER_SITES = {"watchhentai.net": watchhentai_extract,
                  "sulasokvid.co": sulasokvid_extract,
                  "sulasokvids.icu": sulasokvid_extract,
+                 "vimeo.com": vimeo_extract,
+                 "tumblr.com": tumblr_extract,
                  "hanime.tv": hanime_extract,
                  "javhdporn.net": javhdporn_extract}
 

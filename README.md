@@ -95,7 +95,9 @@ and ~1,800 other sites. Measured on this deployment (2026-10):
 | YouTube | works, ~5 s cold, 54 formats on a 4K video | n/a |
 | TikTok | **audio only** — its video tokens are minted for the requesting session and 403 even in a real fresh browser; the music CDN (`tiktokcdn.com`) streams from anywhere | video expected to work — tokens minted under your session are normally self-contained (this is how cookie-based downloader sites operate); not yet verified on this deployment |
 | Facebook | `watch?v=` public videos work; some `/page/videos/` permalinks answer "Cannot parse data" and want a session (yt-dlp issue #17583) | both shapes work |
-| anime/18+ tube sites with obfuscated players | the three adapters below | n/a |
+| Vimeo | works through the public player embed — the watch page now demands a login from yt-dlp's web client | n/a |
+| Tumblr | native videos and video-embed posts work through the canonical `www` embed; blog subdomains 403 server fetches | n/a |
+| anime/18+ tube sites with obfuscated players | the adapters below | n/a |
 
 The TikTok case is a CDN design, not a missing codec: `v16/v19-webapp-prime`
 URLs carry the fingerprint of whoever requested them (verified: a fresh,
@@ -114,6 +116,9 @@ guessing at site shapes is how extractors rot.
 | `hanime.tv` | runs the player's own signed handshake: the page's vendor bundle carries a WebAssembly signer that attests `(unix second, window.origin)`; the adapter executes that blob in wasmtime (no JS engine, every import a stub), AES-256-GCM seals `{timestamp, directive, slug}` with the site's own key, POSTs it with the signature to `auth.hanime.tv/api/v11/handshake`, and reads the per-resolution HLS sources out of the answer's `x-token` header |
 | `watchhentai.net` | follows the player frame the page names, then runs that frame's own client-side decoder (`whDecodeMediaUrl`) to recover the real, per-quality MP4 URLs |
 | `sulasokvid.co` | replays the site's own three-step player flow server-side: `watch.php` → `video.php` (its Skip button's target), read the `/e/` embed its JS injects, then that embed's `POST /api/stream` answers with the HLS manifest. Skips the ad redirect and the "intro" gate by construction |
+| `sulasokvids.icu` | same flow as `sulasokvid.co`, but walks every mirror the page advertises (`streamruby`, `doodstream`, `vidara`) until one yields a stream; DoodStream is resolved through its `pass_md5` → signed-mp4 flow |
+| `vimeo.com` | rewrites the watch page to `player.vimeo.com/video/<id>`, which serves the same format list anonymously, then lets yt-dlp read it |
+| `tumblr.com` | fetches `www.tumblr.com/<blog>/<id>?is_embed=true` (the blog subdomain 403s), reads `og:video`, and either builds native `va.media.tumblr.com` renditions (probing the 480p sibling) or hands an embedded provider URL to yt-dlp |
 
 None of them touch a login or a paywall: each reads what the site serves to any
 visitor and runs the site's own decoder. For watchhentai the media URLs are
