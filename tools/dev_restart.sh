@@ -41,6 +41,8 @@ cd "$APP"
 HOST=${VIEWER_HOST:-0.0.0.0}
 PORT=${VIEWER_PORT:-8080}
 export VIEWER_CACHE_DIR="$CACHE"
+export VIEWER_STATE_DIR="$STATE"
+export VIEWER_LOG_FILE="$LOG"
 # setsid: leave this shell's process group, so a terminal/agent teardown does
 # not take the backend with it. Plain nohup survives SIGHUP but not a group kill.
 if command -v setsid >/dev/null 2>&1; then

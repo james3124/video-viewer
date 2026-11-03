@@ -3847,6 +3847,140 @@ class SlidingWindow:
 EXTRACT_LIMIT = SlidingWindow(RATE_PER_MIN)
 UI_LOG_LIMIT = SlidingWindow(20)
 
+# -- problem reports -------------------------------------------------------- #
+# The error box offers "Submit a report": the server builds a redacted draft
+# and the browser opens GitHub's prefilled new-issue page. No token is stored
+# on the server and nothing is published without the user pressing "Submit".
+REPORT_REPO = env("VIEWER_REPORT_REPO", default="james3124/video-viewer")
+REPORT_LOG_FILE = env("VIEWER_LOG_FILE") or os.path.join(
+    env("VIEWER_STATE_DIR") or os.path.join(os.path.expanduser("~"), ".viewer-state"),
+    "viewer.log")
+REPORT_LIMIT = SlidingWindow(6)
+REPORT_BODY_MAX = 5000           # keeps the prefilled URL inside browser limits
+_REPORT_URL_RE = re.compile(r"https?://[^\s\"'<>]+", re.I)
+_REPORT_LOCAL_RE = re.compile(
+    r"(?<![\w.])(?:localhost|127(?:\.\d{1,3}){3}|0(?:\.\d{1,3}){3}|"
+    r"10(?:\.\d{1,3}){3}|192\.168(?:\.\d{1,3}){2}|"
+    r"172\.(?:1[6-9]|2\d|3[01])(?:\.\d{1,3}){2}|"
+    r"\[::1\]|[A-Za-z0-9_-]+\.local)(?::\d+)?", re.I)
+# Query strings also appear percent-encoded in request-log lines
+# (`/api/info?url=https%3A%2F%2Fhost%2Fwatch%3Ftoken%3Dabc`), where the URL
+# regex cannot see them. Match either the plain or encoded separators.
+_REPORT_QUERY_RE = re.compile(
+    r"(?:\?|%3[fF])[^\s\"'<>]*(?:=|%3[dD])[^\s\"'<>]*")
+_REPORT_SECRET_RE = re.compile(
+    r"(?i)\b(token|sig|signature|expire|expires|key|auth|password|passwd|"
+    r"session|cookie|md5)\s*[=:]\s*[^\s&,;\"']+")
+_REPORT_HEADER_RE = re.compile(
+    r"(?i)\b(authorization|cookie|set-cookie)\s*:\s*[^\n]+")
+_REPORT_GH_RE = re.compile(
+    r"\b(?:ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})\b")
+_REPORT_PEM_RE = re.compile(
+    r"-----BEGIN [A-Z ]+-----.*?-----END [A-Z ]+-----", re.S)
+
+
+def _report_url(raw: str) -> str:
+    """Keep scheme, host and path; drop userinfo, query and fragment."""
+    tail = ""
+    while raw and raw[-1] in ".,);]":
+        tail = raw[-1] + tail
+        raw = raw[:-1]
+    try:
+        p = urllib.parse.urlsplit(raw)
+    except ValueError:
+        return "<url>" + tail
+    if not p.hostname:
+        return "<url>" + tail
+    try:
+        port = f":{p.port}" if p.port else ""
+    except ValueError:
+        port = ""
+    return f"{p.scheme}://{p.hostname}{port}{p.path or '/'}{tail}"
+
+
+def _report_redact(text: str) -> str:
+    text = _REPORT_PEM_RE.sub("<private-key>", text)
+    text = _REPORT_URL_RE.sub(lambda m: _report_url(m.group(0)), text)
+    text = _REPORT_QUERY_RE.sub("?<redacted>", text)
+    text = _REPORT_LOCAL_RE.sub("<local>", text)
+    text = _REPORT_GH_RE.sub("<token>", text)
+    text = _REPORT_HEADER_RE.sub(lambda m: f"{m.group(1)}: <redacted>", text)
+    return _REPORT_SECRET_RE.sub(lambda m: f"{m.group(1)}=<redacted>", text)
+
+
+def _report_log_tail(max_lines: int = 120, max_bytes: int = 60000) -> list[str]:
+    try:
+        with open(REPORT_LOG_FILE, "rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            size = fh.tell()
+            fh.seek(max(0, size - max_bytes))
+            data = fh.read().decode("utf-8", "replace")
+    except OSError:
+        return []
+    return [line.rstrip() for line in data.splitlines()[-max_lines:]]
+
+
+def build_report(url: str = "", msg: str = "", raw: bool = False,
+                 client_ua: str = "") -> dict:
+    """A GitHub issue draft carrying the error, the page and the log tail.
+
+    Redaction is on by default: query strings, local addresses, tokens and
+    cookie headers never leave the machine unless the caller asks for `raw`.
+    """
+    clean = (lambda s: s) if raw else _report_redact
+    flat = re.sub(r"\s+", " ", msg).strip()
+    if not raw:
+        flat = clean(flat)
+    host = ""
+    try:
+        host = urllib.parse.urlsplit(url).hostname or ""
+    except ValueError:
+        pass
+    title = f"Bug report: {host or 'viewer'} — {flat[:60] or 'problem'}"
+    mode = ytdlp_mode()
+    head = "\n".join([
+        "### What happened",
+        flat or "(no message was shown)",
+        "",
+        "### Page",
+        f"`{clean(url) or '(none)'}`",
+        "",
+        "### Diagnostics",
+        f"- Viewer: {VERSION}",
+        "- Backend: reachable (this draft came from `/api/report`)",
+        f"- yt-dlp: {yt_dlp_version() or 'not found'} ({mode})",
+        f"- Python: {sys.version.split()[0]} on {sys.platform}",
+        f"- Client: {clean(client_ua) or 'unknown'}",
+        f"- Time: {time.strftime('%Y-%m-%d %H:%M:%S %Z')}",
+        f"- Redaction: {'off (raw)' if raw else 'on'}",
+        "",
+    ])
+    tail = _report_log_tail()
+    shown = 0
+    body = head + "### Recent server log\n```text\n(log unavailable)\n```\n"
+    for n in (len(tail), 100, 60, 30, 10, 0):
+        if n > len(tail):
+            continue
+        chunk = "\n".join(tail[-n:]) if n else "(log unavailable)"
+        candidate = (head + f"### Recent server log (last {n} line(s))\n"
+                     f"```text\n{clean(chunk)}\n```\n")
+        body = candidate
+        shown = n
+        if len(candidate) <= REPORT_BODY_MAX:
+            break
+    if len(body) > REPORT_BODY_MAX:
+        body = body[:REPORT_BODY_MAX - 16] + "\n…(truncated)\n"
+    query = urllib.parse.urlencode({"title": title, "body": body})
+    return {
+        "ok": True,
+        "repo": REPORT_REPO,
+        "title": title,
+        "body": body,
+        "url": f"https://github.com/{REPORT_REPO}/issues/new?{query}",
+        "redacted": not raw,
+        "logLines": shown,
+    }
+
 
 # --------------------------------------------------------------------------- #
 #  HTTP layer
@@ -4127,6 +4261,7 @@ class Handler(BaseHTTPRequestHandler):
                 "/api/subsrc": lambda: self._api_subsrc(q, head),
                 "/api/position": lambda: self._api_position(q, head),
                 "/api/ui-log": lambda: self._api_ui_log(q, head),
+                "/api/report": lambda: self._api_report(q, head),
                 "/api/reconnect": lambda: self._api_reconnect(q, head),
             }
             fn = routes.get(path)
@@ -5117,6 +5252,22 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", "0")
         self._cors()
         self.end_headers()
+
+    def _api_report(self, q: dict, head: bool = False) -> None:
+        """Build a prefilled GitHub issue draft from a UI failure.
+
+        Nothing is published: the browser opens GitHub's `issues/new` page and
+        the user reviews and submits it. Redaction is on unless `raw=1`.
+        """
+        if not REPORT_LIMIT.allow(self._client_ip()):
+            return self._send_error_json("Too many reports — try again shortly", 429)
+        payload = build_report(
+            url=(q.get("url") or "").strip()[:2000],
+            msg=(q.get("msg") or "").strip()[:500],
+            raw=q.get("raw") == "1",
+            client_ua=(self.headers.get("User-Agent") or "")[:200],
+        )
+        self._send_json(payload)
 
     # -- subtitles -------------------------------------------------------------- #
     def _api_subsrc(self, q: dict, head: bool = False) -> None:

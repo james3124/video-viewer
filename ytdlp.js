@@ -413,6 +413,29 @@
   /** Auth header for HEAD requests app.js makes itself (download pre-flight). */
   window.ViewerAuthHeaders = () => authHeaders();
 
+  /** Build a prefilled GitHub issue draft from an error the UI just showed.
+   *  The backend adds its version, log tail and redacts URLs/addresses.
+   *  Resolves to {url, title, body}; throws when the backend is unreachable,
+   *  which lets app.js fall back to a client-only draft. */
+  window.ViewerReport = function (pageUrl, msg, raw) {
+    const q = new URLSearchParams({
+      url: pageUrl || '',
+      msg: String(msg || '').slice(0, 500),
+    });
+    if (raw) q.set('raw', '1');
+    const url = withToken(`${state.base}/api/report?${q.toString()}`);
+    return fetch(url, { cache: 'no-store', headers: authHeaders() })
+      .then(async (res) => {
+        const text = await res.text();
+        let json = null;
+        try { json = JSON.parse(text); } catch (_) { /* html error page */ }
+        if (!res.ok || !json || !json.url) {
+          throw new Error((json && json.error) || `HTTP ${res.status}`);
+        }
+        return json;
+      });
+  };
+
   /** Tell the backend where the playhead is, so its cache window can follow it.
    *  Range requests alone cannot tell "watching at 3:15" from "buffering ahead". */
   window.ViewerReportPosition = function (pageUrl, fmt, t, duration, paused) {

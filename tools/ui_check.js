@@ -107,7 +107,7 @@ video.src = 'https://example.test/a.mp4';
 $('stage').dispatchEvent(new window.MouseEvent('mousemove', { bubbles: true }));
 window.ViewerPlay('https://example.test/a.mp4');
 
-setTimeout(() => {
+setTimeout(async () => {
   const controls = $('controls');
   check('bar is shown once a video is loaded', controls.hidden === false);
   check('play button has an icon', $('ctlPlay').innerHTML.includes('<svg'));
@@ -181,6 +181,46 @@ setTimeout(() => {
   check('error() keeps the box plain text',
     siteLinkCalls === 0 && $('errors').querySelector('a') === null,
     `links=${siteLinkCalls} box="${$('errors').textContent.slice(0, 40)}"`);
+
+  // The report escape hatch: a button under the error, opening the backend's
+  // prefilled GitHub draft; a backend outage still yields a client-only draft.
+  const reportBtn = $('errors').querySelector('.err-report');
+  check('the error box offers a report button',
+    !!reportBtn && reportBtn.textContent === 'Submit a report',
+    reportBtn ? reportBtn.textContent : 'missing');
+  let opened = null;
+  const realOpen = window.open;
+  const realReport = window.ViewerReport;
+  window.open = (u) => {
+    opened = { closed: false, opener: null, location: { href: u || '' } };
+    return opened;
+  };
+  window.ViewerReport = () => Promise.resolve({
+    url: 'https://github.com/james3124/video-viewer/issues/new?title=t',
+  });
+  await window.__viewerTest.submitReport('Unsupported URL', false, reportBtn);
+  check('the report button opens the prefilled GitHub draft',
+    !!opened && opened.location.href ===
+      'https://github.com/james3124/video-viewer/issues/new?title=t',
+    opened ? opened.location.href : '(not opened)');
+  opened = null;
+  window.ViewerReport = () => Promise.reject(new Error('backend down'));
+  await window.__viewerTest.submitReport('Unsupported URL', false, reportBtn);
+  check('a backend outage still opens a client-side report draft',
+    !!opened && opened.location.href.startsWith(
+      'https://github.com/james3124/video-viewer/issues/new?'),
+    opened ? opened.location.href.slice(0, 70) : '(not opened)');
+  const safeDraft = window.__viewerTest.fallbackReport(
+    'https://example.test/a.mp4?token=leak', 'x', false, 'down');
+  check('a fallback draft strips the URL query string',
+    !safeDraft.url.includes('token=leak') &&
+    decodeURIComponent(safeDraft.url).includes('https://example.test/a.mp4'), '');
+  const msgDraft = window.__viewerTest.fallbackReport(
+    '', 'failed for https://err.test/a?token=msgleak', false, 'down');
+  check('a fallback draft strips URLs inside the error message',
+    !decodeURIComponent(msgDraft.url).includes('msgleak'), '');
+  window.open = realOpen;
+  window.ViewerReport = realReport;
 
   // Volume + speed + captions.
   $('ctlVolume').value = '0.4';

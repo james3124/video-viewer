@@ -84,6 +84,15 @@ Extra bits that help on hostile networks:
   offer the honest fallback: open the original page in a new tab — their
   player, their session, `target="_blank" rel="noopener noreferrer"` so it
   cannot pull this page with it.
+- Every error box also carries **Submit a report**: the backend bundles the
+  error, the page, its version and the tail of its log into a GitHub issue
+  draft, and the browser opens the prefilled `issues/new` page. Nothing is
+  published without the user pressing GitHub's submit button, and no token is
+  stored on the server. Query strings, local/LAN addresses, cookie and auth
+  headers and GitHub tokens are stripped by default; the small "include raw
+  URLs" checkbox opts out for a private report. If the backend is unreachable,
+  the page still builds a client-only draft (no log) so a down backend is
+  itself reportable.
 
 ### What works out of the box
 
@@ -273,6 +282,8 @@ HLS is not windowed yet — it still streams through `/api/hls` (Phase 2).
 | `VIEWER_DISK_CACHE` | `1` | on-disk cache on/off |
 | `VIEWER_YTDLP_CONCURRENCY` | `4` | parallel extractions |
 | `VIEWER_RATE` | `300` | extraction calls per minute per IP (0 = off) |
+| `VIEWER_REPORT_REPO` | `james3124/video-viewer` | `owner/name` whose `issues/new` page receives **Submit a report** drafts |
+| `VIEWER_LOG_FILE` | `$VIEWER_STATE_DIR/viewer.log` | log file whose tail is attached to reports (set by `tools/dev_restart.sh`) |
 | `VIEWER_BLOCK_PRIVATE` | `0` | SSRF guard: refuse loopback/private targets |
 | `VIEWER_PROXY_TIMEOUT` | `60` | upstream timeout for proxied bytes |
 | `VIEWER_MANIFEST_TTL` | `15` | `Cache-Control` for rewritten playlists |

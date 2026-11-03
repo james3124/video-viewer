@@ -802,6 +802,66 @@ def main() -> int:
             check("ui-log: beacon flood is capped", st == 429, str(st))
         finally:
             server.UI_LOG_LIMIT = real_ul
+
+        # problem reports: a prefilled GitHub issue with the log tail, redacted
+        # by default. Never publishes anything; the browser does that.
+        real_log = server.REPORT_LOG_FILE
+        fd, report_log = tempfile.mkstemp(prefix="viewer-report-", suffix=".log")
+        os.close(fd)
+        with open(report_log, "w", encoding="utf-8") as fh:
+            fh.write("https://cdn.test/v.mp4?token=secret&sig=abc\n"
+                     "client 192.168.1.6:8080 asked\n"
+                     "Authorization: Bearer ghp_" + "a" * 30 + "\n"
+                     "[http] \"GET /api/info?url=https%3A%2F%2Fcdn.test"
+                     "%2Fv.mp4%3Ftoken%3Dencoded&fresh=1\" 200\n"
+                     "[ui] could not play\n")
+        try:
+            server.REPORT_LOG_FILE = report_log
+            page_q = urllib.parse.quote(
+                "https://sulasokvids.icu/watch.php?id=x&token=leak", safe="")
+            st, _, raw = fetch(
+                bport, f"/api/report?url={page_q}&msg=Unsupported+URL+"
+                       "https%3A%2F%2Ferr.test%2Fa%3Ftoken%3Dmsgleak")
+            draft = json.loads(raw or b"{}")
+            body = draft.get("body") or ""
+            check("report: the draft targets the repo's new-issue page",
+                  st == 200 and draft.get("url", "").startswith(
+                      "https://github.com/james3124/video-viewer/issues/new?")
+                  and draft.get("redacted") is True,
+                  f"{st} {draft.get('url', '')[:60]}")
+            check("report: query strings and tokens are stripped",
+                  "https://cdn.test/v.mp4" in body
+                  and "token=secret" not in body
+                  and "sig=abc" not in body
+                  and "token=leak" not in body, "")
+            check("report: encoded query strings in log lines are stripped",
+                  "token%3Dencoded" not in body
+                  and "fresh=1" not in body, "")
+            check("report: a URL inside the error message is redacted too",
+                  "msgleak" not in body and "https://err.test/a" in body, "")
+            check("report: LAN addresses and GitHub tokens are masked",
+                  "192.168.1.6" not in body and "<local>" in body
+                  and "ghp_" not in body, "")
+            check("report: the log tail is attached",
+                  "Recent server log" in body and "could not play" in body, "")
+            st, _, raw = fetch(
+                bport, f"/api/report?url={page_q}&msg=Unsupported+URL&raw=1")
+            raw_body = (json.loads(raw or b"{}").get("body") or "")
+            check("report: raw=1 keeps the URL when the user opts in",
+                  "token=leak" in raw_body and "token=secret" in raw_body, "")
+        finally:
+            server.REPORT_LOG_FILE = real_log
+            os.unlink(report_log)
+        real_rl = server.REPORT_LIMIT
+        try:
+            server.REPORT_LIMIT = server.SlidingWindow(1)
+            st, _, _ = fetch(bport, "/api/report?msg=one")
+            check("report: first draft is allowed", st == 200, str(st))
+            st, _, _ = fetch(bport, "/api/report?msg=two")
+            check("report: report flood is capped", st == 429, str(st))
+        finally:
+            server.REPORT_LIMIT = real_rl
+
         st, _, _ = fetch(bport, "/../server.py")
         check("static: path traversal refused", st in (403, 404), str(st))
         st, hd, raw = fetch(bport, "/vendor/hls.min.js")

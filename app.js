@@ -97,9 +97,133 @@
   /* ------------------------------------------------------------------ *
    *  UI helpers
    * ------------------------------------------------------------------ */
-  function error(msg) {
+  const REPORT_REPO = window.VIEWER_REPORT_REPO || 'james3124/video-viewer';
+
+  /* Keep only the origin and path: a report must not leak signed query
+     strings, cookies or the LAN address the phone used. */
+  function reportSafePage(page) {
+    if (!page) return '';
+    let clean;
+    try {
+      const u = new URL(page, location.href);
+      clean = u.origin + u.pathname;
+    } catch (_) {
+      clean = String(page).split(/[?#]/)[0];
+    }
+    return clean.replace(
+      /\b(?:localhost|127\.\d{1,3}\.\d{1,3}\.\d{1,3}|0\.\d{1,3}\.\d{1,3}\.\d{1,3}|10\.\d{1,3}\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3}|172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3})(?::\d+)?/gi,
+      '<local>');
+  }
+
+  /* The backend could not build the draft (down, token-gated, old build):
+     still give the user a report page, with only what the browser knows. */
+  function fallbackReport(page, msg, raw, why) {
+    const shown = raw ? page : reportSafePage(page);
+    const text = String(msg || '(no message)');
+    const safeText = raw ? text : text.replace(
+      /https?:\/\/[^\s"'<>]+/gi,
+      (u) => { try { const x = new URL(u); return x.origin + x.pathname; }
+               catch (_) { return '<url>'; } }
+    ).replace(/\b(token|sig|signature|key|auth|password|session|cookie)=[^\s&,;"']+/gi,
+      '$1=<redacted>');
+    const title = 'Bug report: ' + safeText.replace(/\s+/g, ' ').slice(0, 60);
+    const body = [
+      '### What happened', safeText, '',
+      '### Page', '`' + (shown || '(none)') + '`', '',
+      '### Diagnostics',
+      '- Backend: unreachable' + (why ? ' (' + why + ')' : ''),
+      '- Client: ' + ((navigator && navigator.userAgent) || 'unknown'),
+      '- Time: ' + new Date().toISOString(),
+      '- Redaction: ' + (raw ? 'off (raw)' : 'on'),
+      '',
+      '_No server log: the report endpoint could not be reached._',
+    ].join('\n');
+    const q = new URLSearchParams({ title, body });
+    return { url: 'https://github.com/' + REPORT_REPO + '/issues/new?' + q.toString() };
+  }
+
+  /* Opened outside the click gesture, so leave a tappable draft instead of
+     relying on a popup blocker to cooperate. */
+  function revealReport(url) {
+    if (!url || errBox.hidden) return;
+    const old = errBox.querySelector('.err-report-link');
+    if (old) old.remove();
+    const a = document.createElement('a');
+    a.className = 'err-report-link';
+    a.href = url;
+    a.target = '_blank';
+    a.rel = 'noopener noreferrer';
+    a.textContent = 'Open report draft ↗';
+    errBox.appendChild(a);
+  }
+
+  function submitReport(msg, raw, btn) {
+    const page = (typeof currentUrl === 'string' && /^https?:/i.test(currentUrl))
+      ? currentUrl : '';
+    let win = null;
+    try { win = window.open('', '_blank'); } catch (_) { win = null; }
+    const open = (url) => {
+      if (win && !win.closed) {
+        try { win.opener = null; } catch (_) { /* cross-origin */ }
+        win.location.href = url;
+      } else {
+        revealReport(url);
+      }
+    };
+    const done = () => {
+      if (btn) { btn.disabled = false; btn.textContent = 'Submit a report'; }
+    };
+    if (btn) { btn.disabled = true; btn.textContent = 'Preparing report…'; }
+    const fail = (why) => {
+      done();
+      open(fallbackReport(page, msg, raw, why).url);
+    };
+    let p;
+    try {
+      p = (typeof window.ViewerReport === 'function')
+        ? window.ViewerReport(page, msg, raw)
+        : Promise.reject(new Error('report bridge unavailable'));
+    } catch (e) { p = Promise.reject(e); }
+    return p.then((draft) => {
+      done();
+      if (draft && draft.url) open(draft.url);
+      else fail('empty response');
+    }).catch((e) => fail(e && e.message ? e.message : 'report failed'));
+  }
+
+  function reportActions(msg) {
+    const row = document.createElement('div');
+    row.className = 'err-actions';
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'err-report';
+    btn.textContent = 'Submit a report';
+    const raw = document.createElement('label');
+    raw.className = 'err-raw';
+    const box = document.createElement('input');
+    box.type = 'checkbox';
+    raw.appendChild(box);
+    raw.appendChild(document.createTextNode(' include raw URLs'));
+    btn.addEventListener('click', () => submitReport(msg, box.checked, btn));
+    row.appendChild(btn);
+    row.appendChild(raw);
+    return row;
+  }
+
+  function showError(msg, withSite) {
     errBox.hidden = false;
-    errBox.textContent = msg;
+    errBox.textContent = '';
+    const span = document.createElement('span');
+    span.textContent = msg;
+    errBox.appendChild(span);
+    if (withSite && typeof currentUrl === 'string' && /^https?:/i.test(currentUrl)) {
+      errBox.appendChild(window.ViewerSiteLink(currentUrl));
+    }
+    errBox.appendChild(reportActions(msg));
+  }
+
+  function error(msg) {
+    showError(msg, false);
     // The phone is the only place this fires, so a server-side copy of what it
     // saw turns "still can't play" into a one-line diagnosis. Fire-and-forget,
     // never allowed to break the error box itself (jsdom may lack fetch).
@@ -113,16 +237,12 @@
   /* Failure with the escape hatch attached: the explanation plus a way out that
      does not depend on our extractor working. */
   function errorWithSite(msg) {
-    errBox.hidden = false;
-    errBox.textContent = '';
-    const span = document.createElement('span');
-    span.textContent = msg;
-    errBox.appendChild(span);
-    if (typeof currentUrl === 'string' && /^https?:/i.test(currentUrl)) {
-      errBox.appendChild(window.ViewerSiteLink(currentUrl));
-    }
+    showError(msg, true);
   }
-  const clearError = () => { errBox.hidden = true; errBox.textContent = ''; };
+  const clearError = () => {
+    errBox.hidden = true;
+    errBox.textContent = '';
+  };
 
   function status(text) {
     metaEl.textContent = text;
@@ -1033,6 +1153,11 @@
     }
   });
   window.addEventListener('online', reconnect);
+
+  /* Exposed for the DOM test: the report path is async and the button does not
+     hand back its promise. */
+  window.__viewerTest = Object.assign(window.__viewerTest || {},
+    { submitReport, fallbackReport });
 
   /* ------------------------------------------------------------------ *
    *  Boot: ?url=… / #url=…, with or without backend
