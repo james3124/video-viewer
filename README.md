@@ -111,6 +111,9 @@ Additional behaviour worth knowing:
   impersonation if rejected, then switched off after repeated failures.
 - `--age-limit 18`, cookies, retries, socket timeouts and a shared yt-dlp cache
   directory are always on.
+- The extraction cache is stamped with the server file's build time, so editing
+  an adapter invalidates stale entries on the next restart instead of waiting
+  out the TTL.
 - Playlists, channels and profile pages are detected and listed in the UI.
 - The proxy never follows a redirect off the host the media was resolved on
   (max 5 hops). Tune with `VIEWER_MAX_REDIRECTS`, or allow another CDN family

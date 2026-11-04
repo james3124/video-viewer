@@ -588,8 +588,18 @@ STATS = {"hit": 0, "disk": 0, "miss": 0, "neg": 0, "refresh": 0, "busy": 0,
 _SLOTS = threading.Semaphore(CONCURRENCY) if CONCURRENCY > 0 else None
 
 
+# An extraction cached under an older build of this file can name a URL, a
+# referer or a title the current adapters no longer agree with. Stamping the
+# key with the file's mtime means an edit invalidates the cache on the next
+# restart instead of leaving a stale entry to expire on its own.
+try:
+    _CACHE_STAMP = str(int(os.path.getmtime(os.path.abspath(__file__))))
+except OSError:
+    _CACHE_STAMP = "0"
+
+
 def _key(url: str, playlist: bool = False) -> str:
-    return ("P|" if playlist else "|") + url
+    return ("P|" if playlist else "|") + url + "|" + _CACHE_STAMP
 
 
 def _lock_for(key: str) -> threading.Lock:
