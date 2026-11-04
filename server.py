@@ -60,6 +60,14 @@ import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+if os.path.dirname(os.path.abspath(__file__)) not in sys.path:
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+try:
+    import universal as _universal
+except Exception:  # noqa: BLE001 - the universal layer is optional
+    _universal = None
+
 VERSION = "2.1"
 
 
@@ -575,7 +583,8 @@ _NEG: dict[str, tuple[float, str]] = {}
 _KEY_LOCKS: dict[str, threading.Lock] = {}
 _LOCK_GUARD = threading.Lock()
 _MEM_LOCK = threading.Lock()
-STATS = {"hit": 0, "disk": 0, "miss": 0, "neg": 0, "refresh": 0, "busy": 0}
+STATS = {"hit": 0, "disk": 0, "miss": 0, "neg": 0, "refresh": 0, "busy": 0,
+         "universal": 0}
 _SLOTS = threading.Semaphore(CONCURRENCY) if CONCURRENCY > 0 else None
 
 
@@ -2514,6 +2523,41 @@ def _fetch_html(url: str) -> tuple[str, str] | None:
         return None
 
 
+def _universal_head(url: str, headers: dict, page: str, timeout: float = 5):
+    """One bounded verification request for a universal candidate."""
+    timeout = max(1, min(6, int(timeout or 5)))
+    if is_private_url(url):
+        raise RuntimeError("blocked: private target")
+    merged = {"User-Agent": DEFAULT_UA, "Referer": page or url,
+              "Accept": "*/*", "Accept-Encoding": "identity"}
+    for key, value in (headers or {}).items():
+        if key and value is not None and key.lower() not in HEADER_BLOCKLIST:
+            merged[key] = value
+    resp = guarded_urlopen(url, merged, head=True, timeout=timeout)
+    status = getattr(resp, "status", None) or getattr(resp, "code", 200)
+    hdrs = dict(resp.headers or {})
+    try:
+        resp.close()
+    except Exception:  # noqa: BLE001
+        pass
+    return int(status), hdrs
+
+
+def _universal_probe(url: str) -> dict | None:
+    """Run the universal fallback, if it is available and enabled."""
+    if _universal is None:
+        return None
+    try:
+        info = _universal.universal_extract(url, _fetch_html, _universal_head,
+                                            note=note)
+    except Exception:  # noqa: BLE001 - the layer must fail open to the ladder
+        return None
+    if not info or not info.get("formats"):
+        return None
+    STATS["universal"] += 1
+    return info
+
+
 def sniff_targets(url: str) -> list[tuple[str, str]]:
     """Things worth trying when yt-dlp gives up: media files, player frames, feeds.
 
@@ -2725,6 +2769,10 @@ def _extract_sniffed(url: str, playlist: bool = False) -> dict:
                 return player_info
         except Exception as exc:  # noqa: BLE001
             player_error = exc
+
+    universal_info = _universal_probe(url)
+    if universal_info is not None:
+        return universal_info
 
     for kind, candidate in sniff_targets(url):
         try:

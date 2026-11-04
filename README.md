@@ -136,6 +136,15 @@ None of them touch a login or paywall: each one runs the same public code a
 visitor's browser would, just faster. `cryptography` and `wasmtime` are only
 needed by the hanime adapter.
 
+### Universal fallback
+
+When yt-dlp and the explicit adapters fail, `universal.py` runs pattern probes
+— meta tags, JSON-LD, HTML5 media tags, player configs, one player frame and
+media anchors — without naming any host. It accepts public mp4/HLS candidates
+only, verifies the top few, and never relaxes the redirect guard. Tune it with
+`VIEWER_UNIVERSAL=0`, `VIEWER_UNIVERSAL_VERIFY=0`,
+`VIEWER_UNIVERSAL_TIMEOUT=6`, or `VIEWER_UNIVERSAL_MAX_FETCH=3`.
+
 ### Known limits
 
 yt-dlp covers ~1,800 sites. The remaining failures are usually the server's IP,

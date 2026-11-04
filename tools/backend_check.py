@@ -431,6 +431,40 @@ class Rule34Video(BaseHTTPRequestHandler):
         self._bytes(b"no", "text/plain", 404)
 
 
+class UniversalPage(BaseHTTPRequestHandler):
+    """A tame universal-adapter host: one page whose meta tag names a media
+    URL served on the same host. The universal layer must find it without the
+    meta-URL validator rejecting loopback test URLs."""
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *a):
+        pass
+
+    def _bytes(self, body: bytes, ctype: str, status: int = 200) -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
+
+    def do_GET(self):                       # noqa: N802
+        port = self.server.server_address[1]
+        parsed = urllib.parse.urlparse(self.path)
+        if parsed.path == "/media.mp4":
+            return self._bytes(b"\0" * 1200, "video/mp4")
+        if parsed.path == "/page":
+            body = (f'<html><head>'
+                    f'<title>Universal Fixture</title>'
+                    f'<meta property="og:video" '
+                    f'content="http://127.0.0.1:{port}/media.mp4">'
+                    f'</head><body>public video page</body></html>').encode()
+            return self._bytes(body, "text/html")
+        self._bytes(b"no", "text/plain", 404)
+
+    do_HEAD = do_GET                        # noqa: N815
+
+
 class TumblrPost(BaseHTTPRequestHandler):
     """A tumblish canonical embed: og:video names a native mp4, with its
     480p sibling available only by guessing the rendition suffix."""
@@ -879,6 +913,49 @@ def main() -> int:
         check("cache: failure cached so we do not retry instantly",
               server._NEG.get(server._key("https://example.test/gone", True)) is not None)
         server._extract = fake_extract
+
+        # 7b — universal fallback: yt-dlp failure falls through to pattern
+        # probes, explicit adapters still come first, and the guard is unchanged.
+        if server._universal is not None:
+            uni_host = ThreadingHTTPServer(("127.0.0.1", 0), UniversalPage)
+            uni_port = uni_host.server_address[1]
+            threading.Thread(target=uni_host.serve_forever, daemon=True).start()
+            real_fetch = server._fetch_html
+            server._fetch_html = lambda url: real_fetch(url)
+            server.BLOCK_PRIVATE = False
+            old_usable = server._universal.usable_media_url
+
+            def allows_loopback(raw, page):
+                url = old_usable(raw, page)
+                if url:
+                    return url
+                parsed = urllib.parse.urlparse(
+                    urllib.parse.urljoin(page, raw)) if page and raw else None
+                if parsed and (parsed.hostname or "") == "127.0.0.1":
+                    return urllib.parse.urljoin(page, raw)
+                return None
+
+            server._universal.usable_media_url = allows_loopback
+            try:
+                uni_page = f"http://127.0.0.1:{uni_port}/page"
+                server._extract = boom
+                info = server._extract_sniffed(uni_page)
+                entries = server.browsable_formats(info)
+                check("universal: og:video resolves after yt-dlp fails",
+                      info.get("extractor_key", "").startswith("universal:")
+                      and len(entries) == 1
+                      and entries[0]["url"].endswith("/media.mp4")
+                      and entries[0]["needsProxy"] is True,
+                      f"key={info.get('extractor_key')} "
+                      f"entries={len(entries)}")
+                check("universal: successful probe is counted",
+                      server.STATS.get("universal", 0) >= 1,
+                      str(server.STATS.get("universal")))
+            finally:
+                server._fetch_html = real_fetch
+                server._universal.usable_media_url = old_usable
+                uni_host.shutdown()
+                uni_host.server_close()
 
         # 8 — auth / methods / routes -------------------------------------------
         server.TOKEN = "hunter2"
