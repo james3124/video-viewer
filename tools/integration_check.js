@@ -134,6 +134,23 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   check('the panel offers the always-proxy toggle', !!alwaysBox,
     alwaysBox ? 'checkbox present' : 'no .yt-always checkbox');
 
+  // The quality list must offer the soundtrack on split-rendition sites
+  // (YouTube): its audio formats sort last, past the list's cap.
+  const fakeFormats = [];
+  for (let i = 0; i < 20; i++) {
+    fakeFormats.push({ id: `v${i}`, label: `${1000 - i * 10}p · mp4 · no audio`,
+      kind: 'direct', hasVideo: true, hasAudio: false, ext: 'mp4', size: 100000 });
+  }
+  fakeFormats.push({ id: '251', label: 'audio only · webm', kind: 'direct',
+    hasVideo: false, hasAudio: true, ext: 'webm', size: 2000000 });
+  fakeFormats.push({ id: '140', label: 'audio only · m4a', kind: 'direct',
+    hasVideo: false, hasAudio: true, ext: 'm4a', size: 3000000 });
+  const panelSel = window.ViewerPanelFormats({ formats: fakeFormats });
+  const panelAudio = panelSel.filter((f) => !f.hasVideo).map((f) => f.id);
+  check('the quality list keeps an audio-only option past the cap',
+    panelAudio.includes('140') && panelAudio.includes('251') && panelSel.length <= 17,
+    `shown=${panelSel.length} audio=[${panelAudio.join(',')}]`);
+
   // ---- the silent-failure case ------------------------------------------
   // When the backend answers "this is a list, nothing playable here", the old
   // code returned null without saying so, and app.js fell through to

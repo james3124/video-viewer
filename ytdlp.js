@@ -266,9 +266,29 @@
     if (meta && text) meta.textContent = text;
   }
 
+  /* The formats the quality row shows. Sites that split picture and sound
+     (YouTube) put the audio-only renditions last, exactly where the cap would
+     hide them — so the best m4a and the best non-m4a soundtrack are pulled in
+     explicitly. Picking one plays it, and Download saves it as .m4a/.webm. */
+  function panelFormats(data) {
+    const all = (data.formats || []).filter((f) => f.kind !== 'dash');
+    const shown = all.slice(0, 14);
+    const audio = all.filter((f) =>
+      f.kind === 'direct' && f.hasAudio && !f.hasVideo);
+    if (!audio.length) return shown;
+    const bySize = [...audio].sort((a, b) => (b.size || 0) - (a.size || 0));
+    const bestM4a = bySize.find((f) => /^(m4a|mp4|aac)$/i.test(f.ext || ''));
+    const bestOther = bySize.find((f) => f !== bestM4a);
+    for (const f of [bestM4a, bestOther]) {
+      if (f && !shown.includes(f)) shown.push(f);
+    }
+    return shown;
+  }
+  window.ViewerPanelFormats = panelFormats;
+
   function renderPanel(data, chosenFmt) {
     const current = chosenFmt === null ? null : pick(data);
-    const fmts = (data.formats || []).filter((f) => f.kind !== 'dash').slice(0, 14);
+    const fmts = panelFormats(data);
 
     panel.innerHTML = '';
     panel.hidden = false;
@@ -294,9 +314,13 @@
       fmts.forEach((f) => {
         const b = document.createElement('button');
         b.type = 'button';
-        b.className = 'yt-fmt' + (current && f.id === current.id ? ' active' : '');
-        b.title = f.needsProxy ? 're-fetched through the backend (CDN needs headers)'
-                               : 'played straight from the CDN';
+        const audioOnly = f.kind === 'direct' && f.hasAudio && !f.hasVideo;
+        b.className = 'yt-fmt' + (current && f.id === current.id ? ' active' : '')
+          + (audioOnly ? ' yt-audio' : '');
+        b.title = audioOnly
+          ? 'audio only — pick it to hear just the soundtrack, press Download to save it'
+          : f.needsProxy ? 're-fetched through the backend (CDN needs headers)'
+                         : 'played straight from the CDN';
         b.innerHTML = `${esc(f.label)}${f.sizeHuman ? ` <em>${esc(f.sizeHuman)}</em>` : ''}`;
         b.addEventListener('click', () => {
           state.modes.set(data.url, f.id);

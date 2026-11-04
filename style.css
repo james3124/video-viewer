@@ -243,6 +243,9 @@ button:hover,.file-btn:hover{background:#232c37;border-color:#3a4553}
 }
 .yt-fmt em{color:var(--muted);font-style:normal;font-size:11px;margin-left:4px}
 .yt-fmt.active em{color:rgba(74,158,255,.75)}
+/* The soundtrack option: same button, but clearly not a picture format. */
+.yt-fmt.yt-audio::before{content:"♪";margin-right:4px;opacity:.75}
+.yt-fmt.yt-audio{border-style:dashed}
 .yt-proxy,.yt-close{padding:5px 10px;font-size:12px;font-weight:500}
 .yt-close{width:28px;padding:0;justify-content:center;font-size:16px;line-height:1}
 .yt-proxy{margin-left:auto}
