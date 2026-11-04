@@ -2,6 +2,8 @@ __pycache__/
 *.pyc
 /.venv/
 /.kilo/
+/Plans/
+/Screenshot_*.png
 /server.log
 /data/data/
 /node_modules/

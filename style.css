@@ -58,6 +58,8 @@ body{
   color:var(--accent);
 }
 
+.brand img{display:block;border-radius:6px}
+
 #urlForm{
   flex:1;
   display:flex;
