@@ -2367,13 +2367,17 @@ def hentaimama_tv_extract(url: str, html: str | None = None) -> dict | None:
     """hentaimama.tv: the player is challenge-gated, so embed the site's own.
 
     The episode page frames `nhplayer.com/v/<code>/`, which lists one server
-    whose `player.php?vid=…` page carries no media URL at all. A script there
-    calls `get-video-url-v2.php` with a proof-of-work, per-request DOM
-    challenge parts and a behavioural fingerprint, and the signed URL is only
-    returned to that live browser session. That is an anti-bot gate — decoding
-    it from here would mean forging the challenge, which this server does not
-    do. The honest alternative is the same thing the episode page does: hand
-    the player frame to the browser as an embed and let it run there.
+    whose `player.php?vid=…` page carries no media URL at all. The `vid` is
+    base64 of `https://r2.1hanime.com/<file>.mp4|<exp>|<sig>`, but the CDN also
+    demands `?verify=<exp>-<32-byte token>`. That token is minted by
+    `get-video-url-v2.php` only after a proof-of-work plus per-request DOM
+    challenge parts and a mouse/touch/WebGL fingerprint — the page literally
+    shows "Verifying that you are not a robot…". A token is path-bound and
+    expires within minutes (a captured one stops working while the page is
+    still open), so it cannot be cached or replayed either. Forging that
+    challenge is exactly the evasion this server does not do. The honest
+    alternative is the same thing the episode page does: hand the player frame
+    to the browser as an embed and let the site's own code run there.
     """
     if html is None:
         page = _fetch_html(url)

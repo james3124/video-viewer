@@ -102,8 +102,7 @@ cross-origin host. Several layers make up the difference:
 6. **Embeds** — a site whose own player cannot be reduced to a media URL (a
    live browser challenge) is offered as its player frame instead; the server
    says `embed` in `/api/info` and the page loads it in the embedded player,
-   never in `<video>`. That frame is sandboxed: it can run its own scripts,
-   but cannot navigate this page, open popups, submit forms or download files.
+   never in `<video>`.
 
 Additional behaviour worth knowing:
 
@@ -132,6 +131,13 @@ adapter per site rather than guessing at page shapes:
 | `watchhentai.net` | Follows the player frame and runs its client-side decoder (`whDecodeMediaUrl`) to recover per-quality MP4 URLs. |
 | `hentaimama.io` | Reads the episode's post id, asks `admin-ajax.php` for each mirror, expands the base64 embed and returns its MP4 renditions plus the HLS master. |
 | `hentaimama.tv` | The stream is minted by the site's own player after a live proof-of-work/fingerprint challenge, which this server will not forge. The adapter hands the episode's `nhplayer.com/v/…` frame to the browser as an embed instead, exactly as the site's page does. |
+
+The `hentaimama.tv` case is worth spelling out because the URL *looks* static:
+`vid` decodes to `https://r2.1hanime.com/<file>.mp4|<exp>|<sig>`, but the CDN
+also wants `?verify=<exp>-<32-byte token>`, minted server-side only after the
+page's "Verifying that you are not a robot…" step. That token is path-bound and
+expires in minutes, so it cannot be derived from `vid`, cached, or replayed —
+the player frame must run in a real browser, which is what the embed does.
 | `rule34video.com` | Reads the player data's signed `video_url` tiers (720p/480p/360p), keeps the video page as Referer, and admits only `boomio-cdn.com` for the signed CDN hop. |
 | `sulasokvid.co` | Replays the site's `watch.php` → `video.php` → embed → `POST /api/stream` flow, skipping the ad redirect and intro gate. |
 | `sulasokvids.icu` | Same flow, walking every advertised mirror until one yields a stream. |
