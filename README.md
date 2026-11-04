@@ -134,6 +134,7 @@ adapter per site rather than guessing at page shapes:
 | `beeg.com` | Runs the SPA's own two calls: `facts/file` for metadata and `video/play_url` for a signed token, which becomes `video.beeg.com/<token>` — the HLS master. yt-dlp still asks that API for `hls_resources`, which it no longer returns. |
 | `blogger.com` | Decodes the `video.g` player's bootstrap data into its signed, muxed googlevideo renditions (yt-dlp's Blogger extractor no longer parses that blob). The URLs are IP-bound, so they play directly from the same network. |
 | `gogoanime.fi`, `gogoanime3.co` | Episode pages frame a third-party player. Blogger embeds resolve through the `blogger.com` adapter; other hosts (upbolt, …) are offered as an embed frame. |
+| `hianimes.se` | Episode pages frame zokoanime's player, whose `window.__P` is base64 of an XOR'd JSON blob naming the HLS master and subtitle tracks. The adapter runs the same decode the site's player does, and passes the player frame as Referer so the subtitle CDN answers. |
 
 The `hentaimama.tv` case is worth spelling out because the URL *looks* static:
 `vid` decodes to `https://r2.1hanime.com/<file>.mp4|<exp>|<sig>`, but the CDN

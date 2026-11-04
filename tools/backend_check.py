@@ -16,6 +16,7 @@ whether a header-protected host (18+ sites, TikTok, Twitter…) actually plays:
 
 import hashlib
 import json
+import base64
 import os
 import shutil
 import socket
@@ -1576,6 +1577,49 @@ def main() -> int:
               and got.get("formats") == [],
               f"embed={got.get('embed')!r}")
 
+        # 10e5 — hianimes: the zokoanime player ships window.__P, base64 of an
+        # XOR'd JSON blob; the adapter runs the same decode its own player does.
+        def zoko_blob(obj):
+            payload = json.dumps(obj, separators=(",", ":")).encode()
+            key = b"otaku-embed-v1"
+            xored = bytes(b ^ key[i % len(key)] for i, b in enumerate(payload))
+            return base64.b64encode(xored).decode()
+
+        check("hianimes: registered as a player site",
+              "hianimes.se" in server._PLAYER_SITES
+              and "zokoanime.video" in server._PLAYER_SITES, "")
+
+        player_html = ('<html><script>window.__P="' + zoko_blob({
+            "src": "https://hls.test/master.m3u8",
+            "subtitles": [{"lang": "en", "label": "English (SDH)",
+                           "default": True,
+                           "src": "https://hls.test/subs/en.vtt"}],
+        }) + '"</script></html>')
+        watch_html = ('<html><h1>Primal Episode 1</h1>'
+                      '<iframe src="https://zokoanime.video/stream/anime/1/dub'
+                      '?autostart=true&amp;asi=0"></iframe></html>')
+        real_fetch_text = server._fetch_text
+        server._fetch_text = (lambda u, h, **kw: player_html
+                              if "zokoanime" in u else real_fetch_text(u, h, **kw))
+        try:
+            got = server.hianimes_extract(
+                "https://hianimes.se/watch/primal-episode-1-ep-1-59jrf5-udqmm",
+                html=watch_html)
+        finally:
+            server._fetch_text = real_fetch_text
+        fmts = got.get("formats") or []
+        check("hianimes: the blob names the HLS master",
+              got.get("extractor_key") == "hianimes"
+              and [f.get("format_id") for f in fmts] == ["zoko-hls"]
+              and fmts[0]["url"] == "https://hls.test/master.m3u8"
+              and fmts[0]["http_headers"]["Referer"].startswith(
+                  "https://zokoanime.video/stream/anime/1/dub"),
+              f"urls={[f.get('url') for f in fmts]}")
+        check("hianimes: subtitles survive the decode",
+              ((got.get("subtitles") or {}).get("en") or [{}])[0].get("url")
+              == "https://hls.test/subs/en.vtt",
+              (got.get("subtitles") and json.dumps(got["subtitles"])[:90]) or "missing")
+
         if server._universal is not None:
             ld = ('<script type="application/ld+json">'
                   '{"@type":"VideoObject","url":"https://site.test/author/me",'
@@ -1924,6 +1968,46 @@ def main() -> int:
         check("subs: vtt endpoint sends a cacheable response",
               st == 200 and body.startswith(b"WEBVTT")
               and "max-age" in hd.get("Cache-Control", ""), hd.get("Cache-Control", ""))
+
+        # 11a — a plain .vtt URL that only answers with the player's Referer
+        # (dramahot). yt-dlp downloads nothing for a direct .vtt, so the
+        # server must fetch it itself and send the referer the adapter knew.
+        class SubServer(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, *a):
+                pass
+
+            def do_GET(self):                       # noqa: N802
+                ref = self.headers.get("Referer") or ""
+                if "player.test" not in ref:
+                    body = b"denied"
+                    self.send_response(403)
+                else:
+                    body = b"WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nhi\n"
+                    self.send_response(200)
+                self.send_header("Content-Type", "text/vtt")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        subSrv = ThreadingHTTPServer(("127.0.0.1", 0), SubServer)
+        subport = subSrv.server_address[1]
+        threading.Thread(target=subSrv.serve_forever, daemon=True).start()
+        try:
+            gate_url = f"http://127.0.0.1:{subport}/subs/only.vtt"
+            check("subs: a referer-gated vtt is refused without the referer",
+                  server.cached_vtt(gate_url) is None, "")
+            vtt_path = server.cached_vtt(gate_url, referer="https://player.test/embed")
+            check("subs: with the player referer it is fetched and cached",
+                  vtt_path is not None
+                  and open(vtt_path, encoding="utf-8").read().startswith("WEBVTT"),
+                  vtt_path or "(none)")
+            check("subs: the cached copy is served even without asking upstream",
+                  server.cached_vtt(gate_url) is not None, "")
+        finally:
+            subSrv.shutdown()
+            subSrv.server_close()
     # 12 — codec inference (yt-dlp null vs "none") ---------------------------
         null_codecs = server.browsable_formats({"formats": [
             {"format_id": "1080p", "ext": "mp4", "protocol": "https",

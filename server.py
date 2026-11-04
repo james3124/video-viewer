@@ -2714,6 +2714,120 @@ def gogoanime_extract(url: str, html: str | None = None) -> dict | None:
     }
 
 
+_ZOKO_IFRAME_RE = re.compile(
+    r"""<iframe[^>]*\bsrc=["'](https?://[^"']*zokoanime\.[^"']+)["']""", re.I)
+# The player shell ships `window.__P` — base64(XOR(json, key)). Obfuscation,
+# not access control: the same bytes go to every visitor's browser.
+_ZOKO_BLOB_RE = re.compile(r"""window\.__P\s*=\s*["']([A-Za-z0-9+/=]+)["']""")
+_ZOKO_XOR_KEY = b"otaku-embed-v1"
+
+
+def _zoko_deobfuscate(blob: str) -> dict:
+    raw = base64.b64decode(blob + "=" * (-len(blob) % 4))
+    key = _ZOKO_XOR_KEY
+    out = bytes(b ^ key[i % len(key)] for i, b in enumerate(raw))
+    data = json.loads(out.decode("utf-8"))
+    return data if isinstance(data, dict) else {}
+
+
+def hianimes_extract(url: str, html: str | None = None) -> dict | None:
+    """hianimes: episode pages frame zokoanime's player.
+
+    The player page carries `window.__P`, an XOR-obfuscated blob naming the
+    real HLS master and its subtitle tracks. The site's own player decodes it
+    client-side with a fixed key, so the adapter runs the same decode — no
+    challenge, no session, just the payload the page already shipped.
+    """
+    if html is None:
+        page = _fetch_html(url)
+        if not page:
+            return None
+        url, html = page
+
+    embed = None
+    m = _ZOKO_IFRAME_RE.search(html)
+    if m:
+        embed = html_unescape(m.group(1)).replace("&amp;", "&")
+    elif "zokoanime." in url:
+        embed = url
+    if not embed:
+        return None
+
+    player = _fetch_text(embed, {"User-Agent": DEFAULT_UA, "Referer": url})
+    if not player:
+        raise RuntimeError(
+            "the player frame did not answer — retry, or open the episode "
+            "on the site")
+    blob = _ZOKO_BLOB_RE.search(player)
+    if not blob:
+        raise RuntimeError(
+            "the player frame carried no stream blob — its markup changed, "
+            "so the adapter needs updating")
+    try:
+        data = _zoko_deobfuscate(blob.group(1))
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError(
+            "the player blob did not decode — its key changed, so the "
+            "adapter needs updating") from exc
+
+    media = str(data.get("src") or "")
+    if not media.startswith(("http://", "https://")):
+        raise RuntimeError(
+            "the player blob named no stream — the adapter needs updating")
+
+    subs: dict[str, list[dict]] = {}
+    for track in data.get("subtitles") or []:
+        if not isinstance(track, dict):
+            continue
+        src = str(track.get("src") or "")
+        if not src.startswith(("http://", "https://")):
+            continue
+        lang = str(track.get("lang") or "und")
+        subs.setdefault(lang, []).append({
+            "url": src,
+            "ext": (src.split("?")[0].rsplit(".", 1)[-1] or "vtt").lower(),
+            "name": str(track.get("label") or lang),
+            "referer": embed,
+        })
+
+    note(f"hianimes: decoded the player blob ({'HLS' + (' + subs' if subs else '')})")
+    info = {
+        "title": None,
+        "extractor_key": "hianimes",
+        "formats": [{
+            "format_id": "zoko-hls",
+            "url": media,
+            "ext": "m3u8",
+            "protocol": "m3u8_native",
+            "height": None,
+            "vcodec": None,
+            "acodec": None,
+            "_sniffed": True,
+            # The CDN takes the player frame as Referer; needsProxy is correct.
+            "http_headers": {"User-Agent": DEFAULT_UA, "Referer": embed},
+        }],
+        "webpage_url": url,
+    }
+    if subs:
+        info["subtitles"] = subs
+    # The clones put the site's boilerplate in <title> ("… Watch All Episodes
+    # at Hianime") and menu words in the first <h1>, so trim both.
+    title = None
+    tm = _HM_TITLE_RE.search(html)
+    if tm:
+        title = html_unescape(re.sub(r"<[^>]+>", "", tm.group(1)))
+        title = re.sub(r"\s+", " ", title).strip()
+        title = re.split(r"\s+(?:Watch\b|[|–—])", title)[0].strip()
+        title = re.sub(r"\s+Ep\.?\s+\d+\s+\S+$", "", title).strip()
+    if not title:
+        hm = _HM_H1_RE.search(html)
+        if hm:
+            title = html_unescape(re.sub(r"<[^>]+>", "", hm.group(1)))
+            title = re.sub(r"\s+", " ", title).strip()
+    info["title"] = (title or "")[:160] or None
+    return info
+
+
 # Sites whose markup needs decoding by an adapter — a player frame to walk, or
 # (hanime) an API that signs every request. One named function per host.
 _PLAYER_SITES = {"watchhentai.net": watchhentai_extract,
@@ -2724,6 +2838,8 @@ _PLAYER_SITES = {"watchhentai.net": watchhentai_extract,
                  "blogger.com": blogger_extract,
                  "gogoanime.fi": gogoanime_extract,
                  "gogoanime3.co": gogoanime_extract,
+                 "hianimes.se": hianimes_extract,
+                 "zokoanime.video": hianimes_extract,
                  "sulasokvid.co": sulasokvid_extract,
                  "sulasokvids.icu": sulasokvid_extract,
                  "vimeo.com": vimeo_extract,
@@ -3667,6 +3783,10 @@ def subtitle_tracks(info: dict) -> list[dict]:
                 out.append({
                     "lang": lang if gname == "subs" else f"{lang} (auto)",
                     "raw_lang": lang, "auto": gname == "auto", "ext": ext, "url": url,
+                    # Some CDNs answer a caption only with the player frame as
+                    # Referer (dramahot); the adapter that produced the track
+                    # says which one.
+                    "referer": str(entry.get("referer") or ""),
                 })
     seen, dedup = set(), []
     for s in out:
@@ -4394,7 +4514,7 @@ def resolve_download(page: str, fmt: str = "") -> dict:
 #  Subtitle conversion, cached on disk
 # --------------------------------------------------------------------------- #
 
-def cached_vtt(sub_url: str, timeout: int = 90) -> str | None:
+def cached_vtt(sub_url: str, timeout: int = 90, referer: str = "") -> str | None:
     """Convert a caption track to .vtt once, then serve it from disk."""
     if not valid_url(sub_url):
         return None
@@ -4406,6 +4526,31 @@ def cached_vtt(sub_url: str, timeout: int = 90) -> str | None:
     except OSError:
         pass
 
+    def store(body: str) -> str | None:
+        body = body.lstrip("\ufeff")
+        if not body.lstrip().startswith("WEBVTT"):
+            body = "WEBVTT\n\n" + re.sub(r"(\d\d:\d\d:\d\d),(\d\d\d)", r"\1.\2", body)
+        tmp = f"{path}.{os.getpid()}.part"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.write(body)
+        os.replace(tmp, path)
+        return path
+
+    # A plain .vtt URL: fetch it ourselves. yt-dlp treats such a URL as a
+    # direct media link and downloads nothing, and some CDNs (dramahot) only
+    # answer when the player frame is the Referer.
+    if sub_url.split("?")[0].lower().endswith(".vtt"):
+        headers = {"User-Agent": DEFAULT_UA}
+        if referer:
+            headers["Referer"] = referer
+        body = _fetch_text(sub_url, headers, timeout=timeout)
+        if body and "-->" in body:
+            try:
+                return store(body)
+            except OSError:
+                return None
+        return None
+
     parent = SUB_DIR if os.access(SUB_DIR, os.W_OK) else None
     try:
         work = tempfile.mkdtemp(prefix="sub-", dir=parent)
@@ -4413,9 +4558,12 @@ def cached_vtt(sub_url: str, timeout: int = 90) -> str | None:
         return None
     base = os.path.join(work, "sub")
     try:
-        rc, _, _ = run_yt_dlp(
-            ["--skip-download", "--convert-subs", "vtt", "-o", base + ".%(ext)s", sub_url],
-            timeout=timeout)
+        args = ["--skip-download", "--convert-subs", "vtt",
+                "-o", base + ".%(ext)s"]
+        if referer:
+            args += ["--referer", referer]
+        args.append(sub_url)
+        rc, _, _ = run_yt_dlp(args, timeout=timeout)
         produced = None
         if rc == 0:
             for cand in (base + ".vtt", base + ".srt", base + ".ttml",
@@ -4427,15 +4575,7 @@ def cached_vtt(sub_url: str, timeout: int = 90) -> str | None:
             return None
         with open(produced, encoding="utf-8", errors="replace") as fh:
             body = fh.read()
-        if not produced.endswith(".vtt"):
-            body = "WEBVTT\n\n" + re.sub(r"(\d\d:\d\d:\d\d),(\d\d\d)", r"\1.\2", body)
-        if not body.lstrip().startswith("WEBVTT"):
-            body = "WEBVTT\n\n" + body
-        tmp = f"{path}.{os.getpid()}.part"
-        with open(tmp, "w", encoding="utf-8") as fh:
-            fh.write(body)
-        os.replace(tmp, path)
-        return path
+        return store(body)
     except (OSError, RuntimeError):
         return None
     finally:
@@ -5927,7 +6067,7 @@ class Handler(BaseHTTPRequestHandler):
         hit = next((t for t in tracks if t["raw_lang"] == lang), None)
         if not hit:
             return self._send_error_json("No captions found for that language", 404)
-        vtt = cached_vtt(hit["url"])
+        vtt = cached_vtt(hit["url"], referer=hit.get("referer") or "")
         if vtt:
             return self._serve_file(vtt, "text/vtt", head_only=head)
         self._redirect(hit["url"])
