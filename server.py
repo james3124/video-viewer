@@ -5947,6 +5947,19 @@ class Handler(BaseHTTPRequestHandler):
             if target and target.get("kind") == "hls":
                 return self._stream_hls_transmux(q, target, head, download)
 
+        # Playback of a merge from a split-HLS source (YouTube) takes the same
+        # route: ffmpeg reading the progressive URLs open-ended is throttled by
+        # googlevideo to well under realtime (~50 KB/s measured, vs ~4 MB/s for
+        # a bounded range), while HLS segments are bounded reads at full speed.
+        if not download:
+            try:
+                hls_target = resolve_target(
+                    page, fmt if fmt.startswith(HLSMUX) else "")
+            except Exception:  # noqa: BLE001
+                hls_target = None
+            if hls_target and hls_target.get("kind") == "hls":
+                return self._stream_hls_transmux(q, hls_target, head, download)
+
         # Let yt-dlp do only the extraction and hand us the signed URLs
         # (--get-url); ffmpeg does the downloading. When yt-dlp writes to
         # stdout it cannot run its own merge post-processor, so `-o -` gives

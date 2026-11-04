@@ -1953,6 +1953,16 @@ def main() -> int:
                           and not body
                           and "attachment" in hd.get("Content-Disposition", ""),
                           f"{st} {bool(body)}")
+                    # Playback of a merge from a split-HLS source must use the
+                    # HLS route: ffmpeg reading the progressive URLs open-ended
+                    # is throttled by googlevideo to ~0.5x realtime.
+                    st, hd, body = fetch(
+                        bport, f"/api/merge?{urllib.parse.urlencode({'url': page, 'fmt': 'h1'})}")
+                    check("merge: playback of an HLS source transmuxes, not "
+                          "progressive-reads",
+                          st == 200 and hd.get("Content-Type") == "video/mp4"
+                          and b"ftyp" in body[:32],
+                          f"{st} {len(body)}B {hd.get('Content-Type', '')}")
             finally:
                 server.resolve_target = real_rt
                 hz.shutdown()
