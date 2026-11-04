@@ -255,6 +255,24 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     !!capTrack && capSrc.includes('/api/subsrc') && capSrc.includes('lang=en'),
     capSrc || ($('errors').textContent || '(no track)').slice(0, 70));
 
+  // A page left open must notice when the server's frontend build changes,
+  // and offer to (or just) reload. The served index.html must name the build
+  // the backend reports, or the notice would never fire.
+  const servedHtml = await (await fetch(BASE + '/')).text();
+  const servedBuild = (servedHtml.match(/name="viewer-build" content="([^"]+)"/) || [])[1] || '';
+  const health = await (await fetch(BASE + '/api/health')).json();
+  check('the served page names the current build',
+    !!servedBuild && servedBuild === health.staticBuild,
+    `page=${servedBuild || '(none)'} server=${health.staticBuild || '(none)'}`);
+
+  const metaEl = window.document.querySelector('meta[name="viewer-build"]');
+  if (metaEl) metaEl.setAttribute('content', 'oldbuild00');
+  window.__viewerNoAutoReload = true;
+  const noticed = window.ViewerCheckBuild({ staticBuild: 'newbuild11' });
+  check('a stale page notices the server build changed',
+    noticed === true && /older code/.test($('errors').textContent || ''),
+    ($('errors').textContent || '(no notice)').slice(0, 70));
+
   console.log(`\n${pass} passed, ${fail.length} failed`);
   if (fail.length) {
     console.log('failed:', fail.join(', '));

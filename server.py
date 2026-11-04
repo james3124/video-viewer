@@ -4956,12 +4956,15 @@ class Handler(BaseHTTPRequestHandler):
 
         # index.html carries the build id, so a page left open in a browser can
         # notice it is running yesterday's JavaScript (see static_build()).
+        # The ETag must follow that build, not index.html's own mtime: when
+        # only app.js changes, a mtime-based tag would 304 and the browser
+        # would keep a body naming the old build.
         if rel == "index.html":
             try:
+                build = static_build()
                 with open(target, "rb") as fh:
-                    page = fh.read().replace(b"<!--BUILD-->",
-                                             static_build().encode())
-                return self._raw(page, ctype, cache="no-cache", etag=etag,
+                    page = fh.read().replace(b"<!--BUILD-->", build.encode())
+                return self._raw(page, ctype, cache="no-cache", etag=f'"{build}"',
                                  head_only=head_only)
             except OSError:
                 pass

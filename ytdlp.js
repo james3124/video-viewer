@@ -519,24 +519,41 @@
   // Probe a few origins: a configured backend first, then same-origin, then the
   // usual localhost ports. The first healthy one wins. If none answer we keep
   // retrying, so a slow/restarted server eventually comes back online.
+  const BUILD_RELOAD_KEY = 'viewer.buildReload';
+
   function checkBuild(h) {
     // A tab left open on a phone keeps running yesterday's JavaScript while the
     // backend already has today's fixes. That looks exactly like "the bug is
-    // still there", so say what is actually wrong.
+    // still there", so say what is actually wrong — and, since the page cannot
+    // patch itself, reload as soon as that is harmless.
     const mine = document.querySelector('meta[name="viewer-build"]');
     const theirs = h && h.staticBuild;
     const here = mine && mine.getAttribute('content');
     // A plain static host (Vercel) never substitutes the placeholder, so there
     // is nothing to compare against — stay quiet rather than cry wolf.
-    if (!theirs || !here || here === theirs || /[<>=]/.test(here)) return false;
+    if (!theirs || !here || here === theirs || /[<>=]/.test(here)) {
+      try { sessionStorage.removeItem(BUILD_RELOAD_KEY); } catch (_) {}
+      return false;
+    }
     const box = document.getElementById('errors');
     const msg = 'This page is running older code than the server '
       + `(page ${here}, server ${theirs}) — reload it to get the fix.`;
     if (box) { box.hidden = false; box.textContent = msg; }
     console.warn('[viewer] ' + msg);
     note(msg);
+    // One automatic reload per server build: a stubborn cache that serves the
+    // old page again must not start a reload loop, it just keeps the notice.
+    let tried = '';
+    try { tried = sessionStorage.getItem(BUILD_RELOAD_KEY) || ''; } catch (_) {}
+    if (tried === theirs || window.__viewerNoAutoReload) return true;
+    const v = document.getElementById('video');
+    const idle = !v || !v.currentSrc || v.paused || v.ended;
+    if (!idle) return true;
+    try { sessionStorage.setItem(BUILD_RELOAD_KEY, theirs); } catch (_) {}
+    try { location.reload(); } catch (_) {}
     return true;
   }
+  window.ViewerCheckBuild = checkBuild;
 
   async function checkBackend() {
     const configured = configuredBase();
@@ -588,7 +605,10 @@
               + ' · click to re-check');
             if (wasOffline) note(`Backend online at ${label}`);
           }
-          if (probeTimer) { clearInterval(probeTimer); probeTimer = null; }
+          if (probeTimer) clearInterval(probeTimer);
+          // Keep the check alive while online: an open tab has to notice when
+          // the server's frontend build changes, or it keeps running old code.
+          probeTimer = setInterval(checkBackend, 20000);
           registerResolver();
           return true;
         }
@@ -602,7 +622,8 @@
     statusChip('backend offline', false,
       'server.py is not reachable — direct URLs, HLS files and embeds still work');
     note('Backend offline. Tried: ' + tried.join(' | '));
-    if (!probeTimer) probeTimer = setInterval(checkBackend, 5000);
+    if (probeTimer) clearInterval(probeTimer);
+    probeTimer = setInterval(checkBackend, 5000);
     return false;
   }
 
