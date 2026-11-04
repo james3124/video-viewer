@@ -1411,9 +1411,21 @@ def main() -> int:
                 check("hentaimama.tv: a series page says what it is", False,
                       f"wrong error: {type(exc).__name__}")
             try:
-                got = server.hentaimama_tv_extract(
-                    f"http://127.0.0.1:{hmtvport}"
-                    "/succubus-yondara-gibo-ga-kita-episode-2/")
+                real_fetch = server._fetch_html
+
+                def fake_fetch(u):
+                    if "nhplayer.com" in u:
+                        return (u, '<ul><li data-id="/player.php?vid=TEST">'
+                                   'Main Player</li></ul>')
+                    return real_fetch(u)
+
+                server._fetch_html = fake_fetch
+                try:
+                    got = server.hentaimama_tv_extract(
+                        f"http://127.0.0.1:{hmtvport}"
+                        "/succubus-yondara-gibo-ga-kita-episode-2/")
+                finally:
+                    server._fetch_html = real_fetch
             except Exception as exc:  # noqa: BLE001
                 check("hentaimama.tv: the episode offers the site player",
                       False, f"{type(exc).__name__}: {str(exc)[:80]}")
@@ -1421,7 +1433,7 @@ def main() -> int:
                 check("hentaimama.tv: the episode offers the site player",
                       got.get("title") == "Tame Show! Episode 2"
                       and got.get("embed") ==
-                      "https://nhplayer.com/v/gY8v9AwDhorebIz/"
+                      "https://nhplayer.com/player.php?vid=TEST"
                       and got.get("formats") == [],
                       f"title={got.get('title')!r} embed={got.get('embed')!r}")
         finally:

@@ -32,7 +32,7 @@
    * ------------------------------------------------------------------ */
   const DIRECT_RE = /\.(mp4|m4v|webm|ogv|ogg|mov|mkv|avi|mpeg|mpg|ts|mp3|m4a|aac|wav|flac)(\?|#|$)/i;
   const HLS_RE    = /\.(m3u8)(\?|#|$)/i;
-  const EMBED_RE  = /^https?:\/\/(?:www\.|m\.)?(youtube\.com\/(?:watch\?v=|embed\/|live\/|shorts\/)|youtu\.be\/|youtube-nocookie\.com\/(?:watch\?v=|embed\/)|vimeo\.com\/(?:video\/)?|player\.vimeo\.com\/video\/|dailymotion\.com\/video\/|dai\.ly\/|tiktok\.com\/|nhplayer\.com\/v\/)/i;
+  const EMBED_RE  = /^https?:\/\/(?:www\.|m\.)?(youtube\.com\/(?:watch\?v=|embed\/|live\/|shorts\/)|youtu\.be\/|youtube-nocookie\.com\/(?:watch\?v=|embed\/)|vimeo\.com\/(?:video\/)?|player\.vimeo\.com\/video\/|dailymotion\.com\/video\/|dai\.ly\/|tiktok\.com\/|nhplayer\.com\/(?:v\/|player\.php))/i;
 
   const kindOf = (url) => {
     if (!url) return 'native';

@@ -213,7 +213,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   await sleep(300);
   const embedSrc = $('embed').getAttribute('src') || '';
   check('a challenge-gated site becomes its own player embed',
-    /^https:\/\/nhplayer\.com\/v\/[\w-]+\/$/.test(embedSrc)
+    /^https:\/\/nhplayer\.com\/(?:v\/[\w-]+\/|player\.php\?vid=)/.test(embedSrc)
     && $('embed').hidden === false && $('video').hidden === true,
     embedSrc || ($('errors').textContent || '(no embed)').slice(0, 70));
 

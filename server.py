@@ -2361,6 +2361,9 @@ def hentaimama_extract(url: str, html: str | None = None) -> dict | None:
 _HMTV_EMBED_RE = re.compile(
     r"""<iframe\b[^>]*\bsrc=["'](https?://(?:www\.)?nhplayer\.com/v/[^"']+)["']""",
     re.I)
+# The frame lists its servers as `<li data-id="/player.php?vid=…">`.
+_HMTV_SERVER_RE = re.compile(
+    r"""<li\b[^>]*\bdata-id=["']([^"']*player\.php\?[^"']+)["']""", re.I)
 
 
 def hentaimama_tv_extract(url: str, html: str | None = None) -> dict | None:
@@ -2396,14 +2399,21 @@ def hentaimama_tv_extract(url: str, html: str | None = None) -> dict | None:
         return None
 
     embed = html_unescape(embed_match.group(1))
-    note("hentaimama.tv: the stream is behind the site's own browser "
-         "challenge — offering its player as an embed")
+    # The frame is only a server list; resolving its single entry starts the
+    # player (and its challenge) without an extra tap.
+    frame = _fetch_html(embed)
+    if frame:
+        server = _HMTV_SERVER_RE.search(frame[1])
+        if server:
+            embed = urllib.parse.urljoin(embed, html_unescape(server.group(1)))
 
     heading = _HM_H1_RE.search(html) or _HM_TITLE_RE.search(html)
     title = None
     if heading:
         title = html_unescape(re.sub(r"<[^>]+>", "", heading.group(1)))
         title = re.sub(r"\s+", " ", title).strip()[:160] or None
+    note("hentaimama.tv: the stream is behind the site's own browser "
+         "challenge — offering its player as an embed")
     return {
         "title": title,
         "extractor_key": "hentaimama-tv",
