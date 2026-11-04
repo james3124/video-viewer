@@ -1516,6 +1516,75 @@ def main() -> int:
             beeg.shutdown()
             beeg.server_close()
 
+        # 10e4 — blogger/gogoanime: the episode page frames a Blogger player
+        # whose bootstrap data holds signed muxed googlevideo URLs; yt-dlp's
+        # Blogger extractor no longer parses it. Other embed hosts fall back
+        # to the frame itself, like hentaimama.tv.
+        blogger_html = (
+            '<html><script>window["cfg"] = "{\\"streamingData\\":{\\"formats\\":'
+            '[{\\"itag\\":18,\\"url\\":\\"https://rr1.googlevideo.com/videoplayback'
+            '?expire\\u003d1\\u0026itag\\u003d18\\u0026mime\\u003dvideo/mp4'
+            '\\u0026x\\u003d1\\"},'
+            '{\\"itag\\":22,\\"url\\":\\"https://rr1.googlevideo.com/videoplayback'
+            '?expire\\u003d1\\u0026itag\\u003d22\\u0026mime\\u003dvideo/mp4'
+            '\\u0026x\\u003d2\\"}]}}";</script></html>')
+
+        check("gogoanime: registered as a player site",
+              "gogoanime.fi" in server._PLAYER_SITES
+              and "gogoanime3.co" in server._PLAYER_SITES
+              and "blogger.com" in server._PLAYER_SITES, "")
+
+        got = server.blogger_extract(
+            "https://www.blogger.com/video.g?token=TEST", html=blogger_html)
+        fmts = got.get("formats") or []
+        check("blogger: signed muxed renditions decode from the bootstrap data",
+              [f.get("format_id") for f in fmts] == ["blogger-22", "blogger-18"]
+              and all(f["http_headers"] == {"User-Agent": server.DEFAULT_UA}
+                      for f in fmts),
+              f"ids={[f.get('format_id') for f in fmts]}")
+        entries = server.browsable_formats(
+            {"id": "b", "title": "t", "url": "https://blogger.test/x",
+             "formats": fmts})
+        check("blogger: renditions are direct, so the phone fetches the bytes",
+              [e["kind"] for e in entries] == ["direct", "direct"]
+              and not any(e["needsProxy"] for e in entries),
+              str([(e["id"], e["needsProxy"]) for e in entries]))
+
+        episode_html = (
+            '<html><body><h1>Suikoden: The Anime Episode 5</h1>'
+            '<iframe src="https://www.blogger.com/video.g?token=TEST"></iframe>'
+            "</body></html>")
+        real_fetch_text = server._fetch_text
+        server._fetch_text = lambda u, h, **kw: blogger_html if "blogger.com" in u else real_fetch_text(u, h, **kw)
+        try:
+            got = server.gogoanime_extract(
+                "https://gogoanime.fi/suikoden-episode-5/", html=episode_html)
+        finally:
+            server._fetch_text = real_fetch_text
+        check("gogoanime: the blogger embed resolves through the episode page",
+              got.get("extractor_key") == "gogoanime"
+              and got.get("title") == "Suikoden: The Anime Episode 5"
+              and [f.get("format_id") for f in (got.get("formats") or [])]
+              == ["blogger-22", "blogger-18"],
+              f"title={got.get('title')!r}")
+
+        got = server.gogoanime_extract(
+            "https://gogoanime.fi/whatever-episode-1/",
+            html='<html><h1>Other Embed</h1><iframe src="https://upbolt.to/e/abc"></iframe></html>')
+        check("gogoanime: an unreducible embed is offered as an embed",
+              got.get("embed") == "https://upbolt.to/e/abc"
+              and got.get("formats") == [],
+              f"embed={got.get('embed')!r}")
+
+        if server._universal is not None:
+            ld = ('<script type="application/ld+json">'
+                  '{"@type":"VideoObject","url":"https://site.test/author/me",'
+                  '"author":{"url":"https://site.test/author/me"},'
+                  '"contentUrl":"https://cdn.test/v.mp4"}</script>')
+            urls = [u for u, _k in server._universal._ld_json_urls(ld)]
+            check("universal: JSON-LD no longer offers page URLs as media",
+                  urls == ["https://cdn.test/v.mp4"], str(urls))
+
         # 10e2 — rule34video: the signed rendition tiers are already in the
         # player data; yt-dlp stops at them. The adapter publishes them and
         # names the CDN hop it expects, so the media guard stays deny-by-default.

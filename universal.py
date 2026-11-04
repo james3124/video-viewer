@@ -226,14 +226,24 @@ def _ld_json_urls(html: str):
         yield from _walk_json_media(data)
 
 
+_LD_MEDIA_EXT_RE = re.compile(r"\.(?:mp4|m4v|webm|mov|m3u8|mpd|ts)(?:\?|#|$)", re.I)
+
+
 def _walk_json_media(obj, depth: int = 0):
     if depth > 6:
         return
     if isinstance(obj, dict):
-        for key in ("contentURL", "contentUrl", "embedURL", "url", "src", "file"):
+        # contentURL/file/src name the media itself; a bare `url` in JSON-LD is
+        # usually the page (or its author), so only trust it with an extension.
+        for key in ("contentURL", "contentUrl", "src", "file"):
             value = obj.get(key)
             if isinstance(value, str) and value.startswith(("http://", "https://")):
                 yield value, key
+        page_like = obj.get("url")
+        if (isinstance(page_like, str)
+                and page_like.startswith(("http://", "https://"))
+                and _LD_MEDIA_EXT_RE.search(page_like)):
+            yield page_like, "url"
         for value in obj.values():
             yield from _walk_json_media(value, depth + 1)
     elif isinstance(obj, list):

@@ -2592,6 +2592,128 @@ def beeg_extract(url: str, html: str | None = None) -> dict | None:
     }
 
 
+_BLOGGER_VIDEO_RE = re.compile(r"blogger\.com/video\.g", re.I)
+_BLOGGER_TOKEN_RE = re.compile(r"[?&]token=", re.I)
+_BLOGGER_PLAYBACK_RE = re.compile(r"""https://[^"\\\s]+?videoplayback\?[^"\\\s]+""")
+_BLOGGER_ITAG_RE = re.compile(r"[?&]itag=(\d+)")
+# Muxed (video+audio) blogger renditions; adaptive/video-only ones are skipped.
+_BLOGGER_HEIGHTS = {"18": 360, "22": 720, "37": 1080, "43": 360, "59": 480,
+                    "78": 480}
+
+
+def blogger_extract(url: str, html: str | None = None) -> dict | None:
+    """Blogger's video.g player: its page carries a streamingData JSON blob.
+
+    yt-dlp's Blogger extractor no longer parses this page. The blob is nested
+    in the player's bootstrap data, HTML-escaped and backslash-escaped, but
+    the googlevideo URLs inside it are signed, muxed and ranged — exactly what
+    <video> plays. The signature is bound to the IP that fetched the page, so
+    the bytes go straight to the browser: same LAN, same public address.
+    """
+    if html is None:
+        if not (_BLOGGER_VIDEO_RE.search(url) and _BLOGGER_TOKEN_RE.search(url)):
+            return None
+        html = _fetch_text(url, {"User-Agent": DEFAULT_UA})
+        if not html:
+            raise RuntimeError(
+                "blogger did not serve the player page — retry, or open it "
+                "on the site")
+
+    text = html_unescape(html)
+    text = (text.replace("\\u003d", "=").replace("\\u0026", "&")
+                .replace("\\u003c", "<").replace("\\u003e", ">")
+                .replace("\\u0022", '"').replace("\\/", "/"))
+
+    formats: list[dict] = []
+    seen: set[str] = set()
+    for m in _BLOGGER_PLAYBACK_RE.finditer(text):
+        media = m.group(0)
+        if media in seen:
+            continue
+        seen.add(media)
+        itag = _BLOGGER_ITAG_RE.search(media)
+        height = _BLOGGER_HEIGHTS.get(itag.group(1)) if itag else None
+        if not height or "mime=video%2Fmp4" not in media and "mime=video/mp4" not in media:
+            continue
+        formats.append({
+            "format_id": f"blogger-{itag.group(1)}",
+            "url": media,
+            "ext": "mp4",
+            "protocol": "https",
+            "height": height,
+            "vcodec": None,
+            "acodec": None,
+            # UA only: the signature is bound to this connection's IP, so the
+            # phone fetches the file itself instead of through the proxy.
+            "_sniffed": True,
+            "http_headers": {"User-Agent": DEFAULT_UA},
+        })
+
+    if not formats:
+        raise RuntimeError(
+            "the blogger player carried no muxed rendition — its bootstrap "
+            "data changed, so the adapter needs updating")
+
+    formats.sort(key=lambda f: -(f.get("height") or 0))
+    note(f"blogger: decoded {len(formats)} signed rendition(s)")
+    return {
+        "title": None,
+        "extractor_key": "blogger",
+        "formats": formats,
+        "webpage_url": url,
+    }
+
+
+_GOGO_IFRAME_RE = re.compile(
+    r"""<iframe[^>]*\bsrc=["'](https?://[^"']+)["']""", re.I)
+
+
+def gogoanime_extract(url: str, html: str | None = None) -> dict | None:
+    """gogoanime: episode pages frame a third-party player.
+
+    The clones rotate hosts; the ones seen in the wild embed either a Blogger
+    video (resolved natively through blogger_extract) or a host nothing can
+    reduce statically (upbolt and friends) — for those the frame itself is
+    offered as an embed, exactly like hentaimama.tv.
+    """
+    if html is None:
+        page = _fetch_html(url)
+        if not page:
+            return None
+        url, html = page
+
+    embeds = [html_unescape(m.group(1)).replace("&amp;", "&")
+              for m in _GOGO_IFRAME_RE.finditer(html)]
+    if not embeds:
+        return None
+
+    blogger = next((e for e in embeds if "blogger.com" in e), None)
+    if blogger:
+        info = blogger_extract(blogger)
+        if info and info.get("formats"):
+            info["webpage_url"] = url
+            info["extractor_key"] = "gogoanime"
+            heading = _HM_H1_RE.search(html) or _HM_TITLE_RE.search(html)
+            if heading:
+                title = html_unescape(re.sub(r"<[^>]+>", "", heading.group(1)))
+                info["title"] = re.sub(r"\s+", " ", title).strip()[:160] or None
+            return info
+
+    note("gogoanime: the embed is not blog-parseable — offering it as an embed")
+    heading = _HM_H1_RE.search(html) or _HM_TITLE_RE.search(html)
+    title = None
+    if heading:
+        title = html_unescape(re.sub(r"<[^>]+>", "", heading.group(1)))
+        title = re.sub(r"\s+", " ", title).strip()[:160] or None
+    return {
+        "title": title,
+        "extractor_key": "gogoanime",
+        "embed": embeds[0],
+        "formats": [],
+        "webpage_url": url,
+    }
+
+
 # Sites whose markup needs decoding by an adapter — a player frame to walk, or
 # (hanime) an API that signs every request. One named function per host.
 _PLAYER_SITES = {"watchhentai.net": watchhentai_extract,
@@ -2599,6 +2721,9 @@ _PLAYER_SITES = {"watchhentai.net": watchhentai_extract,
                  "hentaimama.tv": hentaimama_tv_extract,
                  "rule34video.com": rule34video_extract,
                  "beeg.com": beeg_extract,
+                 "blogger.com": blogger_extract,
+                 "gogoanime.fi": gogoanime_extract,
+                 "gogoanime3.co": gogoanime_extract,
                  "sulasokvid.co": sulasokvid_extract,
                  "sulasokvids.icu": sulasokvid_extract,
                  "vimeo.com": vimeo_extract,
