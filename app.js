@@ -238,6 +238,7 @@
       }
     } catch (_) { /* the report path must never become the error */ }
   }
+  window.ViewerUiLog = uiLog;
   /* Failure with the escape hatch attached: the explanation plus a way out that
      does not depend on our extractor working. */
   function errorWithSite(msg) {

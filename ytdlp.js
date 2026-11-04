@@ -47,7 +47,10 @@
     try {
       const res = await fetch(base + path, {
         signal: ctrl.signal,
-        cache: 'default',                 // the backend sends ETag + max-age
+        // The payload changes with every adapter fix; a stale body was
+        // mistaken for a server bug twice. The extraction cache lives on the
+        // server, so re-fetching costs nothing.
+        cache: 'no-store',
         headers: { Accept: 'application/json', ...authHeaders() },
       });
       const text = await res.text();
@@ -165,6 +168,12 @@
     setStatus('Resolving — the backend is working on this link…');
     const data = await info(pageUrl, fresh);
     state.cacheEnabled = !!(data && data.cacheEnabled);
+    // One line in the server log per resolve, so "the phone shows nothing"
+    // can be told apart from "the phone never saw the payload".
+    try {
+      window.ViewerUiLog?.(`info: ${(data && data.formats || []).length}fmt `
+        + `${(data && data.subtitles || []).length}sub`);
+    } catch (_) { /* diagnostics must never break playback */ }
 
     if (data && data.extractable === false) {
       // A playlist still deserves its entry list, even with nothing to play.
