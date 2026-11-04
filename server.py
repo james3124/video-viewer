@@ -2521,12 +2521,84 @@ def rule34video_extract(url: str, html: str | None = None) -> dict | None:
     }
 
 
+_BEEG_URL_RE = re.compile(r"beeg\.com/(?:video/)?-?(\d+)", re.I)
+# Overridable so the backend test can serve a tame look-alike.
+_BEEG_STORE = "https://store.externulls.com"
+_BEEG_CDN = "https://video.beeg.com"
+
+
+def beeg_extract(url: str, html: str | None = None) -> dict | None:
+    """beeg.com: the SPA mints its own signed HLS master.
+
+    yt-dlp's extractor still asks `facts/file` for `hls_resources`, which this
+    API no longer returns (and it feeds the raw page id, leading zeros and
+    all, which the API rejects). The site's real flow is two JSON calls plus a
+    token: `facts/file/<id>` for metadata, `video/play_url/<id>` for a signed
+    token that the player turns into `video.beeg.com/<token>` — the master
+    playlist. The page carries no media; this is the public API its own
+    frontend calls.
+    """
+    m = _BEEG_URL_RE.search(url)
+    if not m:
+        return None
+    vid = str(int(m.group(1)))          # the store API rejects leading zeros
+
+    headers = {
+        "User-Agent": DEFAULT_UA,
+        "Referer": "https://beeg.com/",
+        "Origin": "https://beeg.com",
+        "Accept": "application/json, text/plain, */*",
+    }
+    facts = _json_get(f"{_BEEG_STORE}/facts/file/{vid}", headers)
+    title = duration = None
+    if isinstance(facts, dict):
+        file_info = facts.get("file") or {}
+        rows = file_info.get("data") or []
+        if rows and isinstance(rows[0], dict):
+            title = str(rows[0].get("cd_value") or "").strip()[:160] or None
+        try:
+            duration = int(file_info.get("fl_duration") or 0) or None
+        except (TypeError, ValueError):
+            duration = None
+
+    token = _fetch_text(f"{_BEEG_STORE}/video/play_url/{vid}", headers)
+    if not token or not token.strip().startswith("key="):
+        raise RuntimeError(
+            "beeg did not mint a play token — its API changed, so the "
+            "adapter needs updating")
+
+    note("beeg: resolved the site's signed HLS master")
+    return {
+        "title": title,
+        "extractor_key": "beeg",
+        "duration": duration,
+        "formats": [{
+            "format_id": "beeg-hls",
+            "url": f"{_BEEG_CDN}/{token.strip()}",
+            "ext": "m3u8",
+            "protocol": "m3u8_native",
+            "height": None,
+            "vcodec": None,
+            "acodec": None,
+            # The CDN wants the page's Referer, and the master names its
+            # variants on ip*.video.beeg.com — same operator, so the redirect
+            # guard stays satisfied.
+            "_sniffed": True,
+            "http_headers": {"User-Agent": DEFAULT_UA,
+                             "Referer": "https://beeg.com/",
+                             "Origin": "https://beeg.com"},
+        }],
+        "webpage_url": url,
+    }
+
+
 # Sites whose markup needs decoding by an adapter — a player frame to walk, or
 # (hanime) an API that signs every request. One named function per host.
 _PLAYER_SITES = {"watchhentai.net": watchhentai_extract,
                  "hentaimama.io": hentaimama_extract,
                  "hentaimama.tv": hentaimama_tv_extract,
                  "rule34video.com": rule34video_extract,
+                 "beeg.com": beeg_extract,
                  "sulasokvid.co": sulasokvid_extract,
                  "sulasokvids.icu": sulasokvid_extract,
                  "vimeo.com": vimeo_extract,

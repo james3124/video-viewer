@@ -131,6 +131,7 @@ adapter per site rather than guessing at page shapes:
 | `watchhentai.net` | Follows the player frame and runs its client-side decoder (`whDecodeMediaUrl`) to recover per-quality MP4 URLs. |
 | `hentaimama.io` | Reads the episode's post id, asks `admin-ajax.php` for each mirror, expands the base64 embed and returns its MP4 renditions plus the HLS master. |
 | `hentaimama.tv` | The stream is minted by the site's own player after a live proof-of-work/fingerprint challenge, which this server will not forge. The adapter hands the episode's `nhplayer.com/v/…` frame to the browser as an embed instead, exactly as the site's page does. |
+| `beeg.com` | Runs the SPA's own two calls: `facts/file` for metadata and `video/play_url` for a signed token, which becomes `video.beeg.com/<token>` — the HLS master. yt-dlp still asks that API for `hls_resources`, which it no longer returns. |
 
 The `hentaimama.tv` case is worth spelling out because the URL *looks* static:
 `vid` decodes to `https://r2.1hanime.com/<file>.mp4|<exp>|<sig>`, but the CDN

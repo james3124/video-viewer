@@ -427,6 +427,44 @@ class HentaimamaTv(BaseHTTPRequestHandler):
         self._bytes(b"no", "text/plain", 404)
 
 
+class Beeg(BaseHTTPRequestHandler):
+    """A tame beeg-shaped API: facts JSON, a play token, and the master the
+    token points at. Only the stripped id is served, so normalization is
+    proven by the extraction succeeding at all."""
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *a):
+        pass
+
+    def _bytes(self, body: bytes, ctype: str, status: int = 200) -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
+
+    def do_GET(self):                       # noqa: N802
+        parsed = urllib.parse.urlparse(self.path)
+        if parsed.path == "/facts/file/452246185949825":
+            body = json.dumps({
+                "file": {"data": [{"cd_value": "Tame Beeg Video"}],
+                         "fl_duration": 300, "fl_width": 1920, "fl_height": 1080},
+            }).encode()
+            return self._bytes(body, "application/json")
+        if parsed.path == "/video/play_url/452246185949825":
+            return self._bytes(
+                b"key=abc,end=999,limit=10/data=xyz/media=hls4A/_TPL_/"
+                b"452246185949825.mp4.m3u8", "text/plain")
+        if parsed.path.startswith("/key="):
+            body = ("#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=688541,"
+                    "RESOLUTION=426x240\n"
+                    "//ip1.example/key=abc,end=999/data=xyz/media=hls4A/"
+                    "240p/452246185949825.mp4.m3u8\n").encode()
+            return self._bytes(body, "application/vnd.apple.mpegurl")
+        self._bytes(b"no", "text/plain", 404)
+
+
 class Rule34Video(BaseHTTPRequestHandler):
     """A tame rule34video-shaped page: the player block names three signed
     get_file renditions. The CDN hop itself is tested separately at the
@@ -1439,6 +1477,44 @@ def main() -> int:
         finally:
             hmtv.shutdown()
             hmtv.server_close()
+
+        # 10e3 — beeg: yt-dlp asks `facts/file` for hls_resources the API no
+        # longer returns. The adapter follows the site's own two-call flow:
+        # facts for metadata, play_url for the token that names the master.
+        beeg = ThreadingHTTPServer(("127.0.0.1", 0), Beeg)
+        beegport = beeg.server_address[1]
+        threading.Thread(target=beeg.serve_forever, daemon=True).start()
+        try:
+            check("beeg: registered as a player site",
+                  "beeg.com" in server._PLAYER_SITES, "")
+            old_store, old_cdn = server._BEEG_STORE, server._BEEG_CDN
+            server._BEEG_STORE = f"http://127.0.0.1:{beegport}"
+            server._BEEG_CDN = f"http://127.0.0.1:{beegport}"
+            try:
+                got = server.beeg_extract("https://beeg.com/-0452246185949825")
+            finally:
+                server._BEEG_STORE, server._BEEG_CDN = old_store, old_cdn
+            fmts = got.get("formats") or []
+            check("beeg: the leading-zero id becomes a signed master",
+                  got.get("title") == "Tame Beeg Video"
+                  and got.get("duration") == 300
+                  and len(fmts) == 1
+                  and fmts[0]["url"].endswith(
+                      "/key=abc,end=999,limit=10/data=xyz/media=hls4A/"
+                      "_TPL_/452246185949825.mp4.m3u8")
+                  and fmts[0]["protocol"] == "m3u8_native",
+                  f"title={got.get('title')!r} "
+                  f"url={(fmts[0]['url'] if fmts else '')[-70:]}")
+            entries = server.browsable_formats(
+                {"id": "b", "title": "t", "url": "https://beeg.com/-0452",
+                 "formats": fmts})
+            check("beeg: the master becomes a proxied HLS format",
+                  [e["kind"] for e in entries] == ["hls"]
+                  and entries[0]["needsProxy"] is True,
+                  str([(e["kind"], e["needsProxy"]) for e in entries]))
+        finally:
+            beeg.shutdown()
+            beeg.server_close()
 
         # 10e2 — rule34video: the signed rendition tiers are already in the
         # player data; yt-dlp stops at them. The adapter publishes them and
