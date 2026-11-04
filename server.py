@@ -849,8 +849,9 @@ def _json_post(url: str, payload: dict, headers: dict, timeout: int = 25):
         return ("error", 0)
 
 
-def _fetch_text(url: str, headers: dict, timeout: int = 25) -> str | None:
-    """GET a page as text, preferring curl_cffi's browser TLS profile.
+def _fetch_text(url: str, headers: dict, timeout: int = 25,
+                data: bytes | None = None) -> str | None:
+    """GET/POST a page as text, preferring curl_cffi's browser TLS profile.
 
     Player hosts sit behind bot checks that key on the TLS fingerprint, which
     urllib cannot fake; curl_cffi is the same tool yt-dlp uses. Returns None on
@@ -858,8 +859,17 @@ def _fetch_text(url: str, headers: dict, timeout: int = 25) -> str | None:
     """
     try:
         from curl_cffi import requests as _cr          # noqa: PLC0415
-        resp = _cr.get(url, headers=headers, timeout=timeout,
-                       impersonate="chrome")
+        if data is None:
+            resp = _cr.get(url, headers=headers, timeout=timeout,
+                           impersonate="chrome")
+        else:
+            # curl_cffi sends a str/bytes body verbatim (no form Content-Type),
+            # which WordPress rejects as a malformed AJAX request.
+            if not any(k.lower() == "content-type" for k in headers):
+                headers = {**headers, "Content-Type":
+                           "application/x-www-form-urlencoded"}
+            resp = _cr.post(url, headers=headers, data=data, timeout=timeout,
+                            impersonate="chrome")
         if resp.status_code == 200:
             return resp.text
         return None
@@ -867,7 +877,9 @@ def _fetch_text(url: str, headers: dict, timeout: int = 25) -> str | None:
         pass
     except Exception:  # noqa: BLE001
         pass
-    req = urllib.request.Request(url, headers=headers)
+    req = urllib.request.Request(
+        url, data=data, headers=headers,
+        method="POST" if data is not None else "GET")
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             charset = resp.headers.get_content_charset() or "utf-8"
@@ -2155,9 +2167,184 @@ def vimeo_extract(url: str, html: str | None = None) -> dict | None:
     return info
 
 
+_HM_POST_RE = re.compile(
+    r"""get_player_contents['"]\s*,\s*a\s*:\s*['"](\d+)['"]""")
+_HM_DATA_POST_RE = re.compile(
+    r"""id=["']dt-dl-modal["'][^>]*\bdata-post=["'](\d+)["']""", re.I)
+# The mirror tabs are `#option-5`, `#option-3`, `#option-1`, best first.
+_HM_MIRROR_RE = re.compile(r"""href=["']#option-(\d+)["']""", re.I)
+_HM_EMBED_RE = re.compile(
+    r"""<iframe\b[^>]*\bsrc=["']([^"']*[?&]dt_embed=[^"']+)["']""", re.I)
+# The embed's JW Player setup: sources: [{file,label,type},…], then tracks.
+_HM_SOURCES_RE = re.compile(r"""sources\s*:\s*(\[[^\]]*\])""", re.S)
+_HM_H1_RE = re.compile(r"""<h1[^>]*>(.*?)</h1>""", re.S | re.I)
+_HM_TITLE_RE = re.compile(r"""<title[^>]*>(.*?)</title>""", re.S | re.I)
+# Advertised mirrors can shrink; these are the ones the site has used.
+_HM_MIRRORS = (5, 3, 1)
+
+
+def hentaimama_extract(url: str, html: str | None = None) -> dict | None:
+    """hentaimama.io: post id → admin-ajax mirror → base64 embed → sources.
+
+    The episode page itself carries no media URL. Each mirror is fetched
+    lazily from `admin-ajax.php`; its iframe names a base64 path that the
+    embed page expands into a JW Player `sources` array. Mirror 5 serves
+    progressive mp4 renditions, mirror 3 an HLS master, mirror 1 RTMP (which
+    a browser cannot play). Both playable mirrors are returned, direct first.
+    """
+    if html is None:
+        page = _fetch_html(url)
+        if not page:
+            return None
+        final, html = page
+        url = final
+
+    post = None
+    for pattern in (_HM_POST_RE, _HM_DATA_POST_RE):
+        m = pattern.search(html)
+        if m:
+            post = m.group(1)
+            break
+    if not post:
+        path = urllib.parse.urlparse(url).path
+        if path.startswith(("/playlist/", "/tvshows/")):
+            raise NotAVideoPage(
+                "this is a playlist or series page — open one episode link; "
+                "a listing has no single video to play")
+        if path.startswith("/episodes/"):
+            raise RuntimeError(
+                "the episode page carried no player post id — this site's "
+                "markup changed, so the adapter needs updating")
+        return None
+
+    parsed = urllib.parse.urlparse(url)
+    origin = f"{parsed.scheme}://{parsed.netloc}"
+    mirrors: list[int] = []
+    for m in _HM_MIRROR_RE.finditer(html):
+        num = int(m.group(1))
+        if num not in mirrors:
+            mirrors.append(num)
+    for num in _HM_MIRRORS:
+        if num not in mirrors:
+            mirrors.append(num)
+
+    ajax_headers = {
+        "User-Agent": DEFAULT_UA,
+        "Referer": url,
+        "Origin": origin,
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+        "X-Requested-With": "XMLHttpRequest",
+    }
+    formats: list[dict] = []
+    seen: set[str] = set()
+    reached = 0
+    for mirror in mirrors[:6]:
+        body = _fetch_text(
+            origin + "/wp-admin/admin-ajax.php", ajax_headers,
+            data=urllib.parse.urlencode({
+                "action": "get_player_contents", "a": post, "i": str(mirror),
+            }).encode())
+        if not body:
+            continue
+        try:
+            items = json.loads(body)
+        except ValueError:
+            continue
+        if isinstance(items, list):
+            index = mirror - 1
+            raw = items[index] if 0 <= index < len(items) else ""
+            if not isinstance(raw, str):
+                raw = ""
+        else:
+            raw = body
+        embed_match = _HM_EMBED_RE.search(html_unescape(raw))
+        if not embed_match:
+            continue
+        embed = urllib.parse.urljoin(url, html_unescape(embed_match.group(1)))
+        embed_html = _fetch_text(embed, {
+            "User-Agent": DEFAULT_UA,
+            "Referer": url,
+            "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
+        })
+        if not embed_html:
+            continue
+        reached += 1
+        sources = _HM_SOURCES_RE.search(embed_html)
+        if not sources:
+            continue
+        try:
+            entries = json.loads(sources.group(1))
+        except ValueError:
+            continue
+        for src in entries if isinstance(entries, list) else []:
+            if not isinstance(src, dict):
+                continue
+            media = html_unescape(str(src.get("file") or "")).replace("\\/", "/")
+            if not media:
+                continue
+            if not media.startswith(("http://", "https://")):
+                media = urllib.parse.urljoin(embed, media)
+            if not media.startswith(("http://", "https://")):
+                continue
+            label = str(src.get("label") or "")
+            kind = str(src.get("type") or "").lower()
+            is_hls = kind == "hls" or media.split("?")[0].lower().endswith(".m3u8")
+            ext = "m3u8" if is_hls else (
+                media.split("?")[0].rsplit(".", 1)[-1].lower() or "mp4")
+            if ext not in ("m3u8", "mp4", "m4v", "webm", "mov"):
+                continue
+            height = _jvd_height(label)
+            if media in seen:
+                continue
+            seen.add(media)
+            formats.append({
+                "format_id": f"hm-{height or ('hls' if is_hls else ext)}",
+                "url": media,
+                "ext": ext,
+                "protocol": "m3u8_native" if is_hls else "https",
+                "height": height,
+                "vcodec": None,
+                "acodec": None,
+                # The CDN wants the embed as its Referer, like the site's own
+                # player sends — needsProxy then routes the bytes via us.
+                "_sniffed": True,
+                "http_headers": {"User-Agent": DEFAULT_UA, "Referer": embed},
+            })
+
+    if not formats:
+        if reached:
+            raise RuntimeError(
+                "the mirrors answered but their player had no source list — "
+                "the embed markup changed, so the adapter needs updating")
+        raise RuntimeError(
+            "the mirrors refused the request — this site wants the episode page "
+            "as the Referer; retry, or add cookies (VIEWER_COOKIES_B64)")
+
+    # Mirror 1 also serves an unlabelled mp4; once labelled renditions exist it
+    # is just another button for the same episode, so keep only the HLS fallback.
+    if any(f["ext"] != "m3u8" and f.get("height") for f in formats):
+        formats = [f for f in formats if f["ext"] == "m3u8" or f.get("height")]
+
+    formats.sort(key=lambda f: (f["protocol"] == "m3u8_native",
+                                -(f.get("height") or 0)))
+    heading = _HM_H1_RE.search(html) or _HM_TITLE_RE.search(html)
+    title = None
+    if heading:
+        title = html_unescape(re.sub(r"<[^>]+>", "", heading.group(1)))
+        title = re.sub(r"\s+", " ", title).strip()[:160] or None
+    note(f"hentaimama: resolved {len(formats)} source(s) from {reached} mirror(s)")
+    return {
+        "title": title,
+        "extractor_key": "hentaimama",
+        "formats": formats,
+        "webpage_url": url,
+    }
+
+
 # Sites whose markup needs decoding by an adapter — a player frame to walk, or
 # (hanime) an API that signs every request. One named function per host.
 _PLAYER_SITES = {"watchhentai.net": watchhentai_extract,
+                 "hentaimama.io": hentaimama_extract,
                  "sulasokvid.co": sulasokvid_extract,
                  "sulasokvids.icu": sulasokvid_extract,
                  "vimeo.com": vimeo_extract,

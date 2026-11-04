@@ -325,6 +325,76 @@ class SulaMirrors(BaseHTTPRequestHandler):
         self._bytes(b"no", "text/plain", 404)
 
 
+class Hentaimama(BaseHTTPRequestHandler):
+    """A tame hentaimama-shaped site: the episode page names a post id, each
+    mirror is loaded from admin-ajax and names a base64 embed page, and that
+    embed's JW Player setup carries the sources."""
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *a):
+        pass
+
+    def _bytes(self, body: bytes, ctype: str, status: int = 200) -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
+
+    def do_GET(self):                       # noqa: N802
+        port = self.server.server_address[1]
+        parsed = urllib.parse.urlparse(self.path)
+        if parsed.path == "/playlist/abc/ep1/":
+            body = (f"<html><head><title>Episode Page</title></head><body>"
+                    f"<h1 class='epih1'>Tame Show - Episode 1</h1>"
+                    f"<div id='dt-dl-modal' data-post='4242'></div>"
+                    f"<script>$(function(){{$.post('/wp-admin/admin-ajax.php', "
+                    f"{{action: 'get_player_contents',a: '4242',i: n}});}});"
+                    f"</script>"
+                    f'<a href="#option-5">mi-1</a><a href="#option-3">mi-2</a>'
+                    f'<a href="#option-1">mi-3</a></body></html>').encode()
+            return self._bytes(body, "text/html")
+        if parsed.path == "/playlist/abc/":
+            return self._bytes(b"<html><h1>Playlist</h1></html>", "text/html")
+        if parsed.path == "/embed":
+            kind = urllib.parse.parse_qs(parsed.query).get("dt_embed", [""])[0]
+            if kind == "hls":
+                sources = [{"file": f"http://127.0.0.1:{port}"
+                                    "/media/master.m3u8", "type": "hls"}]
+            else:
+                sources = [
+                    {"file": f"http://127.0.0.1:{port}/media/1080.mp4",
+                     "label": "1080p", "type": "mp4"},
+                    {"file": f"http://127.0.0.1:{port}/media/720.mp4",
+                     "label": "720p", "type": "mp4"},
+                ]
+            body = ("<html><script>var jwp = jwplayer('x').setup({sources: "
+                    + json.dumps(sources) +
+                    ",tracks: [{file: 'http://127.0.0.1/x.vtt'}]});"
+                    "</script></html>").encode()
+            return self._bytes(body, "text/html")
+        self._bytes(b"no", "text/plain", 404)
+
+    def do_POST(self):                      # noqa: N802
+        length = int(self.headers.get("Content-Length") or 0)
+        body = self.rfile.read(length) if length else b""
+        if self.path != "/wp-admin/admin-ajax.php":
+            return self._bytes(b"no", "text/plain", 404)
+        form = urllib.parse.parse_qs(body.decode("utf-8", "replace"))
+        port = self.server.server_address[1]
+        mirror = int((form.get("i") or ["0"])[0])
+        if form.get("a") != ["4242"]:
+            return self._bytes(b"[]", "application/json")
+        iframe = (f'<iframe src="http://127.0.0.1:{port}/embed?'
+                  f'dt_embed={"hls" if mirror == 3 else "r2-mp4"}'
+                  f'&#038;p=abc&#038;ep=4242"></iframe>')
+        # The real endpoint answers one slot per mirror, indexed by i-1.
+        items = [""] * mirror
+        items[mirror - 1] = iframe
+        self._bytes(json.dumps(items).encode(), "application/json")
+
+
 class TumblrPost(BaseHTTPRequestHandler):
     """A tumblish canonical embed: og:video names a native mp4, with its
     480p sibling available only by guessing the rendition suffix."""
@@ -1122,6 +1192,59 @@ def main() -> int:
         finally:
             mir.shutdown()
             mir.server_close()
+
+        # 10e — hentaimama: post id → admin-ajax mirror → base64 embed → JW
+        # Player sources. Mirror 5 is progressive mp4, mirror 3 is the HLS
+        # master; the listing page must say so instead of burning yt-dlp's time.
+        hm = ThreadingHTTPServer(("127.0.0.1", 0), Hentaimama)
+        hmport = hm.server_address[1]
+        threading.Thread(target=hm.serve_forever, daemon=True).start()
+        try:
+            check("hentaimama: registered as a player site",
+                  "hentaimama.io" in server._PLAYER_SITES, "")
+            try:
+                server.hentaimama_extract(
+                    f"http://127.0.0.1:{hmport}/playlist/abc/")
+                check("hentaimama: a playlist page says what it is", False,
+                      "no raise")
+            except server.NotAVideoPage:
+                check("hentaimama: a playlist page says what it is", True, "")
+            except Exception as exc:  # noqa: BLE001
+                check("hentaimama: a playlist page says what it is", False,
+                      f"wrong error: {type(exc).__name__}")
+            try:
+                got = server.hentaimama_extract(
+                    f"http://127.0.0.1:{hmport}/playlist/abc/ep1/")
+            except Exception as exc:  # noqa: BLE001
+                check("hentaimama: the episode resolves through its mirrors",
+                      False, f"{type(exc).__name__}: {str(exc)[:80]}")
+            else:
+                fmts = got.get("formats") or []
+                check("hentaimama: the episode resolves through its mirrors",
+                      got.get("title") == "Tame Show - Episode 1"
+                      and [f.get("format_id") for f in fmts] ==
+                      ["hm-1080", "hm-720", "hm-hls"],
+                      f"title={got.get('title')!r} "
+                      f"ids={[f.get('format_id') for f in fmts]}")
+                check("hentaimama: mp4 renditions keep their Referer",
+                      fmts and all(
+                          f["http_headers"]["Referer"].startswith(
+                              f"http://127.0.0.1:{hmport}/embed?") for f in fmts),
+                      fmts[0].get("http_headers", {}).get("Referer", "")
+                      if fmts else "")
+                entries = server.browsable_formats(
+                    {"id": "h", "title": "t", "url": got.get("webpage_url"),
+                     "formats": fmts})
+                check("hentaimama: the sources become playable, proxied formats",
+                      [e["kind"] for e in entries] == ["direct", "direct", "hls"]
+                      and all(e["needsProxy"] for e in entries)
+                      and entries[0]["label"].startswith("1080p")
+                      and entries[2]["ext"] == "m3u8",
+                      str([(e["kind"], e["label"], e["needsProxy"])
+                           for e in entries]))
+        finally:
+            hm.shutdown()
+            hm.server_close()
 
         # 10d1a — vimeo: the watch page wants a login, the public player
         # embed does not. The adapter rewrites, it does not re-implement.
