@@ -102,7 +102,8 @@ cross-origin host. Several layers make up the difference:
 6. **Embeds** — a site whose own player cannot be reduced to a media URL (a
    live browser challenge) is offered as its player frame instead; the server
    says `embed` in `/api/info` and the page loads it in the embedded player,
-   never in `<video>`.
+   never in `<video>`. That frame is sandboxed: it can run its own scripts,
+   but cannot navigate this page, open popups, submit forms or download files.
 
 Additional behaviour worth knowing:
 

@@ -271,6 +271,12 @@ setTimeout(async () => {
   check('a challenge-gated site player is offered as an embed',
     !embedEl.hidden && embedEl.getAttribute('src') === 'https://nhplayer.com/v/abc/'
     && video.hidden, embedEl.getAttribute('src') || '(no src)');
+  const boxSandbox = embedEl.getAttribute('sandbox') || '';
+  check('the embed frame blocks top navigation, popups, forms and downloads',
+    boxSandbox.includes('allow-scripts')
+    && boxSandbox.includes('allow-same-origin')
+    && !/allow-top-navigation|allow-popups|allow-forms|allow-downloads|allow-modals/
+        .test(boxSandbox), boxSandbox || '(no sandbox)');
 
   console.log(`\n${pass} passed, ${fail.length} failed`);
   if (fail.length) console.log('failed:', fail.join(', '));
