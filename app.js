@@ -227,12 +227,16 @@
     // The phone is the only place this fires, so a server-side copy of what it
     // saw turns "still can't play" into a one-line diagnosis. Fire-and-forget,
     // never allowed to break the error box itself (jsdom may lack fetch).
+    uiLog(msg);
+  }
+  /* One diagnostic line to the server log. Never throws, never blocks. */
+  function uiLog(msg) {
     try {
       if (typeof fetch === 'function') {
         fetch(`/api/ui-log?msg=${encodeURIComponent(String(msg).slice(0, 200))}`)
           .catch(() => {});
       }
-    } catch (_) { /* report path must never become the error */ }
+    } catch (_) { /* the report path must never become the error */ }
   }
   /* Failure with the escape hatch attached: the explanation plus a way out that
      does not depend on our extractor working. */
@@ -759,11 +763,17 @@
     // Switching quality re-applies this: drop the previous captions/poster first.
     video.querySelectorAll('track').forEach((t) => t.remove());
     video.removeAttribute('poster');
-    (meta && meta.subtitles || []).forEach((s) => addTrack(s.url, s.label));
+    const subs = (meta && meta.subtitles) || [];
+    if (subs.length) uiLog(`captions: ${subs.length} track(s)`);
 
     if (stream.kind === 'hls') {
-      return playHls(stream.proxied && stream.proxyUrl ? stream.proxyUrl : stream.url);
+      playHls(stream.proxied && stream.proxyUrl ? stream.proxyUrl : stream.url);
+      // hls.js wipes the cues of every text track while it loads its manifest
+      // and attaches its MediaSource, so captions are added after that.
+      subs.forEach((s) => addTrack(s.url, s.label));
+      return;
     }
+    subs.forEach((s) => addTrack(s.url, s.label));
     if (stream.kind === 'merge') {
       // A single stream with both tracks, remuxed on the fly by yt-dlp+ffmpeg.
       currentKind = 'native';
@@ -814,7 +824,13 @@
     track.label = label || 'Captions';
     track.srclang = 'en';
     track.src = url;
-    track.addEventListener('error', () => track.remove());
+    // A track that fails to load (a CDN refusing without the player's
+    // Referer, say) disappears; say so in the server log, or the phone shows
+    // nothing and no one knows why.
+    track.addEventListener('error', () => { track.remove(); uiLog('caption track failed'); });
+    track.addEventListener('load', () => {
+      if (captionsOn) track.track.mode = 'showing';
+    });
     video.appendChild(track);
     applyCaptionState();
   }
