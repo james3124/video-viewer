@@ -344,9 +344,10 @@ class RedirectBlocked(RuntimeError):
 class _MediaRedirectGuard(urllib.request.HTTPRedirectHandler):
     """urllib's redirect handler, confined to one operator's domain."""
 
-    def __init__(self, allowed: str):
+    def __init__(self, allowed: str, extra: tuple[str, ...] = ()):
         super().__init__()
         self.allowed = allowed
+        self.extra_domains = tuple(d.lower().rstrip(".") for d in extra if d)
         self.hops = 0
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
@@ -355,7 +356,8 @@ class _MediaRedirectGuard(urllib.request.HTTPRedirectHandler):
             raise RedirectBlocked(
                 f"the media redirected {PROXY_MAX_REDIRECTS}+ times — not following")
         hop = base_domain(urllib.parse.urlparse(newurl).hostname or "")
-        if hop != self.allowed and hop not in _REDIRECT_ALLOW_EXTRA:
+        if hop != self.allowed and hop not in _REDIRECT_ALLOW_EXTRA \
+                and hop not in self.extra_domains:
             raise RedirectBlocked(
                 f"the media tried to redirect from {self.allowed} to {hop} — refused "
                 f"(allow it with VIEWER_REDIRECT_HOSTS={hop} if that CDN is expected)")
@@ -368,13 +370,19 @@ class _MediaRedirectGuard(urllib.request.HTTPRedirectHandler):
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
-def guarded_urlopen(url: str, headers: dict, head: bool = False, timeout: float = PROXY_TIMEOUT):
-    """Open a media URL without letting its redirects leave the resolved domain."""
+def guarded_urlopen(url: str, headers: dict, head: bool = False,
+                    timeout: float = PROXY_TIMEOUT,
+                    allow_domains: tuple[str, ...] = ()):
+    """Open a media URL without letting its redirects leave the resolved domain.
+
+    `allow_domains` lets one adapter admit the CDN its own signed links hop
+    to. It is per-format, so the default guard stays deny-by-default.
+    """
     origin = urllib.parse.urlparse(url)
     # `netloc` carries the port, which base_domain would read as a label — use
     # the bare hostname so "host:8443" and "host" allow the same hops.
     opener = urllib.request.build_opener(
-        _MediaRedirectGuard(base_domain(origin.hostname or "")))
+        _MediaRedirectGuard(base_domain(origin.hostname or ""), allow_domains))
     req = urllib.request.Request(url, headers=headers, method="HEAD" if head else "GET")
     return opener.open(req, timeout=timeout)
 
@@ -2341,10 +2349,109 @@ def hentaimama_extract(url: str, html: str | None = None) -> dict | None:
     }
 
 
+_R34_URL_RE = re.compile(r"""video_url\s*:\s*['"](https?://[^'"]+)['"]""")
+_R34_ALT_RE = re.compile(r"""video_alt_url(?:2)?\s*:\s*['"](https?://[^'"]+)['"]""")
+_R34_URL_TEXT_RE = re.compile(r"""video_(?:url|alt_url(?:2)?)_text\s*:\s*['"](\d{3,4})p['"]""")
+_R34_H1_RE = re.compile(r"""<h1[^>]*class=["'][^"']*title_video[^"']*["'][^>]*>(.*?)</h1>""", re.S | re.I)
+_R34_POST_RE = re.compile(r"/video/(\d+)(?:/|$)")
+_R34_DURATION_RE = re.compile(r"""PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)""")
+
+
+def rule34video_extract(url: str, html: str | None = None) -> dict | None:
+    """rule34video.com: its player data names every signed rendition.
+
+    The page already carries `video_url` (360p), `video_alt_url` (480p) and
+    `video_alt_url2` (720p) as signed `get_file` links. yt-dlp stops at the
+    signed URLs, so the adapter returns them directly. The CDN refuses a bare
+    request, so the video page is kept as Referer and needsProxy is correct.
+    """
+    if html is None:
+        page = _fetch_html(url)
+        if not page:
+            return None
+        final, html = page
+        url = final
+
+    parsed = urllib.parse.urlparse(url)
+    if not _R34_POST_RE.search(parsed.path):
+        raise NotAVideoPage(
+            "this is not a single video page — open one /video/<id>/ link")
+
+    tier_patterns = (
+        (r"""video_url\s*:\s*['"](https?://[^'"]+)['"]""",
+         r"""video_url_text\s*:\s*['"](\d{3,4})p['"]"""),
+        (r"""video_alt_url\s*:\s*['"](https?://[^'"]+)['"]""",
+         r"""video_alt_url_text\s*:\s*['"](\d{3,4})p['"]"""),
+        (r"""video_alt_url2\s*:\s*['"](https?://[^'"]+)['"]""",
+         r"""video_alt_url2_text\s*:\s*['"](\d{3,4})p['"]"""),
+    )
+    candidates: list[tuple[int, str]] = []
+    seen: set[str] = set()
+    for url_re, label_re in tier_patterns:
+        urls = [m.group(1) for m in re.finditer(url_re, html)]
+        labels = [m.group(1) for m in re.finditer(label_re, html)]
+        for position, raw in enumerate(urls):
+            media = html_unescape(raw).replace("\\/", "/")
+            if not media.startswith(("http://", "https://")) or media in seen:
+                continue
+            label = labels[position] if position < len(labels) else ""
+            height = int(label) if label.isdigit() else None
+            if height is None:
+                height = _jvd_height(media)
+            if height is None:
+                continue
+            seen.add(media)
+            candidates.append((height, media))
+
+    if not candidates:
+        raise RuntimeError(
+            "the player data carried no signed rendition — this site's "
+            "markup changed, so the adapter needs updating")
+
+    candidates.sort(key=lambda item: -item[0])
+    formats = []
+    for height, media in candidates:
+        formats.append({
+            "format_id": f"r34-{height}",
+            "url": media,
+            "ext": "mp4",
+            "protocol": "https",
+            "height": height,
+            "vcodec": None,
+            "acodec": None,
+            "_sniffed": True,
+            "_redirect_allow": ("boomio-cdn.com",),
+            "http_headers": {"User-Agent": DEFAULT_UA, "Referer": url},
+        })
+
+    heading = _R34_H1_RE.search(html)
+    title = None
+    if heading:
+        title = html_unescape(re.sub(r"<[^>]+>", "", heading.group(1)))
+        title = re.sub(r"\s+", " ", title).strip()[:160] or None
+
+    duration = None
+    dur_match = _R34_DURATION_RE.search(html)
+    if dur_match:
+        duration = (int(dur_match.group(1) or 0) * 3600
+                    + int(dur_match.group(2) or 0) * 60
+                    + int(dur_match.group(3) or 0)) or None
+
+    note(f"rule34video: decoded {len(formats)} signed rendition(s)")
+    return {
+        "title": title,
+        "extractor_key": "rule34video",
+        "duration": duration,
+        "formats": formats,
+        "webpage_url": url,
+    }
+
+
 # Sites whose markup needs decoding by an adapter — a player frame to walk, or
 # (hanime) an API that signs every request. One named function per host.
 _PLAYER_SITES = {"watchhentai.net": watchhentai_extract,
                  "hentaimama.io": hentaimama_extract,
+                 "rule34video.com": rule34video_extract,
                  "sulasokvid.co": sulasokvid_extract,
                  "sulasokvids.icu": sulasokvid_extract,
                  "vimeo.com": vimeo_extract,
@@ -3107,6 +3214,13 @@ def browsable_formats(info: dict) -> list[dict]:
                 label = f"audio only · {ext or 'audio'}"
 
         headers = _clean_headers(f.get("http_headers"))
+
+        redirect_allow: tuple[str, ...] = ()
+        if f.get("_redirect_allow"):
+            redirect_allow = tuple(
+                str(h).strip().lower().rstrip(".")
+                for h in f.get("_redirect_allow") or () if str(h).strip())
+
         size = f.get("filesize") or f.get("filesize_approx")
 
         entry = {
@@ -3132,6 +3246,7 @@ def browsable_formats(info: dict) -> list[dict]:
             "needsProxy": True if ALWAYS_PROXY else any(
                 k.lower() != "user-agent" for k in headers),
             "headers": headers,
+            "redirectAllow": redirect_allow,
         }
         key = (entry["id"], entry["url"][:64])
         if key in seen:
@@ -3285,6 +3400,7 @@ def resolve_target(page: str, fmt: str = "", fresh: bool = False) -> dict:
     return {
         "url": chosen["url"],
         "headers": chosen.get("headers") or {},
+        "redirectAllow": chosen.get("redirectAllow") or (),
         "kind": chosen["kind"],
         "id": chosen["id"],
         "ext": chosen.get("ext"),
@@ -3368,6 +3484,7 @@ class MediaEntry:
         self.budget = 0                # bytes we are allowed to keep
         self.url = ""                  # current upstream URL (may be signed)
         self.headers: dict = {}
+        self.redirect_allow: tuple[str, ...] = ()
         self.title = ""
         self.ext = "mp4"
         self.ctype = "video/mp4"
@@ -3560,6 +3677,10 @@ def _media_attach(ent: MediaEntry | None, target: dict) -> None:
             ent.url = target["url"]
         if target.get("headers") is not None:
             ent.headers = dict(target.get("headers") or {})
+        if target.get("redirectAllow") is not None:
+            ent.redirect_allow = tuple(
+                str(h).strip().lower().rstrip(".")
+                for h in target.get("redirectAllow") or () if str(h).strip())
         if target.get("title"):
             ent.title = str(target["title"])
         if target.get("ext"):
@@ -3794,6 +3915,7 @@ def _media_fetch_chunk(ent: MediaEntry, idx: int) -> None:
         ent.inflight.add(idx)
         url = ent.url
         headers = dict(ent.headers)
+        allow_domains = tuple(ent.redirect_allow or ())
         start = idx * MEDIA_CHUNK
         end = min(ent.total, start + MEDIA_CHUNK) - 1
     headers["Range"] = f"bytes={start}-{end}"
@@ -3801,7 +3923,8 @@ def _media_fetch_chunk(ent: MediaEntry, idx: int) -> None:
     try:
         for attempt in (0, 1):
             try:
-                resp = guarded_urlopen(url, headers, timeout=PROXY_TIMEOUT)
+                resp = guarded_urlopen(url, headers, timeout=PROXY_TIMEOUT,
+                                       allow_domains=allow_domains)
                 break
             except urllib.error.HTTPError as exc:
                 if attempt or exc.code not in EXPIRY_CODES:
@@ -3815,6 +3938,12 @@ def _media_fetch_chunk(ent: MediaEntry, idx: int) -> None:
                 with ent.lock:
                     ent.url = target["url"]
                     ent.headers = dict(target.get("headers") or {})
+                    if target.get("redirectAllow") is not None:
+                        ent.redirect_allow = tuple(
+                            str(h).strip().lower().rstrip(".")
+                            for h in target.get("redirectAllow") or ()
+                            if str(h).strip())
+                    allow_domains = tuple(ent.redirect_allow or ())
                     ent.stale_since = None
                     url = ent.url
                     headers = {**ent.headers,
@@ -4887,6 +5016,10 @@ class Handler(BaseHTTPRequestHandler):
         with ent.lock:
             ent.url = target["url"]
             ent.headers = dict(target.get("headers") or {})
+            if target.get("redirectAllow") is not None:
+                ent.redirect_allow = tuple(
+                    str(h).strip().lower().rstrip(".")
+                    for h in target.get("redirectAllow") or () if str(h).strip())
             ent.stale_since = None
         _media_start_filler(ent)
         self._send_json({"ok": True, "refreshed": True, "url": target["url"]})
@@ -4911,7 +5044,8 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 self._proxy(target["url"], target.get("headers") or {}, head=head,
                             reject_html=reject_html, disposition=disposition,
-                            media=media)
+                            media=media,
+                            redirect_allow=tuple(target.get("redirectAllow") or ()) )
                 return
             except Expired:
                 if (attempt or not allow_refresh or ytdlp_mode() == "none"
@@ -4926,7 +5060,8 @@ class Handler(BaseHTTPRequestHandler):
                     # Keep the cache entry on the fresh link, not the dead one.
                     _media_attach(media, retried)
 
-    def _open_upstream(self, url: str, headers: dict, head: bool = False):
+    def _open_upstream(self, url: str, headers: dict, head: bool = False,
+                       redirect_allow: tuple[str, ...] = ()):
         merged = {"User-Agent": DEFAULT_UA, "Accept": "*/*", "Accept-Encoding": "identity"}
         for k, v in (headers or {}).items():
             if not k or v is None or k.lower() in HEADER_BLOCKLIST:
@@ -4935,11 +5070,12 @@ class Handler(BaseHTTPRequestHandler):
         rng = self.headers.get("Range")
         if rng:
             merged["Range"] = rng
-        return guarded_urlopen(url, merged, head=head, timeout=PROXY_TIMEOUT)
+        return guarded_urlopen(url, merged, head=head, timeout=PROXY_TIMEOUT,
+                               allow_domains=redirect_allow)
 
     def _proxy(self, url: str, headers: dict, head: bool = False,
                reject_html: bool = False, disposition: str | None = None,
-               media=None) -> None:
+               media=None, redirect_allow: tuple[str, ...] = ()) -> None:
         if media is not None:
             # A player request is in flight: park the prefetcher so the two do
             # not compete for the same upstream link or the LAN.
@@ -4954,7 +5090,7 @@ class Handler(BaseHTTPRequestHandler):
                         media.playhead = media.duration * (media.anchor / media.total)
                         media.has_position = True
         try:
-            resp = self._open_upstream(url, headers, head)
+            resp = self._open_upstream(url, headers, head, redirect_allow)
         except urllib.error.HTTPError as exc:
             code = exc.code
             try:
@@ -5319,7 +5455,8 @@ class Handler(BaseHTTPRequestHandler):
             if target and target.get("kind") == "hls":
                 try:
                     with guarded_urlopen(target["url"], target.get("headers") or {},
-                                         head=False, timeout=15):
+                                         head=False, timeout=15,
+                                         allow_domains=tuple(target.get("redirectAllow") or ())):
                         pass                        # token alive — nothing to read
                 except urllib.error.HTTPError as exc:
                     if exc.code in EXPIRY_CODES:

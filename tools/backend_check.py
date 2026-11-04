@@ -395,6 +395,42 @@ class Hentaimama(BaseHTTPRequestHandler):
         self._bytes(json.dumps(items).encode(), "application/json")
 
 
+class Rule34Video(BaseHTTPRequestHandler):
+    """A tame rule34video-shaped page: the player block names three signed
+    get_file renditions. The CDN hop itself is tested separately at the
+    redirect-guard level."""
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *a):
+        pass
+
+    def _bytes(self, body: bytes, ctype: str, status: int = 200) -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
+
+    def do_GET(self):                       # noqa: N802
+        port = self.server.server_address[1]
+        parsed = urllib.parse.urlparse(self.path)
+        if parsed.path == "/video/4710544/ghislaine-hot-sex2/":
+            body = (f"<html><head><title>Fixture</title></head><body>"
+                    f"<h1 class='title_video'>Tame Clip</h1>"
+                    f"<script>var playerData={{"
+                    f"video_url: 'http://127.0.0.1:{port}/get_file/4710544_360.mp4/?v-acctoken=a',"
+                    f"postfix: '_360.mp4',video_url_text: '360p',"
+                    f"video_alt_url: 'http://127.0.0.1:{port}/get_file/4710544_480p.mp4/?v-acctoken=b',"
+                    f"video_alt_url_text: '480p',"
+                    f"video_alt_url2: 'http://127.0.0.1:{port}/get_file/4710544_720p.mp4/?v-acctoken=c',"
+                    f"video_alt_url2_text: '720p',"
+                    "duration: \"PT0H2M43S\"}};</script>"
+                    "</body></html>").encode()
+            return self._bytes(body, "text/html")
+        self._bytes(b"no", "text/plain", 404)
+
+
 class TumblrPost(BaseHTTPRequestHandler):
     """A tumblish canonical embed: og:video names a native mp4, with its
     480p sibling available only by guessing the rendition suffix."""
@@ -1245,6 +1281,36 @@ def main() -> int:
         finally:
             hm.shutdown()
             hm.server_close()
+
+        # 10e1 — rule34video: the signed rendition tiers are already in the
+        # player data; yt-dlp stops at them. The adapter publishes them and
+        # names the CDN hop it expects, so the media guard stays deny-by-default.
+        r34 = ThreadingHTTPServer(("127.0.0.1", 0), Rule34Video)
+        r34port = r34.server_address[1]
+        threading.Thread(target=r34.serve_forever, daemon=True).start()
+        try:
+            got = server.rule34video_extract(
+                f"http://127.0.0.1:{r34port}/video/4710544/ghislaine-hot-sex2/")
+            fmts = got.get("formats") or []
+            check("rule34video: signed renditions resolve in quality order",
+                  got.get("title") == "Tame Clip"
+                  and got.get("duration") == 163
+                  and [f.get("format_id") for f in fmts] ==
+                  ["r34-720", "r34-480", "r34-360"]
+                  and all(f.get("_redirect_allow") ==
+                          ("boomio-cdn.com",) for f in fmts),
+                  f"ids={[f.get('format_id') for f in fmts]} "
+                  f"dur={got.get('duration')}")
+            entries = server.browsable_formats(
+                {"id": "r", "title": "t", "url": got.get("webpage_url"),
+                 "formats": fmts})
+            check("rule34video: browseable formats stay proxied",
+                  [e["id"] for e in entries] == ["r34-720", "r34-480", "r34-360"]
+                  and all(e["needsProxy"] for e in entries),
+                  str([(e["id"], e.get("redirectAllow")) for e in entries]))
+        finally:
+            r34.shutdown()
+            r34.server_close()
 
         # 10d1a — vimeo: the watch page wants a login, the public player
         # embed does not. The adapter rewrites, it does not re-implement.

@@ -126,6 +126,7 @@ adapter per site rather than guessing at page shapes:
 | `hanime.tv` | Runs the player's signed handshake: executes the site's WebAssembly signer in wasmtime, seals `{timestamp, directive, slug}` with the site's key, POSTs it to `auth.hanime.tv/api/v11/handshake`, then reads the per-resolution HLS sources. |
 | `watchhentai.net` | Follows the player frame and runs its client-side decoder (`whDecodeMediaUrl`) to recover per-quality MP4 URLs. |
 | `hentaimama.io` | Reads the episode's post id, asks `admin-ajax.php` for each mirror, expands the base64 embed and returns its MP4 renditions plus the HLS master. |
+| `rule34video.com` | Reads the player data's signed `video_url` tiers (720p/480p/360p), keeps the video page as Referer, and admits only `boomio-cdn.com` for the signed CDN hop. |
 | `sulasokvid.co` | Replays the site's `watch.php` → `video.php` → embed → `POST /api/stream` flow, skipping the ad redirect and intro gate. |
 | `sulasokvids.icu` | Same flow, walking every advertised mirror until one yields a stream. |
 | `vimeo.com` | Rewrites the watch page to `player.vimeo.com/video/<id>`, which still serves formats anonymously. |
