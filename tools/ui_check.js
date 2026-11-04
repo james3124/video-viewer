@@ -263,6 +263,15 @@ setTimeout(async () => {
   $('ctlFull').dispatchEvent(new window.MouseEvent('click', { bubbles: true }));
   check('fullscreen falls back to iOS webkitEnterFullscreen', iosFull === 1, String(iosFull));
 
+  // A site whose own player cannot be reduced to a media URL (hentaimama.tv
+  // runs a live browser challenge) must become an embed, never a page URL
+  // handed to <video>. Last, because it parks the player in embed mode.
+  window.__viewerTest.applyResolved({ embed: 'https://nhplayer.com/v/abc/' });
+  const embedEl = $('embed');
+  check('a challenge-gated site player is offered as an embed',
+    !embedEl.hidden && embedEl.getAttribute('src') === 'https://nhplayer.com/v/abc/'
+    && video.hidden, embedEl.getAttribute('src') || '(no src)');
+
   console.log(`\n${pass} passed, ${fail.length} failed`);
   if (fail.length) console.log('failed:', fail.join(', '));
   process.exit(fail.length ? 1 : 0);

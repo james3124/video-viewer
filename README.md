@@ -99,6 +99,10 @@ cross-origin host. Several layers make up the difference:
 5. **Fallbacks** — when extraction fails, the error box offers the original page
    in a new tab (`rel="noopener noreferrer"`) and a prefilled **Submit a report**
    draft. Nothing is published without the user pressing GitHub's submit button.
+6. **Embeds** — a site whose own player cannot be reduced to a media URL (a
+   live browser challenge) is offered as its player frame instead; the server
+   says `embed` in `/api/info` and the page loads it in the embedded player,
+   never in `<video>`.
 
 Additional behaviour worth knowing:
 
@@ -126,6 +130,7 @@ adapter per site rather than guessing at page shapes:
 | `hanime.tv` | Runs the player's signed handshake: executes the site's WebAssembly signer in wasmtime, seals `{timestamp, directive, slug}` with the site's key, POSTs it to `auth.hanime.tv/api/v11/handshake`, then reads the per-resolution HLS sources. |
 | `watchhentai.net` | Follows the player frame and runs its client-side decoder (`whDecodeMediaUrl`) to recover per-quality MP4 URLs. |
 | `hentaimama.io` | Reads the episode's post id, asks `admin-ajax.php` for each mirror, expands the base64 embed and returns its MP4 renditions plus the HLS master. |
+| `hentaimama.tv` | The stream is minted by the site's own player after a live proof-of-work/fingerprint challenge, which this server will not forge. The adapter hands the episode's `nhplayer.com/v/…` frame to the browser as an embed instead, exactly as the site's page does. |
 | `rule34video.com` | Reads the player data's signed `video_url` tiers (720p/480p/360p), keeps the video page as Referer, and admits only `boomio-cdn.com` for the signed CDN hop. |
 | `sulasokvid.co` | Replays the site's `watch.php` → `video.php` → embed → `POST /api/stream` flow, skipping the ad redirect and intro gate. |
 | `sulasokvids.icu` | Same flow, walking every advertised mirror until one yields a stream. |

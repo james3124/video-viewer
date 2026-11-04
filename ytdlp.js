@@ -182,6 +182,13 @@
       showBadNews(pageUrl, data.reason || 'yt-dlp could not extract anything playable.');
       return null;
     }
+    if (data && data.embed) {
+      // The site's own player cannot be reduced to a media URL (it wants a
+      // live browser challenge), but its frame is embeddable and works in the
+      // embedded <iframe> exactly as it does on the site's page.
+      state.lastInfo = data;
+      return { embed: data.embed, meta: { title: data.title, formatId: '' } };
+    }
     if (!data || !data.formats || !data.formats.length) {
       window.ViewerLastFailure =
         'The backend answered but offered no playable format for this link.';

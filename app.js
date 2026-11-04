@@ -32,7 +32,7 @@
    * ------------------------------------------------------------------ */
   const DIRECT_RE = /\.(mp4|m4v|webm|ogv|ogg|mov|mkv|avi|mpeg|mpg|ts|mp3|m4a|aac|wav|flac)(\?|#|$)/i;
   const HLS_RE    = /\.(m3u8)(\?|#|$)/i;
-  const EMBED_RE  = /^https?:\/\/(?:www\.|m\.)?(youtube\.com\/(?:watch\?v=|embed\/|live\/|shorts\/)|youtu\.be\/|youtube-nocookie\.com\/(?:watch\?v=|embed\/)|vimeo\.com\/(?:video\/)?|player\.vimeo\.com\/video\/|dailymotion\.com\/video\/|dai\.ly\/|tiktok\.com\/)/i;
+  const EMBED_RE  = /^https?:\/\/(?:www\.|m\.)?(youtube\.com\/(?:watch\?v=|embed\/|live\/|shorts\/)|youtu\.be\/|youtube-nocookie\.com\/(?:watch\?v=|embed\/)|vimeo\.com\/(?:video\/)?|player\.vimeo\.com\/video\/|dailymotion\.com\/video\/|dai\.ly\/|tiktok\.com\/|nhplayer\.com\/v\/)/i;
 
   const kindOf = (url) => {
     if (!url) return 'native';
@@ -741,10 +741,11 @@
     hideControls();                 // the iframe brings its own controls
     setDocumentTitle('Embed — ' + prettyName(src));
     clearError();
-    status('Embedded player · start server.py for the direct yt-dlp stream');
+    status('Embedded player — the site plays it in its own frame');
   }
 
   function playResolved(resolved) {
+    if (resolved.embed) return playEmbed(resolved.embed);
     const { stream, meta } = resolved;
     const title = (meta && meta.title) || prettyName(currentUrl);
     currentFmtId = (meta && meta.formatId) || '';
@@ -1157,7 +1158,7 @@
   /* Exposed for the DOM test: the report path is async and the button does not
      hand back its promise. */
   window.__viewerTest = Object.assign(window.__viewerTest || {},
-    { submitReport, fallbackReport });
+    { submitReport, fallbackReport, applyResolved: playResolved });
 
   /* ------------------------------------------------------------------ *
    *  Boot: ?url=… / #url=…, with or without backend

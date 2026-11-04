@@ -395,6 +395,38 @@ class Hentaimama(BaseHTTPRequestHandler):
         self._bytes(json.dumps(items).encode(), "application/json")
 
 
+class HentaimamaTv(BaseHTTPRequestHandler):
+    """A tame hentaimama.tv-shaped site: the episode page frames the site's
+    own player, whose stream URL only a live browser challenge can mint."""
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *a):
+        pass
+
+    def _bytes(self, body: bytes, ctype: str, status: int = 200) -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
+
+    def do_GET(self):                       # noqa: N802
+        parsed = urllib.parse.urlparse(self.path)
+        if parsed.path == "/succubus-yondara-gibo-ga-kita-episode-2/":
+            body = ("<html><head><title>Episode - hentaimama</title></head>"
+                    "<body><h1 class='text-whitegray'>Tame Show! Episode 2</h1>"
+                    '<div class="aspect-w-16 aspect-h-9">'
+                    '<iframe width="1280" height="672" '
+                    'src="https://nhplayer.com/v/gY8v9AwDhorebIz/" '
+                    'frameborder="0" allowfullscreen></iframe></div>'
+                    "</body></html>").encode()
+            return self._bytes(body, "text/html")
+        if parsed.path == "/serie/abc/":
+            return self._bytes(b"<html><h1>Series</h1></html>", "text/html")
+        self._bytes(b"no", "text/plain", 404)
+
+
 class Rule34Video(BaseHTTPRequestHandler):
     """A tame rule34video-shaped page: the player block names three signed
     get_file renditions. The CDN hop itself is tested separately at the
@@ -1359,7 +1391,44 @@ def main() -> int:
             hm.shutdown()
             hm.server_close()
 
-        # 10e1 — rule34video: the signed rendition tiers are already in the
+        # 10e1 — hentaimama.tv: the episode frames the site's own player, whose
+        # signed URL is minted by a live browser challenge. The adapter must
+        # not forge that: it hands the frame over as an embed instead.
+        hmtv = ThreadingHTTPServer(("127.0.0.1", 0), HentaimamaTv)
+        hmtvport = hmtv.server_address[1]
+        threading.Thread(target=hmtv.serve_forever, daemon=True).start()
+        try:
+            check("hentaimama.tv: registered as a player site",
+                  "hentaimama.tv" in server._PLAYER_SITES, "")
+            try:
+                server.hentaimama_tv_extract(
+                    f"http://127.0.0.1:{hmtvport}/serie/abc/")
+                check("hentaimama.tv: a series page says what it is", False,
+                      "no raise")
+            except server.NotAVideoPage:
+                check("hentaimama.tv: a series page says what it is", True, "")
+            except Exception as exc:  # noqa: BLE001
+                check("hentaimama.tv: a series page says what it is", False,
+                      f"wrong error: {type(exc).__name__}")
+            try:
+                got = server.hentaimama_tv_extract(
+                    f"http://127.0.0.1:{hmtvport}"
+                    "/succubus-yondara-gibo-ga-kita-episode-2/")
+            except Exception as exc:  # noqa: BLE001
+                check("hentaimama.tv: the episode offers the site player",
+                      False, f"{type(exc).__name__}: {str(exc)[:80]}")
+            else:
+                check("hentaimama.tv: the episode offers the site player",
+                      got.get("title") == "Tame Show! Episode 2"
+                      and got.get("embed") ==
+                      "https://nhplayer.com/v/gY8v9AwDhorebIz/"
+                      and got.get("formats") == [],
+                      f"title={got.get('title')!r} embed={got.get('embed')!r}")
+        finally:
+            hmtv.shutdown()
+            hmtv.server_close()
+
+        # 10e2 — rule34video: the signed rendition tiers are already in the
         # player data; yt-dlp stops at them. The adapter publishes them and
         # names the CDN hop it expects, so the media guard stays deny-by-default.
         r34 = ThreadingHTTPServer(("127.0.0.1", 0), Rule34Video)

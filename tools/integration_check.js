@@ -18,6 +18,9 @@ const read = (f) => fs.readFileSync(path.join(ROOT, f), 'utf8');
 const BASE = process.env.VIEWER_BASE || 'http://127.0.0.1:8080';
 const TARGET = process.argv[2]
   || 'https://watchhentai.net/videos/kotowarenai-haha-episode-2-id-01/';
+// A site whose own player runs a live browser challenge: its stream cannot be
+// a URL we mint, so the resolver must hand over the embeddable frame instead.
+const EMBED_TARGET = 'https://hentaimama.tv/succubus-yondara-gibo-ga-kita-episode-2/';
 
 let pass = 0;
 const fail = [];
@@ -196,7 +199,23 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
       'no always-proxy toggle in the panel');
   }
 
+  // A challenge-gated site (hentaimama.tv) is not a media URL at all. The
+  // resolver hands over the site's own player frame; <video> must stay out of
+  // it, and the frame must never point at the page.
   window.fetch = realFetch;
+  seen.length = 0;
+  await window.ViewerPlay(EMBED_TARGET);
+  const embedDeadline = Date.now() + 60000;
+  while (Date.now() < embedDeadline) {
+    if ($('embed').getAttribute('src') || window.ViewerLastFailure) break;
+    await sleep(500);
+  }
+  await sleep(300);
+  const embedSrc = $('embed').getAttribute('src') || '';
+  check('a challenge-gated site becomes its own player embed',
+    /^https:\/\/nhplayer\.com\/v\/[\w-]+\/$/.test(embedSrc)
+    && $('embed').hidden === false && $('video').hidden === true,
+    embedSrc || ($('errors').textContent || '(no embed)').slice(0, 70));
 
   console.log(`\n${pass} passed, ${fail.length} failed`);
   if (fail.length) {

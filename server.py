@@ -2358,6 +2358,57 @@ def hentaimama_extract(url: str, html: str | None = None) -> dict | None:
     }
 
 
+_HMTV_EMBED_RE = re.compile(
+    r"""<iframe\b[^>]*\bsrc=["'](https?://(?:www\.)?nhplayer\.com/v/[^"']+)["']""",
+    re.I)
+
+
+def hentaimama_tv_extract(url: str, html: str | None = None) -> dict | None:
+    """hentaimama.tv: the player is challenge-gated, so embed the site's own.
+
+    The episode page frames `nhplayer.com/v/<code>/`, which lists one server
+    whose `player.php?vid=…` page carries no media URL at all. A script there
+    calls `get-video-url-v2.php` with a proof-of-work, per-request DOM
+    challenge parts and a behavioural fingerprint, and the signed URL is only
+    returned to that live browser session. That is an anti-bot gate — decoding
+    it from here would mean forging the challenge, which this server does not
+    do. The honest alternative is the same thing the episode page does: hand
+    the player frame to the browser as an embed and let it run there.
+    """
+    if html is None:
+        page = _fetch_html(url)
+        if not page:
+            return None
+        url, html = page
+
+    embed_match = _HMTV_EMBED_RE.search(html)
+    if not embed_match:
+        path = urllib.parse.urlparse(url).path
+        if path.startswith(("/serie/", "/genre/", "/genres/", "/tag/",
+                            "/brand/", "/page/")):
+            raise NotAVideoPage(
+                "this is a series or listing page — open one episode link; "
+                "a listing has no single video to play")
+        return None
+
+    embed = html_unescape(embed_match.group(1))
+    note("hentaimama.tv: the stream is behind the site's own browser "
+         "challenge — offering its player as an embed")
+
+    heading = _HM_H1_RE.search(html) or _HM_TITLE_RE.search(html)
+    title = None
+    if heading:
+        title = html_unescape(re.sub(r"<[^>]+>", "", heading.group(1)))
+        title = re.sub(r"\s+", " ", title).strip()[:160] or None
+    return {
+        "title": title,
+        "extractor_key": "hentaimama-tv",
+        "embed": embed,
+        "formats": [],
+        "webpage_url": url,
+    }
+
+
 _R34_URL_RE = re.compile(r"""video_url\s*:\s*['"](https?://[^'"]+)['"]""")
 _R34_ALT_RE = re.compile(r"""video_alt_url(?:2)?\s*:\s*['"](https?://[^'"]+)['"]""")
 _R34_URL_TEXT_RE = re.compile(r"""video_(?:url|alt_url(?:2)?)_text\s*:\s*['"](\d{3,4})p['"]""")
@@ -2460,6 +2511,7 @@ def rule34video_extract(url: str, html: str | None = None) -> dict | None:
 # (hanime) an API that signs every request. One named function per host.
 _PLAYER_SITES = {"watchhentai.net": watchhentai_extract,
                  "hentaimama.io": hentaimama_extract,
+                 "hentaimama.tv": hentaimama_tv_extract,
                  "rule34video.com": rule34video_extract,
                  "sulasokvid.co": sulasokvid_extract,
                  "sulasokvids.icu": sulasokvid_extract,
@@ -4783,7 +4835,8 @@ class Handler(BaseHTTPRequestHandler):
                         f["cacheBudget"] = ent.budget
 
         payload = {
-            "ok": True, "url": url, "extractable": bool(fmts),
+            "ok": True, "url": url,
+            "extractable": bool(fmts) or bool(info.get("embed")),
             "title": info.get("title"),
             "description": (info.get("description") or "")[:600],
             "duration": info.get("duration"),
@@ -4791,6 +4844,10 @@ class Handler(BaseHTTPRequestHandler):
             "uploader": info.get("uploader") or info.get("channel"),
             "extractor": info.get("extractor_key") or info.get("extractor"),
             "isLive": bool(info.get("is_live")),
+            # A site whose own player cannot be reduced to a media URL (a live
+            # browser challenge) can still be watched in the embedded player
+            # frame: the site's own page embeds it too.
+            "embed": info.get("embed"),
             "formats": fmts,
             "autoFormatId": chosen["id"] if chosen else None,
             "subtitles": subtitle_tracks(info),
