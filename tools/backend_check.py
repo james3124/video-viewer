@@ -1262,6 +1262,9 @@ def main() -> int:
               sorted(f["height"] for f in muxed) == [360, 720]
               and all(f["hasAudio"] and f["hasVideo"] for f in muxed),
               str([(f["id"], f["height"]) for f in muxed]))
+        check("hls split: the mux entry always goes through the proxy",
+              bool(muxed) and all(f["needsProxy"] for f in muxed),
+              str([(f["id"], f["needsProxy"]) for f in muxed]))
         pick = server.best_format(split)
         check("hls split: the default is the one with sound",
               pick is not None and pick.get("hasAudio") is True

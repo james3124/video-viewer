@@ -769,6 +769,9 @@
 
     if (stream.kind === 'hls') {
       playHls(stream.proxied && stream.proxyUrl ? stream.proxyUrl : stream.url);
+      // playHls names the stream after its URL (which, proxied, is just
+      // "hls"); a resolved link already knows better.
+      setDocumentTitle(title + ' — Viewer');
       // hls.js wipes the cues of every text track while it loads its manifest
       // and attaches its MediaSource, so captions are added after that.
       subs.forEach((s) => addTrack(s.url, s.label));

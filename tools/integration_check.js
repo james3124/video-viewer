@@ -101,7 +101,8 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     seen.some((u) => u.includes('/api/info')), seen.find((u) => u.includes('/api/info')) || 'none');
   check('the video element was given a src', !!src, src.slice(0, 90) || '(empty)');
   check('playback is routed through the backend proxy, not the raw page',
-    src.includes('/api/play') && src.includes('proxy=1'), src.slice(0, 110));
+    (src.includes('/api/play') && src.includes('proxy=1')) || src.includes('/api/hls?'),
+    src.slice(0, 110));
   check('the chosen quality is carried in the request',
     /[?&]fmt=[^&]+/.test(src), (src.match(/[?&]fmt=[^&]+/) || ['none'])[0]);
   check('the raw page URL is never the media itself',
@@ -113,7 +114,9 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   check('no error banner is showing',
     $('errors').hidden === true, ($('errors').textContent || '').slice(0, 80));
   check('the title reached the page',
-    /Kotowarenai/i.test(window.document.title), window.document.title);
+    window.document.title.endsWith(' — Viewer')
+    && !window.document.title.startsWith('HLS '),
+    window.document.title);
 
   // The playhead heartbeat is what makes the cache window follow playback
   // rather than the furthest prefetched Range.

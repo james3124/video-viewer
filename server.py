@@ -3544,6 +3544,11 @@ def hls_audio_mux(fmts: list[dict]) -> list[dict]:
             "muxAudio": a["url"],
             "muxAudioId": a["id"],
             "muxVideoId": v["id"],
+            # The URL alone is video-only; only /api/hls turns this entry into
+            # a master with the audio group. Playing it directly is silent, so
+            # the format must always go through the proxy.
+            "_force_proxy": True,
+            "needsProxy": True,
         }))
     return extra + fmts
 
@@ -3680,7 +3685,10 @@ def browsable_formats(info: dict) -> list[dict]:
             # Anything beyond a plain UA has to be re-fetched by us: <video> and
             # hls.js cannot attach Referer/Cookie cross-origin. That single flag
             # is what makes header-protected (18+, TikTok, …) links playable.
-            "needsProxy": True if ALWAYS_PROXY else any(
+            # A synthetic format (the HLS video+audio mux) is always proxied:
+            # its `url` is only half the stream, and /api/hls is what builds
+            # the real master from it.
+            "needsProxy": True if (ALWAYS_PROXY or f.get("_force_proxy")) else any(
                 k.lower() != "user-agent" for k in headers),
             "headers": headers,
             "redirectAllow": redirect_allow,
