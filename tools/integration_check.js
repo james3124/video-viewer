@@ -21,6 +21,8 @@ const TARGET = process.argv[2]
 // A site whose own player runs a live browser challenge: its stream cannot be
 // a URL we mint, so the resolver must hand over the embeddable frame instead.
 const EMBED_TARGET = 'https://hentaimama.tv/succubus-yondara-gibo-ga-kita-episode-2/';
+// A site whose adapter also decodes caption tracks (zokoanime player blob).
+const CAPTION_TARGET = 'https://hianimes.se/watch/primal-episode-2-ep-2-stbn3i-ig7iq';
 
 let pass = 0;
 const fail = [];
@@ -216,6 +218,22 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     /^https:\/\/nhplayer\.com\/(?:v\/[\w-]+\/|player\.php\?vid=)/.test(embedSrc)
     && $('embed').hidden === false && $('video').hidden === true,
     embedSrc || ($('errors').textContent || '(no embed)').slice(0, 70));
+
+  // A site whose subtitles the adapter decodes (hianimes): the client must add
+  // the caption track, and captions default to showing.
+  seen.length = 0;
+  await window.ViewerPlay(CAPTION_TARGET);
+  const capDeadline = Date.now() + 90000;
+  while (Date.now() < capDeadline) {
+    if ($('video').querySelector('track') || window.ViewerLastFailure) break;
+    await sleep(500);
+  }
+  await sleep(300);
+  const capTrack = $('video').querySelector('track');
+  const capSrc = capTrack ? (capTrack.getAttribute('src') || '') : '';
+  check('a decoded caption track reaches the player',
+    !!capTrack && capSrc.includes('/api/subsrc') && capSrc.includes('lang=en'),
+    capSrc || ($('errors').textContent || '(no track)').slice(0, 70));
 
   console.log(`\n${pass} passed, ${fail.length} failed`);
   if (fail.length) {
