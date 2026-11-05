@@ -1,0 +1,46 @@
+# Live sample URLs for tools/adapter_check.py — one real video page per host.
+# The checker calls each adapter DIRECTLY (no yt-dlp fallback), so a sample
+# must be a single-video page in that host's shape:
+#   host<TAB/space>url        (# lines are comments)
+#
+# When a video disappears, flip the status to SKIP by commenting the line out —
+# checker SKIP never fails CI. Replace TODO-SAMPLE hosts below with one live
+# video URL each; every PASS needs a real one.
+#
+# Verified live 2026-11-05 (adapter returned formats / embed): watchhentai,
+# hentaimama.io, hentaimama.tv, rule34video, sulasokvid(.co/.icu), beeg,
+# vimeo, tumblr, hanime, gogoanime.fi.
+
+watchhentai.net	https://watchhentai.net/videos/muramata-san-no-aijou-episode-2/
+hentaimama.io	https://hentaimama.io/playlist/e0g6eyrigmgk36mt/tonari-no-ie-no-anette-san-animation-episode-1/
+hentaimama.tv	https://hentaimama.tv/otogibanashi-no-onigokko-episode-2/
+rule34video.com	https://rule34video.com/video/4713892/furina-tkm-tsu/
+sulasokvid.co	https://sulasokvid.co/watch.php?id=r4a0zdv5g2gg
+sulasokvids.icu	https://sulasokvids.icu/watch.php?id=r4a0zdv5g2gg
+beeg.com	https://beeg.com/-0452246185949825
+vimeo.com	https://vimeo.com/76979871
+tumblr.com	https://www.tumblr.com/maskofthedragon/626907179849564160
+hanime.tv	https://hanime.tv/videos/hentai/tennen-koi-iro-alcohol-2
+gogoanime.fi	https://gogoanime.fi/the-iceblade-sorcerer-shall-rule-the-world-ii-episode-5-english-subbed/
+
+# TODO-SAMPLE — paste one live single-video URL per host here (uncomment):
+#
+# blogger.com        https://www.blogger.com/video.g?token=<paste-a-real-one>
+#   Harvest: run `adapter_check.py --only gogoanime.fi` and copy the embed URL
+#   it prints — if it is a blogvideo.g link, that IS the blogger sample.
+#   backend_check.py already covers this adapter against a mock, so a TODO
+#   here never hides a regression there.
+# gogoanime3.co      https://gogoanime3.co/<an-episode-page-from-that-mirror>
+#   The .fi sample does NOT resolve there (different catalog).
+# hianimes.se        https://hianimes.se/watch/<slug>?ep=1
+#   Catalog is JS-rendered; open the site, pick a current episode, paste it.
+# zokoanime.video    https://zokoanime.video/watch/<slug>?ep=1
+#   Shares hianimes_extract; use a live zokoanime episode URL.
+# kisskh.co          https://kisskh.co/Drama/Watch?id=<id>&ep=<n>
+#   The episode API refused datacenter IPs on 2026-11-05, so CI will likely
+#   report BLOCKED (not BROKEN) — that classification is the point.
+# t.kisskh.id        https://t.kisskh.id/<shortlink-code>
+#   The shortlink redirects once to the canonical kisskh.co URL above.
+# javhdporn.net      https://www.javhdporn.net/video/<live-slug>/
+#   Homepage bot-blocks datacenter IPs (403); expect BLOCKED in CI until run
+#   from a residential/VPS IP. The adapter itself is covered by backend_check.

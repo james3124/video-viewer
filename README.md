@@ -155,6 +155,30 @@ None of them touch a login or paywall: each one runs the same public code a
 visitor's browser would, just faster. `cryptography` and `wasmtime` are only
 needed by the hanime adapter.
 
+### Adapter health checks
+
+`.github/workflows/adapter-check.yml` runs `tools/adapter_check.py` on every
+push touching `server.py`, on a daily schedule, and on demand (Actions →
+adapter-check → Run workflow lets you check one host, or use `--strict` to
+fail on BLOCKED/SKIP too). Each job calls **only the adapter** — no yt-dlp, no
+sniff, no universal fallback — against the live sample in
+`tools/adapter_urls.txt`, and the offline job runs `backend_check.py` against
+local mock hosts first. The result is classified so a datacenter-IP bot block
+is never blamed on the code: `BLOCKED` (bot/geo/login/cookies) and `SKIP`
+(missing or stale sample) don't fail the run; only `BROKEN` (the adapter read
+the page but its markup/API guess went stale) does. The host list is generated
+from `_PLAYER_SITES` in `server.py`, so adding a host there adds it to CI
+automatically. To confirm a TODO-SAMPLE host (blogger, gogoanime3, hianimes,
+zokoanime, kisskh, javhdporn), paste one live single-video URL into
+`tools/adapter_urls.txt` — when a sample video disappears, flip its line to a
+comment so CI never goes red from a dead sample.
+
+```bash
+python3 tools/adapter_check.py              # every adapter host, live
+python3 tools/adapter_check.py --only hanime.tv   # one host
+python3 tools/adapter_check.py --self-test  # offline decoder round-trips
+```
+
 ### Universal fallback
 
 When yt-dlp and the explicit adapters fail, `universal.py` runs pattern probes

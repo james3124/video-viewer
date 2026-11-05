@@ -1,0 +1,175 @@
+name: adapter-check
+
+# Live + offline health check for the site adapters in server.py
+# (tools/adapter_check.py). Adapters ONLY — the checker never calls yt-dlp,
+# so a red run means an adapter's markup/API guess went stale, not yt-dlp.
+#
+#   offline  backend_check.py + wsgi_check.py over local mock hosts (no net)
+#   live     one job per _PLAYER_SITES host, adapter called directly
+#            against the sample in tools/adapter_urls.txt
+#   summary  aggregates PASS / BLOCKED / SKIP / BROKEN into one table
+#
+# BLOCKED (bot check, geo/login, datacenter IP) never fails the run — that is
+# the README "Known limits", not a code bug. Only BROKEN (or UNKNOWN) fails.
+
+on:
+  push:
+    paths:
+      - "server.py"
+      - "universal.py"
+      - "tools/adapter_check.py"
+      - "tools/adapter_urls.txt"
+      - "tools/backend_check.py"
+      - ".github/workflows/adapter-check.yml"
+  pull_request:
+    paths:
+      - "server.py"
+      - "universal.py"
+      - "tools/adapter_check.py"
+      - "tools/adapter_urls.txt"
+      - "tools/backend_check.py"
+      - ".github/workflows/adapter-check.yml"
+  schedule:
+    # Daily, 07:00 UTC — catches site-side drift between releases.
+    - cron: "0 7 * * *"
+  workflow_dispatch:
+    inputs:
+      host:
+        description: "Single host to check (blank = every adapter host)"
+        required: false
+        type: string
+      strict:
+        description: "Fail on BLOCKED/SKIP too (manual runs only)"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  PYTHONUNBUFFERED: "1"
+
+jobs:
+  offline:
+    name: offline (mock hosts)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          python -c "import curl_cffi, wasmtime, cryptography; print('deps ok')"
+      - name: Backend self-test (all adapters vs local mock hosts)
+        run: python3 tools/backend_check.py
+      - name: WSGI self-test
+        run: python3 tools/wsgi_check.py
+      - name: Adapter decoder round-trips (offline)
+        run: python3 tools/adapter_check.py --self-test
+
+  discover:
+    name: list adapter hosts
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.list.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Matrix from server.py's own registry
+        id: list
+        run: |
+          pip install -q -r requirements.txt >/dev/null 2>&1 || true
+          echo "matrix=$(python3 tools/adapter_check.py --list | tr -d '\n')" >> "$GITHUB_OUTPUT"
+
+  live:
+    name: live — ${{ matrix.host }}
+    needs: discover
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.discover.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Check ${{ matrix.host }} (adapter only)
+        id: check
+        continue-on-error: true
+        run: |
+          set +e
+          python3 tools/adapter_check.py \
+            --only "${{ matrix.host }}" \
+            --bytes \
+            --json-out adapter-report.json \
+            ${{ inputs.strict && '--strict' || '' }}
+          code=$?
+          echo "exit_code=$code" >> "$GITHUB_OUTPUT"
+          echo "adapter_exit=$code" > check-exit.txt
+          exit 0
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: adapter-${{ matrix.host }}
+          path: |
+            adapter-report.json
+            check-exit.txt
+          retention-days: 30
+
+  summary:
+    name: summary
+    needs: [offline, live]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: tools
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Download all host reports
+        uses: actions/download-artifact@v4
+        with:
+          path: reports
+      - name: Build the table, fail on BROKEN
+        run: |
+          python3 - <<'PY'
+          import glob, json, sys
+          rows, broken, unknown = [], 0, 0
+          for path in sorted(glob.glob("reports/*/adapter-report.json")):
+              try:
+                  rep = json.load(open(path))
+              except Exception:
+                  continue
+              for r in rep.get("results", []):
+                  rows.append(r)
+                  if r["status"] == "BROKEN":
+                      broken += 1
+                  if r["status"] == "UNKNOWN":
+                      unknown += 1
+          lines = ["## Adapter check — " + ("live" if rows else "no live results"),
+                   "",
+                   "| Host | Status | Formats | Detail |",
+                   "| --- | --- | --- | --- |"]
+          for r in sorted(rows, key=lambda x: x["host"]):
+              detail = str(r.get("detail", "")).replace("|", "\\|")[:110]
+              lines.append(f"| `{r['host']}` | **{r['status']}** | {r.get('formats', 0)} | {detail} |")
+          lines += ["", "PASS/BLOCKED/SKIP are environmental; only **BROKEN** fails this run."]
+          open("/tmp/summary.md", "w").write("\n".join(lines) + "\n")
+          print("\n".join(lines))
+          sys.exit(1 if (broken or unknown) else 0)
+          PY
+      - name: Publish summary
+        if: always()
+        run: cat /tmp/summary.md >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || cat /tmp/summary.md
