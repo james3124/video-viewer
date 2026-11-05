@@ -179,6 +179,24 @@ python3 tools/adapter_check.py --only hanime.tv   # one host
 python3 tools/adapter_check.py --self-test  # offline decoder round-trips
 ```
 
+The yt-dlp layer gets the same treatment. `.github/workflows/ytdlp-check.yml`
+runs `tools/ytdlp_check.py` daily (08:00 UTC) and on demand (Actions →
+ytdlp-check → Run workflow, with a per-site filter and `--strict`). Each job
+calls **only yt-dlp** — no adapters, no sniff, no universal fallback —
+against one sample per site in `tools/ytdlp_urls.txt`, and classifies the
+result as `OK`, `BLOCKED` (bot/geo/login/datacenter IP — the Known-limits
+table above, including TikTok session-bound formats), `STALE` (sample video
+gone — refresh the sample), or `BROKEN` (extractor needs updating). Only
+`BROKEN` fails the run. TikTok, Reddit, Instagram, Vimeo (login path) and
+Tumblr (blog-subdomain 403) routinely read `BLOCKED` on datacenter runners;
+that is the classifier working as designed, not an extractor regression.
+
+```bash
+python3 tools/ytdlp_check.py                # every site in the registry
+python3 tools/ytdlp_check.py --only youtube # one site
+python3 tools/ytdlp_check.py --self-test    # offline classification tests
+```
+
 ### Universal fallback
 
 When yt-dlp and the explicit adapters fail, `universal.py` runs pattern probes

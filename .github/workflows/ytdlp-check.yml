@@ -1,0 +1,151 @@
+name: ytdlp-check
+
+# Live health check for the yt-dlp layer (tools/ytdlp_check.py). Pure yt-dlp:
+# the checker calls YoutubeDL directly against the sample in
+# tools/ytdlp_urls.txt — no site adapters, no sniff, no universal fallback —
+# so a red run means yt-dlp's extractor for that site needs updating.
+#
+#   discover  matrix from tools/ytdlp_urls.txt (one entry per site)
+#   check     one job per site, fail-fast: false
+#   summary   aggregates OK / BLOCKED / STALE / SKIP / BROKEN into one table
+#
+# BLOCKED (bot check, geo/login, datacenter IP) and STALE (dead sample video)
+# never fail the run — the README "Known limits" and sample maintenance are
+# not extractor bugs. Only BROKEN (or UNKNOWN) fails.
+
+on:
+  push:
+    paths:
+      - "tools/ytdlp_check.py"
+      - "tools/ytdlp_urls.txt"
+      - "requirements.txt"
+      - ".github/workflows/ytdlp-check.yml"
+  pull_request:
+    paths:
+      - "tools/ytdlp_check.py"
+      - "tools/ytdlp_urls.txt"
+      - "requirements.txt"
+      - ".github/workflows/ytdlp-check.yml"
+  schedule:
+    # Daily, 08:00 UTC — catches yt-dlp extractor drift after site changes.
+    - cron: "0 8 * * *"
+  workflow_dispatch:
+    inputs:
+      site:
+        description: "Single site to check (blank = every site)"
+        required: false
+        type: string
+      strict:
+        description: "Fail on BLOCKED/STALE/SKIP too (manual runs only)"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  PYTHONUNBUFFERED: "1"
+
+jobs:
+  discover:
+    name: list yt-dlp sites
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.list.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Matrix from the URL registry
+        id: list
+        run: |
+          echo "matrix=$(python3 tools/ytdlp_check.py --list | tr -d '\n')" >> "$GITHUB_OUTPUT"
+
+  check:
+    name: check — ${{ matrix.site }}
+    needs: discover
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.discover.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Check ${{ matrix.site }} (yt-dlp only)
+        id: check
+        continue-on-error: true
+        run: |
+          set +e
+          python3 tools/ytdlp_check.py \
+            --only "${{ matrix.site }}" \
+            --bytes \
+            --json-out ytdlp-report.json \
+            ${{ inputs.strict && '--strict' || '' }}
+          code=$?
+          echo "exit_code=$code" >> "$GITHUB_OUTPUT"
+          echo "ytdlp_exit=$code" > check-exit.txt
+          exit 0
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ytdlp-${{ matrix.site }}
+          path: |
+            ytdlp-report.json
+            check-exit.txt
+          retention-days: 30
+
+  summary:
+    name: summary
+    needs: check
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: tools
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Download all site reports
+        uses: actions/download-artifact@v4
+        with:
+          path: reports
+      - name: Build the table, fail on BROKEN
+        run: |
+          python3 - <<'PY'
+          import glob, json, sys
+          rows, broken, unknown = [], 0, 0
+          for path in sorted(glob.glob("reports/*/ytdlp-report.json")):
+              try:
+                  rep = json.load(open(path))
+              except Exception:
+                  continue
+              for r in rep.get("results", []):
+                  rows.append(r)
+                  if r["status"] == "BROKEN":
+                      broken += 1
+                  if r["status"] == "UNKNOWN":
+                      unknown += 1
+          lines = ["## yt-dlp check — " + ("live" if rows else "no live results"),
+                   "",
+                   "| Site | Status | Formats | Extractor | Detail |",
+                   "| --- | --- | --- | --- | --- |"]
+          for r in sorted(rows, key=lambda x: x["site"]):
+              detail = str(r.get("detail", "")).replace("|", "\\|")[:100]
+              lines.append(f"| `{r['site']}` | **{r['status']}** | {r.get('formats', 0)} | {r.get('extractor', '')} | {detail} |")
+          lines += ["", "PASS/BLOCKED/STALE/SKIP are environmental or sample maintenance; only **BROKEN** fails this run."]
+          open("/tmp/summary.md", "w").write("\n".join(lines) + "\n")
+          print("\n".join(lines))
+          sys.exit(1 if (broken or unknown) else 0)
+          PY
+      - name: Publish summary
+        if: always()
+        run: cat /tmp/summary.md >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || cat /tmp/summary.md

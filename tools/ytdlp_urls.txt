@@ -1,0 +1,62 @@
+# Live sample URLs for tools/ytdlp_check.py — one real video page per site,
+# for the yt-dlp layer ONLY (no adapters, no sniff, no universal).
+# The checker calls yt-dlp directly, so a sample must be a single-video page
+# in that site's shape:
+#   site<TAB/space>url        (# lines are comments)
+#
+# When a video disappears, flip the status to STALE by replacing the URL with
+# a live one — checker STALE never fails CI, but the summary lists it so the
+# sample gets refreshed. Replace TODO-SAMPLE sites below with one live video
+# URL each; an OK needs a real one.
+#
+# Samples below are yt-dlp's own extractor test URLs (yt_dlp/extractor/*.py
+# _TESTS), which the project itself uses to prove extraction. Sites known to
+# bot-block datacenter IPs (tiktok session-bound formats, pornhub/xvideos
+# Cloudflare, reddit/facebook login walls) will report BLOCKED in CI — that
+# classification is the point: environmental, not extractor rot.
+
+youtube		https://www.youtube.com/watch?v=YE7VzlLtp-4
+vimeo			https://vimeo.com/33951933
+dailymotion		https://www.dailymotion.com/video/x5kesuj_office-christmas-party-review-jason-bateman-olivia-munn-t-j-miller_news
+twitch			http://www.twitch.tv/riotgames/v/6528877
+tiktok			https://www.tiktok.com/@leenabhushan/video/6748451240264420610
+twitter			https://twitter.com/qarev001/status/1348948114569269251
+facebook		https://www.facebook.com/radiokicksfm/videos/3676516585958356/
+instagram		https://www.instagram.com/p/BQ0eAlwhDrw/
+reddit			https://www.reddit.com/r/videos/comments/6rrwyj/that_small_heart_attack/
+streamable		https://streamable.com/dnd1
+soundcloud		https://soundcloud.com/jaimemf/youtube-dl-test-video-a-y-baw/s-8Pjrp
+bandcamp		http://youtube-dl.bandcamp.com/track/youtube-dl-test-song
+rumble			https://rumble.com/embed/v5pv5f
+bitchute		https://www.bitchute.com/video/UGlrF9o9b-Q/
+archive			https://archive.org/details/Cops1922
+bilibili		https://www.bilibili.com/video/BV13x41117TL
+niconico		https://www.nicovideo.jp/watch/1173108780
+# pornhub      https://www.pornhub.com/view_video.php?viewkey=<live-viewkey>
+#   All upstream test viewkeys tried are dead (disabled / verification hold).
+#   Open the site, paste a current video URL here to enable the probe.
+xnxx			http://www.xnxx.com/video-55awb78/skyrim_test_video
+xvideos			http://xvideos.com/video.ucuvbkfda4e/a_beautiful_red-haired_stranger_was_refused_but_still_came_to_my_room_for_sex
+xhamster		https://xhamster.com/videos/femaleagent-shy-beauty-takes-the-bait-1509445
+framatube		https://framatube.org/videos/watch/9c9de5e8-0a1e-484a-b099-e80766180a6d
+pinterest		https://www.pinterest.com/pin/664281013778109217/
+snapchat		https://www.snapchat.com/spotlight/W7_EDlXWTBiXAEEniNoMPwAAYYWtidGhudGZpAX1TKn0JAX1TKnXJAAAAAA
+linkedin		https://www.linkedin.com/posts/mishalkhawaja_sendinblueviews-toronto-digitalmarketing-ugcPost-6850898786781339649-mM20
+vk				https://vk.com/video205387401_165548505
+kick			https://kick.com/mxddy?clip=clip_01GYXVB5Y8PWAPWCWMSBCFB05X
+redgifs			https://www.redgifs.com/watch/squeakyhelplesswisent
+tumblr			https://maskofthedragon.tumblr.com/post/626907179849564160/mona-talking-in-english
+
+# TODO-SAMPLE — paste one live single-video URL per site here (uncomment):
+#
+# peertube        https://<a-peertube-instance>/videos/watch/<uuid>
+#   Any public PeerTube instance works; framatube above already covers the
+#   PeerTube extractor. Add a second instance only if you want an extra probe.
+# odysee          https://odysee.com/<channel>/<title>/<claim-id>
+#   Extractor tests live in a different module upstream; paste any live
+#   Odysee video URL here to enable the probe.
+# mastodon        https://<a-mastodon-instance>/@user/<status-id>
+#   Mastodon videos are per-instance; pick a video from a large instance.
+# threads         https://www.threads.net/@user/post/<id>
+#   Threads is covered by the Instagram extractor family; add a live post
+#   URL here to probe it directly.
