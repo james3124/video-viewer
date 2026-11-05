@@ -1623,6 +1623,99 @@ def main() -> int:
               == "https://hls.test/subs/en.vtt",
               (got.get("subtitles") and json.dumps(got["subtitles"])[:90]) or "missing")
 
+        # 10e7 — kisskh.co: anonymous JSON APIs + a deterministic AES kkey,
+        # ported straight from the site's own derivation.
+        check("kisskh: registered as a player site",
+              "kisskh.co" in server._PLAYER_SITES
+              and "t.kisskh.id" in server._PLAYER_SITES, "")
+
+        check("kisskh: kkey matches the site's own (video)",
+              server._kisskh_kkey(228668, server._KISSKH_VI_GUID) == (
+                  "CBB770E89E45CAF856407F2394F9D3BE4B36D037A024ABAA00B7A126845306C"
+                  "F01B7AA4FC021A9D02CD7E196646AE8DA03113C362039A7F93603315048123B8"
+                  "73FA611925BF9C9570C69CF43BBE28E6705F4260060EE1AB1CAC36DAA3CB36B8"
+                  "FA3921F6B6D394B334F3FBEC5DFE110C818BC1ABFACC3CDFB6121862B6ACC9FB8"),
+              "")
+        check("kisskh: kkey matches the site's own (subtitles)",
+              server._kisskh_kkey(228668, server._KISSKH_SUB_GUID) == (
+                  "A5938838F3D2DD75CB4508CDE7A7F24FC7FC326085A867E1631740A4C1AE9A"
+                  "6741FADE11A4B3854F7273BEDF0568EC0864ADB2DC7343ECBDF87CC0DB9DBC0"
+                  "E6CCADDE1027F067E3ED66746CC2FFB4F5051D80B9C4C3955533E47EA95420A0"
+                  "A3C2659CD95AB64CC1AC856C35CC1AC7E532E333B7FAAB2C00F340E6B4299C525B5"),
+              "")
+
+        drama_json = {"id": 14105, "title": "Resident Evil (2026)",
+                      "episodes": [{"id": 228668, "number": 1.0, "sub": 5}],
+                      "episodesCount": 1}
+        episode_json = {"Video": "https://media.test/resident-evil/index.m3u8?v=abc123",
+                        "Video_tmp": "", "ThirdParty": None, "Type": 1}
+        subtitle_json = [
+            {"src": "https://subs.test/14105/1/aa.ar.srt", "label": "Arabic",
+             "land": "ar", "default": False},
+            {"src": "https://subs.test/14105/1/aa.en.srt", "label": "English",
+             "land": "en", "default": True},
+        ]
+
+        def fake_json_get(url, headers, timeout=25):
+            if "/api/DramaList/Drama/14105" in url:
+                return drama_json
+            if "/api/DramaList/Episode/228668.png" in url:
+                # the kkey has to ride along, or the real API refuses
+                return episode_json if "kkey=" in url else ("error", 403)
+            if "/api/Sub/228668" in url:
+                return subtitle_json if "kkey=" in url else ("error", 403)
+            return ("error", 404)
+
+        real_json_get = server._json_get
+        server._json_get = fake_json_get
+        try:
+            got = server.kisskh_extract(
+                "https://kisskh.co/Drama/Resident-Evil--2026-/Episode-1"
+                "?id=14105&ep=228668")
+        finally:
+            server._json_get = real_json_get
+        fmts = got.get("formats") or []
+        check("kisskh: HLS master resolved through the episode API",
+              got.get("extractor_key") == "kisskh"
+              and [f.get("format_id") for f in fmts] == ["kisskh-hls"]
+              and fmts[0]["url"] == (
+                  "https://media.test/resident-evil/index.m3u8?v=abc123")
+              and fmts[0]["http_headers"]["Referer"].startswith(
+                  "https://kisskh.co"),
+              f"urls={[f.get('url') for f in fmts]}")
+        check("kisskh: title carries drama and episode number",
+              got.get("title") == "Resident Evil (2026) — Episode 1",
+              repr(got.get("title")))
+        subs = got.get("subtitles") or {}
+        check("kisskh: subtitle tracks survive (ar/en)",
+              set(subs) == {"ar", "en"}
+              and subs["en"][0]["ext"] == "srt"
+              and subs["en"][0]["url"].endswith(".en.srt"),
+              json.dumps({k: len(v) for k, v in subs.items()}))
+        try:
+            server.kisskh_extract("https://kisskh.co/Drama/resident-evil-2026")
+            check("kisskh: listing page raises NotAVideoPage", False)
+        except server.NotAVideoPage:
+            check("kisskh: listing page raises NotAVideoPage", True)
+
+        # The shortlink host is an alias: it must follow the redirect, read
+        # id/ep from the canonical URL, and still answer through the adapter.
+        real_resolve = server._kisskh_resolve
+        server._kisskh_resolve = (lambda u:
+                                  "https://kisskh.co/Drama/Resident-Evil--2026-/"
+                                  "Episode-1?id=14105&ep=228668")
+        server._json_get = fake_json_get
+        try:
+            got2 = server.kisskh_extract("https://t.kisskh.id/UY7R")
+        finally:
+            server._kisskh_resolve = real_resolve
+            server._json_get = real_json_get
+        check("kisskh: shortlink resolves to the canonical episode",
+              (got2.get("formats") or [{}])[0].get("url", "").endswith(
+                  "index.m3u8?v=abc123")
+              and got2.get("title") == "Resident Evil (2026) — Episode 1",
+              repr(got2.get("title")))
+
         if server._universal is not None:
             ld = ('<script type="application/ld+json">'
                   '{"@type":"VideoObject","url":"https://site.test/author/me",'

@@ -2838,9 +2838,226 @@ def hianimes_extract(url: str, html: str | None = None) -> dict | None:
     return info
 
 
+# --------------------------------------------------------------------------- #
+#  kisskh.co — anonymous JSON APIs plus a deterministic AES "kkey"
+#
+#  The watch page is an Angular SPA, but playback resolves through cookie-free
+#  APIs that any visitor's browser calls:
+#
+#    /api/DramaList/Drama/<id>        → title + episode list (drives our title)
+#    /api/DramaList/Episode/<ep>.png  → JSON body despite the name: the HLS
+#                                       master (`Type==1` ⇒ m3u8_native)
+#    /api/Sub/<ep>                    → subtitle tracks (SRT per language)
+#
+#  The episode endpoints want a `kkey`, an AES-128-CBC hex string the site's
+#  own JS derives from the episode id, a handful of app/platform constants and
+#  the GUID for the resource kind. The key is deterministic — same episode ⇒
+#  same key — and this is a straight port of that derivation (verified
+#  byte-for-byte against the site's real output). No login, no paywall, no
+#  session; the page ships everything it needs to every visitor.
+#
+#  Shortlinks (t.kisskh.id) are Firebase dynamic links that 302 to the
+#  canonical /Drama/…/Episode-N?ep=… URL — followed the same way, no redirect
+#  targets are cached beyond the one resolve call.
+# --------------------------------------------------------------------------- #
+
+_KISSKH_KEY = bytes.fromhex("4f6bdaa39e2f8cb07f5e722d9edef314")
+_KISSKH_IV = bytes.fromhex("01504af356e619cf2e42bba68c3f70f9")
+_KISSKH_APP_ID = "mg3c3b04ba"
+_KISSKH_APP_VER = "2.8.10"
+_KISSKH_PLATFORM = "4830201"
+_KISSKH_VI_GUID = "62f176f3bb1b5b8e70e39932ad34a0c7"      # video
+_KISSKH_SUB_GUID = "VgV52sWhwvBSf8BsM3BRY9weWiiCbtGp"     # subtitles
+_KISSKH_API = "https://kisskh.co"
+_KISSKH_REFERER = _KISSKH_API + "/"
+_KISSKH_JSON_HEADERS = {"User-Agent": DEFAULT_UA, "Referer": _KISSKH_REFERER,
+                        "Accept": "application/json, text/plain, */*"}
+
+
+def _kisskh_t32(x: int) -> int:
+    """ToInt32: wrap into a signed 32-bit integer."""
+    x %= 1 << 32
+    return x - (1 << 32) if x >= 1 << 31 else x
+
+
+def _kisskh_hash(s: str) -> int:
+    """The site's string hash: h = (h << 5) - h + charCodeAt(i)."""
+    h = 0
+    for ch in s:
+        h = _kisskh_t32(_kisskh_t32(h) << 5) - h + ord(ch)
+    return h
+
+
+def _kisskh_kkey(ep: int, guid: str) -> str:
+    """Derive the `kkey` the episode/subtitle endpoints expect."""
+    try:
+        from cryptography.hazmat.primitives.ciphers import (  # noqa: PLC0415
+            Cipher, algorithms, modes)
+    except ImportError:
+        raise RuntimeError(
+            "the `cryptography` package is needed to play kisskh links "
+            "(pip install cryptography)") from None
+    parts = ["", str(ep), "", _KISSKH_APP_ID, _KISSKH_APP_VER, guid,
+             _KISSKH_PLATFORM] + ["kisskh"] * 6 + ["00", ""]
+    joined = "|".join(parts)
+    parts.insert(1, str(_kisskh_hash(joined)))
+    joined = "|".join(parts)
+    pad = 16 - (len(joined.encode("utf-8")) % 16)
+    pt = (joined + chr(pad) * pad).encode("utf-8")
+    enc = Cipher(algorithms.AES(_KISSKH_KEY), modes.CBC(_KISSKH_IV)).encryptor()
+    return (enc.update(pt) + enc.finalize()).hex().upper()
+
+
+def _kisskh_resolve(url: str) -> str:
+    """Follow a shortlink to the canonical episode URL."""
+    req = urllib.request.Request(url, headers={"User-Agent": DEFAULT_UA})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            final = resp.geturl() or url
+            resp.read(1024)                    # headers are all we need
+            return final
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError(
+            "the kisskh shortlink would not resolve — open the episode "
+            "page directly") from exc
+
+
+def kisskh_extract(url: str, html: str | None = None) -> dict | None:
+    """kisskh.co: anonymous episode APIs + a deterministic AES kkey."""
+    parsed = urllib.parse.urlparse(url)
+    host = (parsed.hostname or "").lower()
+    qs = urllib.parse.parse_qs(parsed.query)
+
+    # t.kisskh.id/<code> carries no id/ep of its own — follow the redirect
+    # once and read them from the canonical URL.
+    if host.endswith("kisskh.id"):
+        url = _kisskh_resolve(url)
+        parsed = urllib.parse.urlparse(url)
+        host = (parsed.hostname or "").lower()
+        if not host.endswith("kisskh.co"):
+            raise RuntimeError(
+                "the shortlink resolved somewhere that is not kisskh.co — "
+                "open the episode page directly")
+        qs = urllib.parse.parse_qs(parsed.query)
+
+    ep_raw = (qs.get("ep") or [""])[0].strip()
+    if not ep_raw:
+        raise NotAVideoPage(
+            "that is a kisskh listing/watch page without an episode "
+            "(?ep=…) — open the episode link")
+    if not ep_raw.isdigit():
+        raise RuntimeError(
+            "the ?ep=… parameter is not a number — paste the full episode "
+            "link")
+    ep = int(ep_raw)
+    id_raw = (qs.get("id") or [""])[0].strip()
+    drama_id = int(id_raw) if id_raw.isdigit() else None
+
+    headers = _KISSKH_JSON_HEADERS
+
+    # 1 — drama metadata (title + the episode number for our own title).
+    title = None
+    if drama_id is not None:
+        payload = _json_get(f"{_KISSKH_API}/api/DramaList/Drama/{drama_id}",
+                            headers)
+        if isinstance(payload, dict):
+            name = str(payload.get("title") or "").strip()
+            number = None
+            for item in payload.get("episodes") or []:
+                try:
+                    if int(float(item.get("id") or 0)) != ep:
+                        continue
+                    number = float(item.get("number"))
+                    break
+                except (TypeError, ValueError, AttributeError):
+                    continue
+            if name:
+                if number is not None:
+                    n = int(number) if number == int(number) else number
+                    title = f"{name} — Episode {n}"
+                else:
+                    title = name
+        else:
+            note("kisskh: drama metadata unavailable — streaming anyway")
+
+    # 2 — the episode itself: HLS master lives behind the kkey.
+    kkey = _kisskh_kkey(ep, _KISSKH_VI_GUID)
+    # The endpoint validates `err` strictly — empty string is a 400; the
+    # values the site's own player sends are false/null.
+    payload = _json_get(
+        f"{_KISSKH_API}/api/DramaList/Episode/{ep}.png"
+        f"?err=false&ts=null&time=null&kkey={kkey}", headers)
+    if not isinstance(payload, dict):
+        raise RuntimeError(
+            "the kisskh episode endpoint refused the request — try again, "
+            "or open the episode on the site")
+    video = str(payload.get("Video") or "")
+    if not video.startswith("http"):
+        raise RuntimeError(
+            "the kisskh episode endpoint named no stream — the site's "
+            "player changed, so the adapter needs updating")
+    try:
+        stream_type = int(payload.get("Type") or 0)
+    except (TypeError, ValueError):
+        stream_type = 0
+    if stream_type != 1:
+        raise RuntimeError(
+            "the kisskh episode endpoint answered with an unsupported "
+            "stream type — open the episode on the site")
+
+    # 3 — subtitles (SRT files; cached_vtt() transcodes them for the browser).
+    subkkey = _kisskh_kkey(ep, _KISSKH_SUB_GUID)
+    payload = _json_get(f"{_KISSKH_API}/api/Sub/{ep}?kkey={subkkey}", headers)
+    subs: dict[str, list[dict]] = {}
+    if isinstance(payload, list):
+        for track in payload:
+            if not isinstance(track, dict):
+                continue
+            src = str(track.get("src") or "")
+            if not src.startswith("http"):
+                continue
+            lang = str(track.get("land") or "und").strip().lower() or "und"
+            ext = (src.split("?")[0].rsplit(".", 1)[-1] or "srt").lower()
+            entry = {"url": src, "ext": ext,
+                     "name": str(track.get("label") or lang),
+                     "referer": _KISSKH_REFERER}
+            if track.get("default"):
+                entry["default"] = True
+            subs.setdefault(lang, []).append(entry)
+    else:
+        note("kisskh: subtitle list unavailable — streaming without captions")
+
+    note(f"kisskh: resolved episode {ep}"
+         + (f" + {len(subs)} subtitle track(s)" if subs else ""))
+    info = {
+        "title": title or f"kisskh episode {ep}",
+        "extractor_key": "kisskh",
+        "formats": [{
+            "format_id": "kisskh-hls",
+            "url": video,
+            "ext": "m3u8",
+            "protocol": "m3u8_native",
+            "height": None,
+            "vcodec": None,
+            "acodec": None,
+            "_sniffed": True,
+            # Segment CDN takes the site as Referer; needsProxy then routes
+            # the master + every segment through us.
+            "http_headers": {"User-Agent": DEFAULT_UA,
+                             "Referer": _KISSKH_REFERER},
+        }],
+        "webpage_url": url,
+    }
+    if subs:
+        info["subtitles"] = subs
+    return info
+
+
 # Sites whose markup needs decoding by an adapter — a player frame to walk, or
 # (hanime) an API that signs every request. One named function per host.
 _PLAYER_SITES = {"watchhentai.net": watchhentai_extract,
+                 "kisskh.co": kisskh_extract,
+                 "t.kisskh.id": kisskh_extract,
                  "hentaimama.io": hentaimama_extract,
                  "hentaimama.tv": hentaimama_tv_extract,
                  "rule34video.com": rule34video_extract,
