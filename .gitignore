@@ -5,6 +5,7 @@ __pycache__/
 /Plans/
 /Screenshot_*.png
 /server.log
+/graphify-out/
 /data/data/
 /node_modules/
 node_modules/
