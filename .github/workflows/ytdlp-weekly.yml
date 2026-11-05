@@ -1,0 +1,163 @@
+name: ytdlp-weekly
+
+# Weekly full-corpus sweep for the yt-dlp layer (tools/ytdlp_corpus.py →
+# tools/ytdlp_check.py). Every extractor class in the installed yt-dlp gets
+# its own fixture URL from yt-dlp's _TESTS, checked with yt-dlp ONLY (no
+# adapters, no sniff, no universal). If sites are BROKEN, ONE pull request
+# is created (same branch reused every week, updated in place) with the
+# canonical table: | Site | Broken | Extractor | Fixed |, default BROKEN
+# with an unticked Fixed checkbox, plus "Fixed since last report" for
+# recoveries. BLOCKED (bot/geo/login/datacenter IP) and STALE (fixture died)
+# appear in the summary only, never in the PR.
+
+on:
+  schedule:
+    # Weekly, Sunday 06:00 UTC — a quiet window for a ~1k-job fan-out.
+    - cron: "0 6 * * 0"
+  workflow_dispatch:
+    inputs:
+      limit:
+        description: "Corpus limit for a small smoke run (0 = full corpus)"
+        required: false
+        type: number
+        default: 0
+
+permissions:
+  contents: read
+
+env:
+  PYTHONUNBUFFERED: "1"
+
+jobs:
+  discover:
+    name: build full corpus
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.list.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install yt-dlp
+        run: pip install -r requirements.txt
+      - name: Matrix from the installed yt-dlp's extractor corpus
+        id: list
+        run: |
+          LIMIT="${{ inputs.limit || '0' }}"
+          if [ "$LIMIT" = "0" ] || [ -z "$LIMIT" ]; then
+            echo "matrix=$(python3 tools/ytdlp_corpus.py | tr -d '\n')" >> "$GITHUB_OUTPUT"
+          else
+            echo "matrix=$(python3 tools/ytdlp_corpus.py --limit "$LIMIT" | tr -d '\n')" >> "$GITHUB_OUTPUT"
+          fi
+
+  check:
+    name: check — ${{ matrix.site }}
+    needs: discover
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.discover.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Check ${{ matrix.site }} (yt-dlp only, corpus sample)
+        continue-on-error: true
+        run: |
+          set +e
+          python3 tools/ytdlp_check.py \
+            --only "${{ matrix.site }}" \
+            --url "${{ matrix.site }}=${{ matrix.url }}" \
+            --json-out ytdlp-report.json \
+            --delay 0 \
+            --timeout 90
+          echo "${{ matrix.extractor }}" > extractor.txt
+          exit 0
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: corpus-${{ matrix.site }}
+          path: |
+            ytdlp-report.json
+            extractor.txt
+          retention-days: 30
+
+  report:
+    name: aggregate + one PR
+    needs: check
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Download all site reports
+        uses: actions/download-artifact@v4
+        with:
+          path: reports
+      - name: Aggregate into the canonical Broken|Fixed report
+        id: aggregate
+        run: |
+          python3 tools/ytdlp_weekly_report.py \
+            --reports-dir reports \
+            --prev docs/ytdlp-broken.md \
+            --out docs/ytdlp-broken.md \
+            --body body.md \
+            --counts counts.json
+          cat counts.json
+          echo "broken=$(python3 -c "import json;print(json.load(open('counts.json'))['broken'])")" >> "$GITHUB_OUTPUT"
+          echo "unknown=$(python3 -c "import json;print(json.load(open('counts.json'))['unknown'])")" >> "$GITHUB_OUTPUT"
+          echo "fixed=$(python3 -c "import json;print(json.load(open('counts.json'))['fixed_since_last'])")" >> "$GITHUB_OUTPUT"
+          echo "checked=$(python3 -c "import json;print(json.load(open('counts.json'))['checked'])")" >> "$GITHUB_OUTPUT"
+      - name: Push the report branch + open-or-update the single PR
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set +e
+          if [ -f docs/ytdlp-broken.md ] && ! git diff --quiet HEAD -- docs/ytdlp-broken.md; then
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git checkout -B ytdlp-weekly/broken-sites
+            git add docs/ytdlp-broken.md
+            git commit -m "weekly: yt-dlp broken sites report ($(git log -1 --format=%cs))"
+            git push --force-with-lease origin ytdlp-weekly/broken-sites
+            TITLE="weekly: yt-dlp broken sites (${{ steps.aggregate.outputs.broken }} broken / ${{ steps.aggregate.outputs.checked }} checked)"
+            EXISTING=$(gh pr list --head ytdlp-weekly/broken-sites --json number --jq length)
+            if [ "$EXISTING" = "0" ]; then
+              gh pr create --head ytdlp-weekly/broken-sites \
+                --title "$TITLE" --body-file body.md
+            else
+              gh pr edit --title "$TITLE" --body-file body.md $(gh pr list --head ytdlp-weekly/broken-sites --json number --jq '.[0].number')
+            fi
+            echo "PR updated/created on ytdlp-weekly/broken-sites (single branch, reused weekly)"
+          else
+            echo "No report diff — no PR churn."
+          fi
+      - name: Publish summary
+        if: always()
+        run: |
+          {
+            echo "## yt-dlp weekly sweep"
+            echo ""
+            echo "Checked **${{ steps.aggregate.outputs.checked }}** extractors. \
+            Broken: **${{ steps.aggregate.outputs.broken }}** (fails this run) · \
+            Unknown: ${{ steps.aggregate.outputs.unknown }} · \
+            Fixed since last report: ${{ steps.aggregate.outputs.fixed }}"
+            echo ""
+            echo "See body.md for the full | Site | Broken | Fixed | table (also in the weekly PR when anything is broken)."
+          } >> "$GITHUB_STEP_SUMMARY"
+          cat body.md 2>/dev/null >> "$GITHUB_STEP_SUMMARY" || true

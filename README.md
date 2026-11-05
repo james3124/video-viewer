@@ -197,6 +197,33 @@ python3 tools/ytdlp_check.py --only youtube # one site
 python3 tools/ytdlp_check.py --self-test    # offline classification tests
 ```
 
+### Weekly full sweep (one PR)
+
+`.github/workflows/ytdlp-weekly.yml` runs every Sunday 06:00 UTC.
+`tools/ytdlp_corpus.py` emits the **full** corpus — the first `_TEST` URL of
+every extractor class in the installed yt-dlp (~1,700 entries, which is why
+this is a weekly job and not a push-time one) — and `tools/ytdlp_check.py`
+runs each one with yt-dlp only. `tools/ytdlp_weekly_report.py` then writes
+one canonical table to `docs/ytdlp-broken.md`:
+
+| Site | Broken | Extractor | Fixed |
+| --- | --- | --- | --- |
+| `YoutubeIE` | BROKEN: … | youtube | - [ ] |
+
+and opens **one** pull request (branch `ytdlp-weekly/broken-sites`, reused
+and updated in place every week — never one PR per site) containing that
+table, a totals line, and a "Fixed since last report" section for sites
+that recovered. Tick **Fixed** when the extractor is updated upstream or a
+dead sample is replaced. `BLOCKED` (bot/geo/login/datacenter IP) and `STALE`
+(fixture video died) only appear in the run summary, never in the PR.
+GITHUB_TOKEN-created PRs don't trigger the other workflows, which keeps the
+report branch quiet — the PR is a read-only inbox, not a release.
+
+```bash
+python3 tools/ytdlp_corpus.py --limit 20    # first 20 corpus entries (smoke)
+python3 tools/ytdlp_corpus.py | head -1     # the full matrix JSON
+```
+
 ### Universal fallback
 
 When yt-dlp and the explicit adapters fail, `universal.py` runs pattern probes
