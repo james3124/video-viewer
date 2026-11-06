@@ -69,6 +69,17 @@
       <button class="ex" data-url="https://www.youtube.com/watch?v=aqz-KE-bpKQ">YouTube</button>
       <button class="ex" data-url="https://www.youtube.com/watch?v=LXb3EKWsInQ">YouTube 4K-ish</button>
     </div>
+    <!-- Home-screen-only Display ad. Rendered by app.js when VIEWER_AD_SLOT
+         in config.js is set; hidden for good once a video is loaded. AdSense
+         Auto Ads are off in the dashboard — this is the only ad that renders. -->
+    <div class="home-ad" id="homeAd" hidden>
+      <div class="home-ad-label">Ad</div>
+      <ins class="adsbygoogle" style="display:block"
+           data-ad-client="ca-pub-3796591441323242"
+           data-ad-slot=""
+           data-ad-format="auto"
+           data-full-width-responsive="true"></ins>
+    </div>
     <p class="backend-hint" id="backendHint" hidden></p>
   </div>
 

@@ -604,3 +604,20 @@ dialog[open]{animation:pop .16s ease-out}
 .yt-always input{accent-color:var(--accent);width:15px;height:15px}
 .yt-always:active,.site-link:active{opacity:.7}
 .site-link{color:var(--accent);margin:0 2px;text-decoration:underline}
+
+/* ---------- home-screen-only display ad ---------- */
+.home-ad{
+  margin:22px auto 4px;
+  max-width:728px;
+  width:100%;
+}
+.home-ad-label{
+  margin:0 0 6px;
+  text-align:center;
+  color:var(--muted);
+  font-size:11px;
+  letter-spacing:.14em;
+  text-transform:uppercase;
+  opacity:.6;
+}
+.home-ad .adsbygoogle{min-height:90px}
