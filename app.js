@@ -20,7 +20,6 @@
   const closeHelp  = document.getElementById('closeHelp');
   const stage      = document.getElementById('stage');
   const dropzone   = document.getElementById('dropzone');
-  const homeAd     = document.getElementById('homeAd');
   const video      = document.getElementById('video');
   const embed      = document.getElementById('embed');
   const errBox     = document.getElementById('errors');
@@ -814,34 +813,8 @@
     return a;
   };
 
-  /* Home-screen-only Display ad. Runs once, on the empty state, and only
-   * when config.js sets VIEWER_AD_SLOT — otherwise nothing renders and the
-   * container stays hidden. showMedia() hides it for good; there is no
-   * back-to-home path except a reload, so the watch screen never carries it. */
-  let homeAdInit = false;
-
-  function initHomeAd() {
-    if (homeAdInit || !homeAd) return;
-    const slot = String(window.VIEWER_AD_SLOT || '').trim();
-    const ins = homeAd.querySelector('.adsbygoogle');
-    // No slot configured, the <ins> is missing, or an ad blocker ate the
-    // library: silence, not console errors and not invalid ad requests.
-    if (!slot || !ins || typeof window.adsbygoogle === 'undefined') return;
-    ins.setAttribute('data-ad-slot', slot);
-    homeAd.hidden = false;
-    try {
-      window.adsbygoogle.push({});
-      homeAdInit = true;
-    } catch (_) { /* the ad unit stays hidden; nothing else depends on it */ }
-  }
-
-  function hideHomeAd() {
-    if (homeAd) homeAd.hidden = true;
-  }
-
   function showMedia() {
     dropzone.hidden = true;
-    hideHomeAd();
     video.hidden = false;
     embed.hidden = true;
     embed.removeAttribute('src');
@@ -1228,7 +1201,6 @@
     } else {
       status('Ready');
       urlInput.focus();
-      initHomeAd();
     }
   }
   boot();
