@@ -696,7 +696,9 @@ class Jvd(BaseHTTPRequestHandler):
 
     def _player(self, sources: list, vtt: str = "") -> bytes:
         import base64 as _b64                             # noqa: PLC0415
-        keyarg = _b64.b64encode(self.path.encode()).decode()[4:20]
+        # 0.17 player slice (was [4:20]); short mock paths give a shorter
+        # key here, but the seal/decrypt pair must use the same slice.
+        keyarg = _b64.b64encode(self.path.encode()).decode()[6:22]
         cfg = {"src": _b64.b64encode(json.dumps(sources).encode()).decode(),
                "img": "", "vtt": vtt}
         blob = self._seal(keyarg, "_0x59a0e4", json.dumps(cfg).encode())
@@ -709,12 +711,23 @@ class Jvd(BaseHTTPRequestHandler):
         if self.path.startswith("/video/"):
             slug = self.path.rstrip("/").rsplit("/", 1)[-1]
             marker = {"with-file": "case-file", "ads-only": "case-ads",
-                      "real-hls": "case-hls"}.get(slug, "case-file")
-            mpu = self._seal("719679", "QxLUF1bgIAdeQX", marker.encode())
-            html = (f'<!doctype html><html><head><title>Test {slug}</title>'
-                    f'</head><body><div id="video-player-area" '
-                    f'data-video-id="719679"><div id="video-player" '
-                    f'data-mpu="{mpu}" data-ver="1"></div></div></body></html>')
+                      "real-hls": "case-hls", "best-file": "case-file"}.get(
+                slug, "case-file")
+            if slug == "best-file":
+                # bestjavporn markup: video-id/video_ver on the area, and
+                # the mpu is sealed with the response salt, not the
+                # request salt for this ver.
+                mpu = self._seal("719679", "_0x58fe15", marker.encode())
+                html = (f'<!doctype html><html><head><title>Test {slug}</title>'
+                        f'</head><body><div id="video-player-area" '
+                        f'video-id="719679" video_ver="1"><div id="video-player" '
+                        f'data-mpu="{mpu}"></div></div></body></html>')
+            else:
+                mpu = self._seal("719679", "QxLUF1bgIAdeQX", marker.encode())
+                html = (f'<!doctype html><html><head><title>Test {slug}</title>'
+                        f'</head><body><div id="video-player-area" '
+                        f'data-video-id="719679"><div id="video-player" '
+                        f'data-mpu="{mpu}" data-ver="1"></div></div></body></html>')
             return self._bytes(html.encode(), "text/html")
         if self.path.startswith("/p/primary") or self.path.startswith("/p/nl"):
             return self._bytes(self._player(
@@ -1928,6 +1941,8 @@ def main() -> int:
             server._JVD_BASE = jbase
             check("javhdporn: registered as a player-site adapter",
                   "javhdporn.net" in server._PLAYER_SITES, "")
+            check("bestjavporn: registered as a player-site adapter",
+                  "bestjavporn.com" in server._PLAYER_SITES, "")
             try:
                 server.javhdporn_extract(f"{jbase}/tag/uncensored")
                 check("javhdporn: a non-video page says so", False, "no raise")
@@ -1987,6 +2002,17 @@ def main() -> int:
                       str([(f["format_id"], f["ext"]) for f in fmts]))
             except Exception as exc:  # noqa: BLE001
                 check("javhdporn: a genuine HLS source is accepted", False,
+                      f"{type(exc).__name__}: {str(exc)[:80]}")
+
+            try:
+                got = server.javhdporn_extract(f"{jbase}/video/best-file")
+                fmts = got.get("formats") or []
+                check("bestjavporn: video-id/video_ver markup resolves",
+                      len(fmts) == 1 and fmts[0]["ext"] == "mp4"
+                      and fmts[0]["url"].endswith("/real.mp4"),
+                      str([(f["format_id"], f["ext"]) for f in fmts]))
+            except Exception as exc:  # noqa: BLE001
+                check("bestjavporn: video-id/video_ver markup resolves", False,
                       f"{type(exc).__name__}: {str(exc)[:80]}")
         finally:
             server._JVD_BASE = keep_base
@@ -2372,6 +2398,218 @@ def main() -> int:
         finally:
             server._extract = real_extract
             server.player_site_extract = real_player
+
+        # 16d — declarative extra-site recipes --------------------------------
+        ext = server._extra
+        check("extra-site: sites_extra is importable", ext is not None)
+        if ext is not None:
+            saved = dict(ext.SITES)
+            real_fetch = server._fetch_text
+            real_extract = server._extract
+            try:
+                ext.SITES.clear()
+                ext._add(ext.SiteRule(host="extra.test", strategy="meta"))
+                ext._add(ext.SiteRule(host="video.extra.test", strategy="player"))
+                ext._add(ext.SiteRule(
+                    host="api.test", strategy="api",
+                    api="/api/info?id={id}&alt=0",
+                    api_id=r'episodeToken\s*=\s*"([^"]+)"',
+                    api_token=r'csrfToken\s*=\s*"([^"]+)"'))
+                server._EXTRA_SITES = ext.SITES
+                server._EXTRA_HOSTS = set(ext.SITES)
+
+                check("extra-site: exact host resolves",
+                      ext.rule_for("https://extra.test/watch/1").host == "extra.test")
+                check("extra-site: a subdomain uses the parent recipe",
+                      ext.rule_for("https://cdn.extra.test/watch/1").host == "extra.test")
+                check("extra-site: the longest suffix wins",
+                      ext.rule_for("https://video.extra.test/watch/1").strategy == "player")
+                check("extra-site: unknown hosts are left alone",
+                      ext.rule_for("https://example.com/x") is None)
+
+                page = ('<html><head><title>Example Clip</title>'
+                        '<meta property="og:video" content="/media/clip.mp4">'
+                        '</head></html>')
+                got = ext.extract(ext.SiteRule(host="extra.test", strategy="meta"),
+                                  "https://extra.test/watch/1", page)
+                check("extra-site: og:video becomes a format",
+                      bool(got["formats"]) and got["formats"][0]["url"]
+                      == "https://extra.test/media/clip.mp4", str(got["formats"]))
+                check("extra-site: the title is read without tags",
+                      got["title"] == "Example Clip", str(got["title"]))
+
+                ld = ('<script type="application/ld+json">{"@type":"VideoObject",'
+                      '"contentUrl":"https://cdn.extra.test/1080.mp4",'
+                      '"name":"Clip"}</script>')
+                got = ext.extract(ext.SiteRule(host="extra.test", strategy="jsonld"),
+                                  "https://extra.test/watch/1", ld)
+                check("extra-site: JSON-LD VideoObject contentUrl is read",
+                      bool(got["formats"])
+                      and got["formats"][0]["url"].endswith("1080.mp4"),
+                      str(got["formats"]))
+
+                html5 = ('<video><source src="https://cdn.extra.test/720.mp4" '
+                         'type="video/mp4"><source src="https://cdn.extra.test/480.mp4">'
+                         '</video>')
+                got = ext.extract(ext.SiteRule(host="extra.test", strategy="html5"),
+                                  "https://extra.test/watch/1", html5)
+                check("extra-site: <source> tags become formats",
+                      len(got["formats"]) == 2, str(got["formats"]))
+
+                player = ('<script>var player = {sources: [{file: '
+                          '"https://cdn.extra.test/master.m3u8", label: "1080p"}, '
+                          '{file: "https://cdn.extra.test/720.mp4", label: "720p"}]};'
+                          '</script>')
+                got = ext.extract(ext.SiteRule(host="extra.test", strategy="player"),
+                                  "https://extra.test/watch/1", player)
+                check("extra-site: a JW Player source list is read",
+                      len(got["formats"]) == 2
+                      and got["formats"][0]["ext"] == "m3u8",
+                      str([(f["url"], f["ext"]) for f in got["formats"]]))
+
+                ifr = '<iframe src="https://player.extra.test/embed/1"></iframe>'
+                got = ext.extract(ext.SiteRule(host="extra.test", strategy="iframe"),
+                                  "https://extra.test/watch/1", ifr)
+                check("extra-site: a player frame becomes an embed",
+                      got["embed"] == "https://player.extra.test/embed/1",
+                      str(got["embed"]))
+
+                social = ('<iframe src="https://www.youtube.com/embed/abc"></iframe>'
+                          '<iframe src="https://www.facebook.com/plugins/like.php?'
+                          'href=x"></iframe>'
+                          '<iframe src="https://ad.a-ads.com/1/?size=300x250">'
+                          '</iframe>')
+                got = ext.extract(ext.SiteRule(host="extra.test", strategy="iframe"),
+                                  "https://extra.test/watch/1", social)
+                check("extra-site: social/ad frames are not the video",
+                      got["embed"] is None, str(got["embed"]))
+
+                mixed = ('<iframe src="https://a.adtng.com/get/1"></iframe>'
+                         '<iframe src="https://go.gsrv.dev/banner.go?spaceid=1">'
+                         '</iframe>'
+                         '<iframe src="https://video.extra.test/embed/1"></iframe>')
+                got = ext.extract(ext.SiteRule(host="extra.test", strategy="iframe"),
+                                  "https://extra.test/watch/1", mixed)
+                check("extra-site: the same-site player beats an ad frame",
+                      got["embed"] == "https://video.extra.test/embed/1",
+                      str(got["embed"]))
+
+                scanned = ('<script>var a = "https://extra.test/get_file/1/abc/1/1.mp4";'
+                           'var b = "https://extra.test/get_file/1/abc/1/1_720p.mp4";'
+                           'var c = "https://extra.test/preview.mp4";'
+                           'var d = "https://extra.test/1_vthumb.mp4";</script>')
+                got = ext.extract(ext.SiteRule(host="extra.test", strategy="auto"),
+                                  "https://extra.test/watch/1", scanned)
+                urls = [f["url"] for f in got["formats"]]
+                check("extra-site: auto scans full media, not thumbnails",
+                      len(urls) == 2 and not any("preview" in u or "vthumb" in u
+                                                 for u in urls), str(urls))
+
+                only_preview = ('<script>var a = '
+                                '"https://extra.test/preview.mp4";</script>')
+                got = ext.extract(ext.SiteRule(host="extra.test", strategy="auto"),
+                                  "https://extra.test/watch/1", only_preview)
+                check("extra-site: a preview alone is not a video",
+                      not got["formats"] and got["embed"] is None,
+                      str(got))
+
+                got = ext.extract(ext.SiteRule(host="extra.test", strategy="auto"),
+                                  "https://extra.test/watch/1", mixed)
+                check("extra-site: auto falls back to the same-site player",
+                      got["embed"] == "https://video.extra.test/embed/1",
+                      str(got["embed"]))
+
+                hosters = ('<li data-link-target="/redirect/42"></li>'
+                           '<li data-link-target="/redirect/43"></li>')
+                got = ext.extract(ext.SiteRule(
+                    host="extra.test", strategy="embed",
+                    patterns=(r'data-link-target="([^"]+)"',)),
+                    "https://extra.test/watch/1", hosters)
+                check("extra-site: an embed pattern picks the first hoster",
+                      got["embed"] == "https://extra.test/redirect/42",
+                      str(got["embed"]))
+
+                api_rule = ext.SiteRule(
+                    host="api.test", strategy="api",
+                    api="/api/info?id={id}&alt=0",
+                    api_id=r'episodeToken\s*=\s*"([^"]+)"',
+                    api_token=r'csrfToken\s*=\s*"([^"]+)"')
+                api_page = ('<script>var episodeToken="abc";'
+                            ' var csrfToken="tok";</script>')
+                request = ext.api_request(api_rule, "https://api.test/watch/1",
+                                          api_page)
+                check("extra-site: the API request carries the id and token",
+                      request[0] == "https://api.test/api/info?id=abc&alt=0"
+                      and request[1].get("CSRF-Token") == "tok", str(request))
+                api_got = ext.api_extract(
+                    '{"grabber":"https://cdn.api.test/1.mp4"}',
+                    "https://api.test/watch/1")
+                check("extra-site: an API payload yields media",
+                      bool(api_got["formats"])
+                      and api_got["formats"][0]["url"].endswith("1.mp4"),
+                      str(api_got))
+
+                captured = []
+
+                def api_fetch(u, h, timeout=25, data=None):
+                    if "/api/" in u:
+                        captured.append((u, dict(h)))
+                        return '{"grabber":"https://cdn.api.test/1.mp4"}'
+                    return api_page
+
+                server._fetch_text = api_fetch
+                info = server.extra_site_extract("https://api.test/watch/1")
+                check("extra-site: the server wrapper falls back to the API",
+                      bool(server.browsable_formats(info))
+                      and server.browsable_formats(info)[0]["url"]
+                      .endswith("1.mp4"), str(info))
+                check("extra-site: the API call used the page token",
+                      bool(captured)
+                      and captured[0][1].get("CSRF-Token") == "tok",
+                      str(captured))
+
+                # Packed fixture: ext._unpack_js decodes it; no JS engine runs.
+                packed = (
+                    "eval(function(p,a,c,k,e,d){return p}('"
+                    "<iframe src=\"1://2.3/e/4\"></iframe>',62,5,"
+                    "'|https|streamtape|com|abc'.split('|'),0,{}))")
+                got = ext.extract(ext.SiteRule(host="extra.test",
+                                               strategy="auto"),
+                                  "https://extra.test/watch/1", packed)
+                check("extra-site: a packed player config is decoded, not run",
+                      got["embed"] == "https://streamtape.com/e/abc",
+                      str(got["embed"]))
+
+                ad = ('<meta property="og:video" '
+                      'content="https://doubleclick.net/ad.mp4">')
+                got = ext.extract(ext.SiteRule(host="extra.test", strategy="meta"),
+                                  "https://extra.test/watch/1", ad)
+                check("extra-site: tracker media is never served",
+                      not got["formats"], str(got["formats"]))
+
+                server._fetch_text = lambda u, h, timeout=25, data=None: page
+                info = server.extra_site_extract("https://extra.test/watch/1")
+                check("extra-site: the server wrapper dispatches to the recipe",
+                      bool(server.browsable_formats(info))
+                      and server.browsable_formats(info)[0]["url"]
+                      .endswith("clip.mp4"), str(info))
+                check("extra-site: unknown hosts return None",
+                      server.extra_site_extract("https://example.com/x") is None)
+
+                reached = []
+                server._extract = lambda u, playlist=False: reached.append(u)
+                info = server._extract_sniffed("https://extra.test/watch/1")
+                check("extra-site: a known host never reaches the yt-dlp crawl",
+                      not reached, str(reached))
+                check("extra-site: the recipe's answer is used",
+                      bool(info.get("formats")), str(info))
+            finally:
+                server._fetch_text = real_fetch
+                server._extract = real_extract
+                ext.SITES.clear()
+                ext.SITES.update(saved)
+                server._EXTRA_SITES = ext.SITES
+                server._EXTRA_HOSTS = set(ext.SITES)
 
         # decisive vs provisional; session-bound CDNs tell the truth ----------
         check("cdn notes: a tiktok web token explains itself",

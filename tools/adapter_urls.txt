@@ -44,3 +44,32 @@ gogoanime.fi	https://gogoanime.fi/the-iceblade-sorcerer-shall-rule-the-world-ii-
 # javhdporn.net      https://www.javhdporn.net/video/<live-slug>/
 #   Homepage bot-blocks datacenter IPs (403); expect BLOCKED in CI until run
 #   from a residential/VPS IP. The adapter itself is covered by backend_check.
+
+# --- extra-site recipes (sites_extra.py) — live-verified 2026-11-07 ---------
+# 15 of the 100 hosts returned a video surface during discovery; these are
+# their samples. The other 85 are LIVE_AUTO/BLOCKED_AUTO and intentionally
+# have no sample: `adapter_check.py --extra` reports SKIP, never FAIL, for a
+# missing sample. See docs/extra-sites.md.
+animeworld.tv	https://www.animeworld.ac/play/firefly-wedding-ita.zRBGG/GWc422POzD
+aniworld.to	https://aniworld.to/anime/stream/ranma-12-2024/staffel-3/episode-6
+hentaicity.com	https://www.hentaicity.com/video/succubus-nightmare-3-game-preview-succubus-in-stockade-is-fucked-from-both-ends-6w803G4xeh3.html
+jav321.com	https://www.jav321.com/video/1aiav00055
+javbangers.com	https://www.javbangers.com/video/116843/fc2-ppv-1579620-1
+javmix.tv	https://javmix.tv/video/mx-1dldss00570/
+javtiful.com	https://javtiful.com/video/100183/1pondo-123025-001
+javtube.com	https://javtube.com/tokyotube/jav/natsuko.mishima/video2662/1/
+porn300.com	https://www.porn300.com/video/anal-toy-play-babe/
+porndig.com	https://www.porndig.com/videos/242510/how-delightful-it-is-to-see-this-milf-mounted-on-a-mechanical-toy.html
+pornhat.com	https://www.pornhat.com/video/a-nerdy-guy-gets-lucky-as-two-tattooed-alt-teens-share-his-cock-in-an-ffm/
+porntrex.com	https://www.porntrex.com/video/1203665/the-rub-down
+pornzog.com	https://pornzog.com/video/27670017/julia-en-trio-au-cap-d-agde/
+sexvid.xxx	https://www.sexvid.xxx/blonde-gets-on-her-knees-and-tongues-this-brunette-raw.html
+xozilla.com	https://www.xozilla.com/videos/188898/couple-fucks-at-the-beach-public-sex/
+
+# TODO-SAMPLE — discovered page, but no video surface was found on it:
+# animeunity.tv    https://www.animeunity.co/anime/7869-cyberpunk-edgerunners-2-ita
+#   Detail page, not an episode; .tv redirects to .co. Paste a /play/ URL.
+# hentaigasm.com   https://hentaigasm.com/hentai/new-hentai-release/
+#   Listing page. Paste a single video URL.
+# hentaihaven.com  https://hentaihaven.com/video/abandon-100-nuki-shinai-to-derarenai-fushigi-na-kyoushitsu-2/
+#   Video page but the player is JS-rendered; confirm with a manual run first.

@@ -2,6 +2,7 @@
 
     .venv/bin/python tools/adapter_check.py                  # all hosts
     .venv/bin/python tools/adapter_check.py --only hanime.tv  # one host
+    .venv/bin/python tools/adapter_check.py --extra           # sites_extra.py hosts
     .venv/bin/python tools/adapter_check.py --list            # JSON matrix for CI
     .venv/bin/python tools/adapter_check.py --self-test       # decoder round-trips, offline
 
@@ -76,13 +77,22 @@ BLOCKED_HINTS = (
 )
 
 
-def adapter_registry() -> list[tuple[str, list[str]]]:
-    """(adapter function name, hosts) pairs from server.py's own tables."""
+def adapter_registry(mode: str = "none") -> list[tuple[str, list[str]]]:
+    """(adapter function name, hosts) pairs from server.py's own tables.
+
+    mode: "none" (default) keeps the declarative extra-site hosts out so the
+    CI matrix keeps its current shape; "merge" adds them; "only" returns just
+    the extra-site table.
+    """
     by_fn: dict[str, list[str]] = {}
-    for host, fn in server._PLAYER_SITES.items():
-        by_fn.setdefault(getattr(fn, "__name__", str(fn)), []).append(host)
-    for host, entry in server._API_SITES.items():
-        by_fn.setdefault("api_site_extract", []).append(host)
+    if mode != "only":
+        for host, fn in server._PLAYER_SITES.items():
+            by_fn.setdefault(getattr(fn, "__name__", str(fn)), []).append(host)
+        for host, entry in server._API_SITES.items():
+            by_fn.setdefault("api_site_extract", []).append(host)
+    if mode in ("merge", "only"):
+        for host in getattr(server, "_EXTRA_SITES", {}):
+            by_fn.setdefault("extra_site_extract", []).append(host)
     return sorted((name, sorted(hosts)) for name, hosts in by_fn.items())
 
 
@@ -171,13 +181,13 @@ def check_host(host: str, url: str, retries: int) -> dict:
     result = {"adapter": "", "host": host, "url": url, "status": "SKIP",
               "detail": "", "formats": 0, "seconds": 0.0}
     fn = None
-    for name, hosts in adapter_registry():
+    for name, hosts in adapter_registry("merge"):
         if host in hosts:
             result["adapter"] = name
             fn = name
             break
     if fn is None:
-        result["detail"] = "host not registered in _PLAYER_SITES/_API_SITES"
+        result["detail"] = "host not registered in _PLAYER_SITES/_API_SITES/_EXTRA_SITES"
         return result
     if not url:
         result["detail"] = "no sample URL (add it to tools/adapter_urls.txt)"
@@ -190,6 +200,10 @@ def check_host(host: str, url: str, retries: int) -> dict:
             info = server.player_site_extract(url)
             if info is None:
                 info = server.api_site_extract(url)
+            if info is None:
+                extra = getattr(server, "extra_site_extract", None)
+                if extra is not None:
+                    info = extra(url)
             status, detail, nf = validate(info)
             result.update(status=status, detail=detail, formats=nf,
                           seconds=round(time.time() - t0, 1))
@@ -206,7 +220,7 @@ def check_host(host: str, url: str, retries: int) -> dict:
 def cmd_list(args: argparse.Namespace) -> int:
     urls = load_urls(args.urls, [])
     matrix = []
-    for adapter, hosts in adapter_registry():
+    for adapter, hosts in adapter_registry("only" if args.extra else "none"):
         for host in hosts:
             matrix.append({"adapter": adapter, "host": host,
                            "sample": bool(urls.get(host))})
@@ -301,6 +315,8 @@ def main(argv: list[str] | None = None) -> int:
                     help="write a machine-readable report to this file")
     ap.add_argument("--list", action="store_true",
                     help="emit the adapter/host matrix as JSON and exit")
+    ap.add_argument("--extra", action="store_true",
+                    help="restrict to the declarative sites_extra.py hosts")
     ap.add_argument("--self-test", action="store_true",
                     help="run offline decoder round-trips and exit")
     ap.add_argument("--quiet", action="store_true",
@@ -312,7 +328,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.list:
         return cmd_list(args)
 
-    registry = adapter_registry()
+    registry = adapter_registry(
+        "only" if args.extra else ("merge" if args.only else "none"))
     urls = load_urls(args.urls, args.url)
     wanted = {w.lower() for w in args.only}
     targets: list[tuple[str, str]] = []
@@ -333,6 +350,10 @@ def main(argv: list[str] | None = None) -> int:
             try:
                 info = server.player_site_extract(url) \
                     or server.api_site_extract(url)
+                if info is None:
+                    extra = getattr(server, "extra_site_extract", None)
+                    if extra is not None:
+                        info = extra(url)
                 if info:
                     res["detail"] += " · " + probe_bytes(info)
             except Exception:  # noqa: BLE001 - informational only

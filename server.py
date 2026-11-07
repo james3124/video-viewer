@@ -68,6 +68,11 @@ try:
 except Exception:  # noqa: BLE001 - the universal layer is optional
     _universal = None
 
+try:
+    import sites_extra as _extra
+except Exception:  # noqa: BLE001 - the declarative layer is optional
+    _extra = None
+
 VERSION = "2.1"
 
 
@@ -1774,10 +1779,11 @@ _JVD_STAGE2_SALT = "_0x59a0e4"
 # the video — the decoy providers render the same TikTok image 975 times.
 _JVD_AD_HOSTS = ("tiktokcdn.com",)
 
-_JVD_AREA_RE = re.compile(r'id="video-player-area"[^>]*data-video-id="(\d+)"')
-_JVD_VIDEO_ID_RE = re.compile(r'data-video-id="(\d+)"')
+_JVD_AREA_RE = re.compile(r'id="video-player-area"[^>]*(?:data-video-id|video-id)="(\d+)"')
+_JVD_VIDEO_ID_RE = re.compile(r'(?:data-video-id|video-id)="(\d+)"')
 _JVD_MPU_RE = re.compile(r'id="video-player"[^>]*data-mpu="([^"]+)"')
-_JVD_VER_RE = re.compile(r'id="video-player"[^>]*data-ver="([^"]+)"')
+_JVD_VER_RE = re.compile(
+    r'(?:id="video-player"[^>]*data-ver|id="video-player-area"[^>]*(?:data-ver|video_ver))="([^"]+)"')
 _JVD_CONFIG_RE = re.compile(r'id="jwplayer"[^>]*data-config="([^"]+)"')
 _JVD_H1_RE = re.compile(r"<h1[^>]*>(.*?)</h1>", re.S | re.I)
 _JVD_TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.S | re.I)
@@ -1853,11 +1859,28 @@ def _jvd_player(play_url: str, referer: str) -> tuple[list, dict, str]:
     if not match:
         raise RuntimeError(f"the player frame carried no config (HTTP {status})")
     parsed = urllib.parse.urlparse(play_url)
-    # Stage-two key: base64(path[?query])[4:20] — the same slice the frame uses.
-    keyarg = base64.b64encode(
-        (parsed.path + (("?" + parsed.query) if parsed.query else "")).encode()
-    ).decode()[4:20]
-    cfg = json.loads(_jvd_dex_str(keyarg, _JVD_STAGE2_SALT, match.group(1)))
+    # Stage-two key: base64(path[?query])[6:22] — the frame shifted this
+    # slice by two in its 0.17 player (was [4:20]). Try the current slice
+    # first, then the old one, so a mixed fleet (per-host main.js versions)
+    # still decrypts.
+    raw = parsed.path + (("?" + parsed.query) if parsed.query else "")
+    encoded = base64.b64encode(raw.encode()).decode()
+    cfg = None
+    last_exc: Exception | None = None
+    for start, end in ((6, 22), (4, 20)):
+        try:
+            kind = json.loads(_jvd_dex_str(encoded[start:end],
+                                          _JVD_STAGE2_SALT, match.group(1)))
+            if isinstance(kind, dict):
+                cfg = kind
+                break
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+    if cfg is None:
+        raise RuntimeError(
+            "the player frame's config would not open (the stage-two "
+            "slice changed, so the adapter needs updating)"
+            + (f": {last_exc}" if last_exc else ""))
     raw = cfg.get("src")
     srcs = json.loads(_jvd_b64d(raw).decode("utf-8")) if isinstance(raw, str) else (raw or [])
     return (srcs if isinstance(srcs, list) else []), cfg, play_url
@@ -1894,7 +1917,7 @@ def _jvd_hls_is_video(playlist: str, referer: str) -> bool:
 
 
 def javhdporn_extract(url: str, html: str | None = None) -> dict | None:
-    """javhdporn.net: run the page's own `dex()` chain to reach the real stream.
+    """javhdporn.net / bestjavporn.com: run the page's own `dex()` chain.
 
     The site offers several player "reserves" per video; some are ad decoys that
     answer with an HLS chain of TikTok ad images. We take every alternate the
@@ -1906,7 +1929,12 @@ def javhdporn_extract(url: str, html: str | None = None) -> dict | None:
         raise NotAVideoPage(
             "javhdporn only plays single videos at /video/<slug> — this link is a "
             "listing, a tag or a search page")
-    headers = {"User-Agent": _JVD_UA, "Referer": _JVD_BASE + "/"}
+    # bestjavporn is the same player family, just with the area attributes
+    # renamed (`video-id`/`video_ver` instead of `data-video-id`/`data-ver`)
+    # and its own /api/play/ host. Derive the base from the page so one
+    # adapter serves both.
+    site = f"{parsed.scheme or 'https'}://{parsed.netloc or 'www.javhdporn.net'}"
+    headers = {"User-Agent": _JVD_UA, "Referer": site + "/"}
     if html is None:
         status, html = _jvd_http("GET", url, headers)
         if status != 200:
@@ -1922,20 +1950,46 @@ def javhdporn_extract(url: str, html: str | None = None) -> dict | None:
             "the javhdporn page carried no player data — the site changed its "
             "markup, so the adapter needs updating")
     vid, ver = vid.group(1), ver.group(1)
-    sources = _jvd_dex_str(vid, _JVD_REQ_SALT.get(ver, _JVD_RESP_SALT), mpu.group(1))
 
-    body = urllib.parse.urlencode({"sources": sources, "ver": ver}).encode()
-    status, text = _jvd_http("POST", _JVD_BASE + "/api/play/", {
-        **headers, "Referer": url, "Origin": _JVD_BASE,
-        "X-Requested-With": "XMLHttpRequest",
-        "Content-Type": "application/x-www-form-urlencoded"}, data=body)
-    try:
-        answer = json.loads(text)
-    except ValueError:
-        raise RuntimeError(
-            f"javhdporn's play api answered HTTP {status} without JSON — the site "
-            f"changed its player, so the adapter needs updating") from None
-    if not answer.get("status") or not answer.get("data"):
+    # The mpu seal is keyed per page `ver`, but the two hosts disagree on
+    # which salt `ver=2` means (javhdporn: "SyntaxError", bestjavporn:
+    # "_0x58fe15"). Try the mapped salt first, then the response salt —
+    # the one that decodes to an ASCII token and wins the play api is right.
+    raw_mpu = mpu.group(1)
+    candidates = []
+    for salt in (_JVD_REQ_SALT.get(ver, _JVD_RESP_SALT), _JVD_RESP_SALT):
+        if salt not in candidates:
+            candidates.append(salt)
+    answer = None
+    status = 0
+    last_status_body = ""
+    for salt in candidates:
+        try:
+            sources = _jvd_dex_str(vid, salt, raw_mpu)
+        except Exception:  # noqa: BLE001
+            continue
+        if not sources or not all(32 <= ord(c) < 127 for c in sources[:120]):
+            continue
+        body = urllib.parse.urlencode({"sources": sources, "ver": ver}).encode()
+        status, text = _jvd_http("POST", site + "/api/play/", {
+            **headers, "Referer": url, "Origin": site,
+            "X-Requested-With": "XMLHttpRequest",
+            "Content-Type": "application/x-www-form-urlencoded"}, data=body)
+        last_status_body = text
+        try:
+            kind = json.loads(text)
+        except ValueError:
+            continue
+        if kind.get("status") and kind.get("data"):
+            answer = kind
+            break
+    if answer is None:
+        try:
+            json.loads(last_status_body)
+        except ValueError:
+            raise RuntimeError(
+                f"javhdporn's play api answered HTTP {status} without JSON — the site "
+                f"changed its player, so the adapter needs updating") from None
         raise RuntimeError(
             "javhdporn's play api refused the request — the site changed its "
             "player, so the adapter needs updating")
@@ -3053,6 +3107,105 @@ def kisskh_extract(url: str, html: str | None = None) -> dict | None:
     return info
 
 
+# --------------------------------------------------------------------------- #
+#  Declarative extra-site adapter (sites_extra.py)
+#
+#  One host→recipe table covers the long tail yt-dlp has no extractor for and
+#  that needs no bespoke decoder: meta tags, JSON-LD, an HTML5 <video>, a
+#  player config, a bare media URL, or a player frame. The recipes are data;
+#  this function is the only code they share.
+# --------------------------------------------------------------------------- #
+
+_EXTRA_SITES = _extra.SITES if _extra is not None else {}
+_EXTRA_HOSTS = set(_EXTRA_SITES)
+
+
+def extra_site_extract(url: str, html: str | None = None) -> dict | None:
+    """Apply the declarative recipe for a host in sites_extra.SITES."""
+    if _extra is None:
+        return None
+    rule = _extra.rule_for(url)
+    if rule is None:
+        return None
+    referer = rule.referer or url
+    if html is None:
+        html = _fetch_text(url, {
+            "User-Agent": DEFAULT_UA,
+            "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer": referer,
+        })
+        if not html:
+            raise RuntimeError(
+                f"{_host_of(url)} did not serve the page to this server — try "
+                f"from the same network you watch from, or add cookies "
+                f"(VIEWER_COOKIES_B64)")
+    page_found = _extra.extract(rule, url, html)
+
+    def build_formats(found: dict) -> list[dict]:
+        out = []
+        for item in found.get("formats") or []:
+            ext = item.get("ext") or "mp4"
+            height = item.get("height")
+            fmt = {
+                "format_id": f"extra-{ext}-{height or 'src'}",
+                "url": item["url"],
+                "ext": ext,
+                "protocol": "m3u8_native" if ext == "m3u8" else "https",
+                "vcodec": None, "acodec": None,
+                "_sniffed": True,
+                # A player config commonly names a CDN that wants the page as
+                # Referer; needsProxy then routes the media (and HLS segments)
+                # through us.
+                "http_headers": {"User-Agent": DEFAULT_UA, "Referer": referer},
+            }
+            if height:
+                fmt["height"] = height
+                fmt["width"] = round(height * 16 / 9)
+            if rule.allow_domains:
+                fmt["_redirect_allow"] = tuple(rule.allow_domains)
+            out.append(fmt)
+        return out
+
+    formats = build_formats(page_found)
+    from_api = False
+    if not formats and not page_found.get("embed") and rule.api:
+        try:
+            request = _extra.api_request(rule, url, html)
+            if request:
+                api_url, api_headers = request
+                body = _fetch_text(api_url, {
+                    "User-Agent": DEFAULT_UA,
+                    "Accept-Language": "en-US,en;q=0.9",
+                    **api_headers,
+                })
+                if body:
+                    api_formats = build_formats(_extra.api_extract(body, url))
+                    if api_formats:
+                        formats = api_formats
+                        from_api = True
+        except Exception as exc:  # noqa: BLE001 - the HTML result still stands
+            note(f"{_host_of(url)}: extra-site API failed: {exc}")
+    if formats:
+        note(f"{_host_of(url)}: extra-site "
+             f"{'API' if from_api else 'recipe'} returned {len(formats)} "
+             f"format(s)")
+        return {"title": page_found.get("title") or None,
+                "extractor_key": "extra",
+                "formats": formats,
+                "webpage_url": url}
+    embed = page_found.get("embed")
+    if embed:
+        note(f"{_host_of(url)}: handed its player frame to the browser")
+        return {"title": page_found.get("title") or None,
+                "extractor_key": "extra",
+                "embed": embed,
+                "webpage_url": url}
+    raise RuntimeError(
+        f"{_host_of(url)} served the page but no source list was found — its "
+        f"player markup or API changed, so the extra-site recipe needs updating")
+
+
 # Sites whose markup needs decoding by an adapter — a player frame to walk, or
 # (hanime) an API that signs every request. One named function per host.
 _PLAYER_SITES = {"watchhentai.net": watchhentai_extract,
@@ -3072,7 +3225,8 @@ _PLAYER_SITES = {"watchhentai.net": watchhentai_extract,
                  "vimeo.com": vimeo_extract,
                  "tumblr.com": tumblr_extract,
                  "hanime.tv": hanime_extract,
-                 "javhdporn.net": javhdporn_extract}
+                 "javhdporn.net": javhdporn_extract,
+                 "bestjavporn.com": javhdporn_extract}
 
 
 class NotAVideoPage(RuntimeError):
@@ -3301,7 +3455,7 @@ def _is_comment_playlist(info: dict) -> bool:
 def _known_adapter_host(url: str) -> bool:
     host = (_host_of(url) or "").lower()
     return any(host == k or host.endswith("." + k)
-               for k in (*_PLAYER_SITES, *_API_SITES))
+               for k in (*_PLAYER_SITES, *_API_SITES, *_EXTRA_HOSTS))
 
 
 def _extract_sniffed(url: str, playlist: bool = False) -> dict:
@@ -3320,10 +3474,13 @@ def _extract_sniffed(url: str, playlist: bool = False) -> dict:
     # on a watchhentai page: 2.4 s through the adapter, 16.6 s through yt-dlp.
     api_error: Exception | None = None
     player_error: Exception | None = None
+    extra_error: Exception | None = None
     tried_adapters: list[str] = []
 
     if _known_adapter_host(url):
-        for step, fn in (("api", api_site_extract), ("player", player_site_extract)):
+        for step, fn in (("api", api_site_extract),
+                         ("player", player_site_extract),
+                         ("extra", extra_site_extract)):
             tried_adapters.append(step)
             try:
                 info = fn(url)
@@ -3340,6 +3497,8 @@ def _extract_sniffed(url: str, playlist: bool = False) -> dict:
                 # source list"), which is the error worth reporting in the end.
                 if step == "player":
                     player_error = exc
+                elif step == "extra":
+                    extra_error = exc
                 else:
                     api_error = exc
 
@@ -3376,6 +3535,16 @@ def _extract_sniffed(url: str, playlist: bool = False) -> dict:
         except Exception as exc:  # noqa: BLE001
             player_error = exc
 
+    # The declarative table covers hosts whose shape (meta tag, JSON-LD,
+    # player config, frame) needs no bespoke decoder.
+    if "extra" not in tried_adapters:
+        try:
+            extra_info = extra_site_extract(url)
+            if extra_info is not None:
+                return extra_info
+        except Exception as exc:  # noqa: BLE001
+            extra_error = exc
+
     universal_info = _universal_probe(url)
     if universal_info is not None:
         return universal_info
@@ -3393,8 +3562,9 @@ def _extract_sniffed(url: str, playlist: bool = False) -> dict:
         except Exception:  # noqa: BLE001
             continue
 
-    # The adapter's own complaint is the most specific one, so it wins.
-    for err in (player_error, api_error, original):
+    # The adapter's own complaint is the most specific one, so it wins. The
+    # extra table is host-scoped, so its diagnosis only applies to its hosts.
+    for err in (extra_error, player_error, api_error, original):
         if err is not None:
             raise err
     raise RuntimeError(f"nothing playable found on {_host_of(url)}")
