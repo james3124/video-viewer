@@ -1080,6 +1080,12 @@
     if (typing) { if (e.key === 'Escape' && t === urlInput) t.blur(); return; }
     if (e.metaKey || e.ctrlKey || e.altKey) return;
 
+    /* On the marketing page the player is one section of many: its shortcuts
+       must not eat the page's Space/arrows while it is off screen or empty. */
+    if (ctl.root.hidden) return;
+    const stageBox = stage.getBoundingClientRect();
+    if (stageBox.bottom < 120 || stageBox.top > window.innerHeight * 0.6) return;
+
     const k = e.key;
     wakeControls();
     if (currentKind === 'embed') {

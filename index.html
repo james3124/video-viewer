@@ -10,144 +10,579 @@
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-<title>Viewer — play any video link</title>
+<title>Viewer: play any video link</title>
 <meta name="description" content="Paste any video link and watch it: direct files, HLS streams, YouTube, Vimeo, TikTok, Reddit, playlists and more.">
-<meta property="og:title" content="Viewer — play any video link">
+<meta property="og:title" content="Viewer: play any video link">
 <meta property="og:description" content="One clean player for direct files, HLS streams and ~1,000 yt-dlp sites.">
 <meta property="og:image" content="docs/logo.svg">
 <link rel="icon" type="image/svg+xml" href="docs/logo.svg">
 <link rel="apple-touch-icon" href="docs/logo.svg">
+<link rel="preload" href="assets/fonts/clash-grotesk-400.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="preload" href="assets/fonts/clash-grotesk-500.woff2" as="font" type="font/woff2" crossorigin>
 <link rel="stylesheet" href="style.css">
+<script>
+  /* The page is readable and complete without this file; the class only lets
+     the CSS hide what the reveal observer will bring in. If the observer never
+     starts (blocked or broken script), everything is shown after 2.5 s. */
+  document.documentElement.classList.add('js');
+  window.setTimeout(function () {
+    if (!window.__viewerReady) document.documentElement.classList.add('reveal-all');
+  }, 2500);
+</script>
 </head>
 <body>
 
-<header id="bar">
-  <div class="brand">
-    <img src="docs/logo.svg" width="24" height="24" alt="">
-    <span>Viewer</span>
-  </div>
+<a class="skip" href="#main">Skip to content</a>
 
-  <form id="urlForm" autocomplete="off">
-    <input id="urlInput" type="text" spellcheck="false"
-           placeholder="Paste a video link or m3u8 stream URL, then press Enter…">
-    <button id="playBtn" type="submit" title="Play">
-      <svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>
-      <span>Play</span>
-    </button>
-  </form>
-
-  <div class="actions">
-    <span id="backendChip" data-state="off" title="checking for server.py…">checking…</span>
-    <label class="file-btn" title="Open a local video file">
-      <input type="file" id="fileInput" accept="video/*,audio/*">
-      <svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor"><path d="M9 16h6v-6h4l-7-7-7 7h4v6zm-4 2h14v2H5v-2z"/></svg>
-      <span>File</span>
-    </label>
-    <button id="pipBtn" type="button" title="Toggle picture-in-picture">
-      <svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor"><path d="M19 11h-8v6h8v-6zm4-8H1v18h22V3zm-2 16H3V5h18v14z"/></svg>
-      PiP
-    </button>
-    <button id="helpBtn" type="button" title="Keyboard shortcuts & help">?</button>
+<header class="site-head">
+  <div class="wrap head-in">
+    <a class="brand" href="#top">
+      <img src="docs/logo.svg" width="26" height="26" alt="">
+      <span>Viewer</span>
+    </a>
+    <nav class="site-nav" aria-label="Sections">
+      <a href="#how">How it works</a>
+      <a href="#platforms">Platforms</a>
+      <a href="#faq">FAQ</a>
+      <a href="#contact">Contact</a>
+    </nav>
+    <a class="btn btn-small" href="#player">Play a link</a>
   </div>
 </header>
 
-<div id="ytdlp" hidden></div>
-<aside id="notices" hidden></aside>
+<main id="main">
 
-<main id="stage">
-  <!-- Drop zone / empty state -->
-  <div id="dropzone">
-    <svg viewBox="0 0 24 24" width="64" height="64" fill="currentColor" opacity=".55">
-      <path d="M4 3h16a1 1 0 0 1 1 1v16a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1zm6 4v10l7-5-7-5z"/>
-    </svg>
-    <h2>Paste any video link</h2>
-    <p>Direct files (mp4, webm, ogv, mov, m4v), HLS streams (.m3u8), YouTube, Vimeo, Twitch, TikTok, Twitter, Reddit and ~1000 more via yt-dlp — playlists and channels included — or drop a file here.</p>
-    <div class="examples">
-      <span>Try:</span>
-      <button class="ex" data-url="https://test-videos.co.uk/vids/bigbuckbunny/mp4/h264/720/Big_Buck_Bunny_720_10s_30MB.mp4">Big Buck Bunny</button>
-      <button class="ex" data-url="https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8">HLS test stream</button>
-      <button class="ex" data-url="https://www.youtube.com/watch?v=aqz-KE-bpKQ">YouTube</button>
-      <button class="ex" data-url="https://www.youtube.com/watch?v=LXb3EKWsInQ">YouTube 4K-ish</button>
-    </div>
-    <p class="backend-hint" id="backendHint" hidden></p>
-  </div>
-
-  <!-- Native video player -->
-  <video id="video" playsinline preload="metadata" hidden></video>
-
-  <!-- iframe player (YouTube / Vimeo / embeds) -->
-  <iframe id="embed" hidden allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; fullscreen" allowfullscreen referrerpolicy="strict-origin-when-cross-origin"></iframe>
-
-  <!-- player controls -->
-  <div id="controls" hidden>
-    <div id="seekWrap" title="Click or drag to seek">
-      <div id="seekTrack"><div id="seekBuffer"></div><div id="seekPlayed"></div></div>
-      <div id="seekKnob"></div>
-      <input type="range" id="seek" min="0" max="100" step="1" value="0" aria-label="Seek">
-      <div id="seekTip" hidden></div>
+  <!-- ================================================================ hero -->
+  <section class="hero" id="top">
+    <div class="wrap hero-copy">
+      <h1 class="hero-title">Any video link,<br>one player.</h1>
+      <p class="hero-sub">Paste a stream, a file or a YouTube link and watch it here. No account, no install, no re-upload.</p>
+      <a class="btn" id="sampleBtn" href="https://test-videos.co.uk/vids/bigbuckbunny/mp4/h264/720/Big_Buck_Bunny_720_10s_1MB.mp4"
+         data-sample="https://test-videos.co.uk/vids/bigbuckbunny/mp4/h264/720/Big_Buck_Bunny_720_10s_1MB.mp4">Play a sample</a>
+      <p class="hero-facts">Direct files · HLS · 1,755 extractors · no account</p>
     </div>
 
-    <div id="ctlRow">
-      <button id="ctlPlay" class="ctl" title="Play / pause  (Space)"></button>
-      <button id="ctlBack" class="ctl" title="Back 10 s  (← / J)">−10</button>
-      <button id="ctlFwd" class="ctl" title="Forward 10 s  (→ / L)">+10</button>
-      <button id="ctlTime" class="ctl ctl-clock" title="Click, then type a time to jump there — 3:21, 1:54, 1:02:03 or 194">0:00 / 0:00</button>
-      <input id="ctlTimeInput" type="text" inputmode="numeric" autocomplete="off" spellcheck="false" hidden>
+    <div class="stage-field">
+      <div class="player" id="player">
 
-      <span class="ctl-sep"></span>
+        <div class="player-chrome" data-ui>
+          <form id="urlForm" autocomplete="off">
+            <input id="urlInput" type="text" spellcheck="false" aria-label="Video link"
+                   placeholder="Paste a video link or .m3u8…">
+            <button id="playBtn" type="submit" title="Play">
+              <svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor" aria-hidden="true"><path d="M8 5v14l11-7z"/></svg>
+              <span>Play</span>
+            </button>
+          </form>
+          <div class="player-tools">
+            <button id="backendChip" type="button" data-state="off" title="checking for server.py…">checking…</button>
+            <label class="file-btn" title="Open a local video file">
+              <input type="file" id="fileInput" accept="video/*,audio/*">
+              <svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor" aria-hidden="true"><path d="M9 16h6v-6h4l-7-7-7 7h4v6zm-4 2h14v2H5v-2z"/></svg>
+              <span>File</span>
+            </label>
+            <button id="pipBtn" type="button" title="Toggle picture-in-picture">
+              <svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor" aria-hidden="true"><path d="M19 11h-8v6h8v-6zm4-8H1v18h22V3zm-2 16H3V5h18v14z"/></svg>
+              PiP
+            </button>
+            <button id="helpBtn" type="button" title="Keyboard shortcuts &amp; help" aria-label="Keyboard shortcuts and help">?</button>
+          </div>
+        </div>
 
-      <button id="ctlMute" class="ctl" title="Mute  (M)"></button>
-      <input id="ctlVolume" type="range" min="0" max="1" step="0.01" value="1" aria-label="Volume" title="Volume">
+        <div id="stage">
+          <video id="video" playsinline preload="metadata" poster="assets/bbb-poster.jpg"
+                 title="The sample film, Big Buck Bunny"></video>
+          <iframe id="embed" hidden allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; fullscreen" allowfullscreen referrerpolicy="strict-origin-when-cross-origin"></iframe>
 
-      <select id="ctlRate" class="ctl ctl-select" title="Playback speed  (&gt; / &lt;)" aria-label="Playback speed">
-        <option value="0.25">0.25×</option>
-        <option value="0.5">0.5×</option>
-        <option value="0.75">0.75×</option>
-        <option value="1" selected>1×</option>
-        <option value="1.25">1.25×</option>
-        <option value="1.5">1.5×</option>
-        <option value="1.75">1.75×</option>
-        <option value="2">2×</option>
-        <option value="3">3×</option>
-        <option value="4">4×</option>
-      </select>
+          <div id="controls" hidden>
+            <div id="seekWrap" title="Click or drag to seek">
+              <div id="seekTrack"><div id="seekBuffer"></div><div id="seekPlayed"></div></div>
+              <div id="seekKnob"></div>
+              <input type="range" id="seek" min="0" max="100" step="1" value="0" aria-label="Seek">
+              <div id="seekTip" hidden></div>
+            </div>
 
-      <span class="ctl-spacer"></span>
+            <div id="ctlRow">
+              <button id="ctlPlay" class="ctl" title="Play / pause  (Space)"></button>
+              <button id="ctlBack" class="ctl" title="Back 10 s  (← / J)">−10</button>
+              <button id="ctlFwd" class="ctl" title="Forward 10 s  (→ / L)">+10</button>
+              <button id="ctlTime" class="ctl ctl-clock" title="Click, then type a time to jump there: 3:21, 1:54, 1:02:03 or 194">0:00 / 0:00</button>
+              <input id="ctlTimeInput" type="text" inputmode="numeric" autocomplete="off" spellcheck="false" hidden>
 
-      <button id="ctlCC" class="ctl" title="Subtitles  (C)">CC</button>
-      <button id="ctlDl" class="ctl" title="Download this file">
-        <svg viewBox="0 0 24 24"><path d="M12 3v9.6l3.3-3.3 1.4 1.4-5.7 5.7-5.7-5.7 1.4-1.4L10 12.6V3h2zM5 19h14v2H5z"/></svg>
-      </button>
-      <button id="ctlSite" class="ctl" title="Open the original page in a new tab (their player, their session)">
-        <svg viewBox="0 0 24 24"><path d="M14 3h7v7h-2V6.4l-9.3 9.3-1.4-1.4L17.6 5H14V3zM5 5h6v2H7v10h10v-4h2v6H5z"/></svg>
-      </button>
-      <button id="ctlPip" class="ctl" title="Picture-in-picture  (P)">PiP</button>
-      <button id="ctlFull" class="ctl" title="Fullscreen  (F)"></button>
+              <span class="ctl-sep"></span>
+
+              <button id="ctlMute" class="ctl" title="Mute  (M)"></button>
+              <input id="ctlVolume" type="range" min="0" max="1" step="0.01" value="1" aria-label="Volume" title="Volume">
+
+              <select id="ctlRate" class="ctl ctl-select" title="Playback speed  (&gt; / &lt;)" aria-label="Playback speed">
+                <option value="0.25">0.25×</option>
+                <option value="0.5">0.5×</option>
+                <option value="0.75">0.75×</option>
+                <option value="1" selected>1×</option>
+                <option value="1.25">1.25×</option>
+                <option value="1.5">1.5×</option>
+                <option value="1.75">1.75×</option>
+                <option value="2">2×</option>
+                <option value="3">3×</option>
+                <option value="4">4×</option>
+              </select>
+
+              <span class="ctl-spacer"></span>
+
+              <button id="ctlCC" class="ctl" title="Subtitles  (C)">CC</button>
+              <button id="ctlDl" class="ctl" title="Download this file" aria-label="Download this file">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v9.6l3.3-3.3 1.4 1.4-5.7 5.7-5.7-5.7 1.4-1.4L10 12.6V3h2zM5 19h14v2H5z"/></svg>
+              </button>
+              <button id="ctlSite" class="ctl" title="Open the original page in a new tab (their player, their session)" aria-label="Open the original page in a new tab">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M14 3h7v7h-2V6.4l-9.3 9.3-1.4-1.4L17.6 5H14V3zM5 5h6v2H7v10h10v-4h2v6H5z"/></svg>
+              </button>
+              <button id="ctlPip" class="ctl" title="Picture-in-picture  (P)">PiP</button>
+              <button id="ctlFull" class="ctl" title="Fullscreen  (F)"></button>
+            </div>
+          </div>
+
+          <div id="errors" data-ui hidden></div>
+        </div>
+
+        <div id="dropzone">
+          <span class="try-label">Try the sample</span>
+          <button class="ex is-primary" data-url="https://test-videos.co.uk/vids/bigbuckbunny/mp4/h264/720/Big_Buck_Bunny_720_10s_1MB.mp4">Big Buck Bunny <span>10 s</span></button>
+          <button class="ex" data-url="https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8">HLS stream <span>.m3u8</span></button>
+          <button class="ex" data-url="https://www.youtube.com/watch?v=aqz-KE-bpKQ">YouTube <span>4K</span></button>
+
+          <!-- Home-screen-only Display ad. Rendered by app.js when VIEWER_AD_SLOT
+               in config.js is set; hidden for good once a video is loaded. -->
+          <div class="home-ad" id="homeAd" hidden>
+            <div class="home-ad-label">Ad</div>
+            <ins class="adsbygoogle" style="display:block"
+                 data-ad-client="ca-pub-3796591441323242"
+                 data-ad-slot=""
+                 data-ad-format="auto"
+                 data-full-width-responsive="true"></ins>
+          </div>
+          <p class="backend-hint" id="backendHint" hidden></p>
+        </div>
+
+        <div id="ytdlpSlot"></div>
+        <aside id="notices" hidden></aside>
+
+        <div id="status" data-ui>
+          <span id="meta">Ready.</span>
+          <span id="src" class="src"></span>
+        </div>
+
+      </div>
     </div>
-  </div>
+  </section>
 
-  <div id="errors" hidden></div>
+  <!-- =============================================================== intro -->
+  <section class="section intro" id="what" aria-labelledby="whatH">
+    <div class="wrap">
+      <h2 id="whatH" data-reveal>The short version</h2>
+      <p class="lead" data-reveal>Viewer watches links. One box for a file, a stream, a channel or a page, and a player that explains itself when a site says no.</p>
+      <div class="intro-grid">
+        <p data-reveal><strong>Built for links.</strong> One box takes a URL, an .m3u8 playlist, a file name or a drop, and plays it on this page. No library, no feed, no thumbnails to scroll. Just the link you came with and the player it deserved.</p>
+        <p data-reveal><strong>The browser comes first.</strong> Direct files and HLS play locally, decoded by the browser itself. When a site blocks that, the small Python server takes over and streams the bytes the CDN actually expects to see.</p>
+        <p data-reveal><strong>The failure is the feature.</strong> Most of the code is about the awkward cases: a Referer check, a cookie that never reaches the page, a signed link that expires mid-film, a format that needs a second request before the first byte moves.</p>
+        <p data-reveal><strong>Nothing is uploaded.</strong> The link goes to the server you configured and to the site it names. There is no account, no history and no analytics. The video plays, and that is the whole transaction.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ film band -->
+  <figure class="film" data-reveal>
+    <div class="film-frame">
+      <img src="assets/color-print-film-strip-01-negative.jpg" width="1920" height="1156" loading="lazy" decoding="async"
+           alt="A strip of 35 mm colour negative held up to the light, the frames showing a landscape in reverse.">
+    </div>
+    <figcaption class="wrap film-cap">A strip of 35 mm colour negative, held to the light.</figcaption>
+  </figure>
+
+  <!-- ============================================================= how it works -->
+  <section class="section how" id="how" aria-labelledby="howH">
+    <div class="wrap">
+      <h2 id="howH" data-reveal>What happens to a link</h2>
+      <p class="lead" data-reveal>Nothing here is a magic embed. The page resolves the link, then fetches what the browser is not allowed to.</p>
+
+      <div class="exchanges">
+        <div class="exchange">
+          <div class="call" data-reveal>
+            <h3>First, the browser asks what the link is.</h3>
+            <div class="call-field"><span>You paste</span><b>youtube.com/watch?v=aqz-KE-bpKQ</b></div>
+            <p>A file or an .m3u8 plays here. Anything else is a question the browser cannot answer alone.</p>
+          </div>
+          <div class="frag resp" data-ui data-reveal>
+            <div class="frag-head"><span class="frag-title">Formats</span><span class="frag-sub">youtube.com/watch?v=aqz-KE-bpKQ</span><span class="frag-state">4 found</span></div>
+            <ul class="frag-rows">
+              <li class="frag-row"><span class="frag-k">1080p</span><span class="frag-v">mp4 · video + audio</span><span class="frag-tag">direct</span></li>
+              <li class="frag-row on"><span class="frag-k">720p</span><span class="frag-v">mp4 · video + audio</span><span class="frag-tag on">proxy</span></li>
+              <li class="frag-row"><span class="frag-k">480p</span><span class="frag-v">mp4 · video + audio</span><span class="frag-tag">direct</span></li>
+              <li class="frag-row"><span class="frag-k">Audio</span><span class="frag-v">m4a · 128 kbps</span><span class="frag-tag">direct</span></li>
+            </ul>
+            <p class="frag-foot">proxy is decided per rendition, not per site.</p>
+          </div>
+        </div>
+
+        <div class="exchange">
+          <div class="call" data-reveal>
+            <h3>Then the server does what the browser cannot.</h3>
+            <p>The CDN wants a Referer, a session cookie or a browser's user agent. The backend replays the headers and hands back one origin.</p>
+          </div>
+          <div class="frag resp" data-ui data-reveal>
+            <div class="frag-head"><span class="frag-title">The second request</span><span class="frag-sub">cdn.example.net</span><span class="frag-state">206</span></div>
+            <pre class="frag-code">GET /v/…/720.mp4
+Referer:    https://example.com/watch
+User-Agent: Mozilla/5.0 …
+Cookie:     session=… (server-side)
+Range:      bytes=0-1048575</pre>
+            <p class="frag-foot">The page never sees the cookie; the backend does.</p>
+          </div>
+        </div>
+
+        <div class="exchange">
+          <div class="call" data-reveal>
+            <h3>And when you type 3:21, it lands there.</h3>
+            <div class="call-field"><span>You type</span><b>3:21</b></div>
+            <p>Click the time and type 3:21 or 1:02:03; the player seeks there. Arrows move five seconds, J and L ten.</p>
+          </div>
+          <div class="frag resp" data-ui data-reveal>
+            <div class="frag-head"><span class="frag-title">Seek</span><span class="frag-sub">click the clock</span><span class="frag-state">on</span></div>
+            <div class="frag-seek is-large"><i style="width:58%"></i></div>
+            <div class="frag-clockrow"><span class="frag-clock">1:57 / 3:21</span><span class="frag-field">3:21</span></div>
+            <p class="frag-foot">Typed 3:21; the bar jumped to 58%.</p>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="show" data-reveal>
+      <div class="show-row" data-ui role="list" tabindex="0"
+           aria-label="Seven panels; scroll sideways or use the arrow keys">
+        <article class="frag show-panel is-active" data-ui role="listitem">
+          <div class="frag-head"><span class="frag-title">Formats</span><span class="frag-sub">the same source</span><span class="frag-state">4</span></div>
+          <ul class="frag-rows">
+            <li class="frag-row"><span class="frag-k">1080p</span><span class="frag-v">direct</span></li>
+            <li class="frag-row on"><span class="frag-k">720p</span><span class="frag-v">proxy</span><span class="frag-tag on">chosen</span></li>
+            <li class="frag-row"><span class="frag-k">480p</span><span class="frag-v">direct</span></li>
+            <li class="frag-row"><span class="frag-k">Audio</span><span class="frag-v">direct</span></li>
+          </ul>
+          <p class="frag-foot">needsProxy is decided per rendition.</p>
+        </article>
+
+        <article class="frag show-panel" data-ui role="listitem">
+          <div class="frag-head"><span class="frag-title">Seek</span><span class="frag-sub">type a time</span><span class="frag-state">3:21</span></div>
+          <div class="frag-seek"><i style="width:22%"></i></div>
+          <div class="frag-clockrow"><span class="frag-clock">3:21 / 15:07</span><span class="frag-field">3:21</span></div>
+          <p class="frag-foot">3:21, 1:54, 1:02:03 and 194 all work.</p>
+        </article>
+
+        <article class="frag show-panel" data-ui role="listitem">
+          <div class="frag-head"><span class="frag-title">Playlist</span><span class="frag-sub">a channel, not a video</span><span class="frag-state">3 entries</span></div>
+          <ul class="frag-rows">
+            <li class="frag-row"><span class="frag-k">Big Buck Bunny</span><span class="frag-v">0:10</span></li>
+            <li class="frag-row on"><span class="frag-k">HLS test stream</span><span class="frag-v">live</span></li>
+            <li class="frag-row"><span class="frag-k">YouTube sample</span><span class="frag-v">0:10</span></li>
+          </ul>
+          <p class="frag-foot">N plays the next source in the list.</p>
+        </article>
+
+        <article class="frag show-panel" data-ui role="listitem">
+          <div class="frag-head"><span class="frag-title">Subtitles</span><span class="frag-sub">sidecar and source tracks</span><span class="frag-state">on</span></div>
+          <div class="frag-screen"><span>[applause]</span></div>
+          <div class="frag-clockrow"><span class="frag-v">English · 2 tracks</span><span class="frag-tag on">C</span></div>
+          <p class="frag-foot">C toggles every track the source offers.</p>
+        </article>
+
+        <article class="frag show-panel" data-ui role="listitem">
+          <div class="frag-head"><span class="frag-title">Download</span><span class="frag-sub">the quality on screen</span><span class="frag-state">1.0 MB</span></div>
+          <div class="frag-clockrow"><span class="frag-k">Big_Buck_Bunny_720_10s_1MB.mp4</span></div>
+          <div class="frag-clockrow"><span class="frag-v">through the backend, with the CDN's headers</span></div>
+          <p class="frag-foot">Saved under the file name the source uses.</p>
+        </article>
+
+        <article class="frag show-panel" data-ui role="listitem">
+          <div class="frag-head"><span class="frag-title">Keys</span><span class="frag-sub">no mouse needed</span><span class="frag-state">?</span></div>
+          <ul class="frag-rows">
+            <li class="frag-row"><span class="frag-k">Space</span><span class="frag-v">play / pause</span></li>
+            <li class="frag-row"><span class="frag-k">← →</span><span class="frag-v">5 seconds</span></li>
+            <li class="frag-row"><span class="frag-k">J L</span><span class="frag-v">10 seconds</span></li>
+            <li class="frag-row"><span class="frag-k">0–9</span><span class="frag-v">0–90%</span></li>
+          </ul>
+          <p class="frag-foot">The full list is behind the ? in the player.</p>
+        </article>
+
+        <article class="frag show-panel" data-ui role="listitem">
+          <div class="frag-head"><span class="frag-title">Error</span><span class="frag-sub">cdn.example.net</span><span class="frag-state">403</span></div>
+          <div class="frag-error">This stream is region-locked.</div>
+          <p class="frag-note">The source refused the proxy too. Open the original page in a new tab, or pass cookies from an account in that region.</p>
+          <p class="frag-foot">Error 403 · region blocked</p>
+        </article>
+      </div>
+
+      <div class="show-foot">
+        <p class="show-cap" aria-live="polite">
+          <span class="cap-name">Formats</span>
+          <span class="cap-desc">Every rendition the source offers, with proxy or direct decided per row.</span>
+        </p>
+        <div class="show-arrows">
+          <button class="arrow" type="button" data-dir="-1" aria-label="Previous panel">
+            <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M15 5l-7 7 7 7"/></svg>
+          </button>
+          <button class="arrow" type="button" data-dir="1" aria-label="Next panel">
+            <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M9 5l7 7-7 7"/></svg>
+          </button>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================= platforms -->
+  <section class="section platforms" id="platforms" aria-labelledby="platH">
+    <div class="wrap">
+      <div class="plat-head" data-reveal>
+        <h2 id="platH">1,755 sites,<br>one player.</h2>
+        <a class="btn btn-ghost" href="https://github.com/james3124/video-viewer/blob/main/docs/yt-dlp-sites.txt">The extractor list</a>
+      </div>
+      <p class="lead" data-reveal>Direct files and HLS play in the browser alone. Everything else is resolved by the backend, through yt-dlp, the adapters and a generic fallback.</p>
+
+      <div class="plat-tabs" role="tablist" aria-label="Platform categories" data-reveal>
+        <button class="tab is-active" id="tab-direct" type="button" role="tab" aria-selected="true" aria-controls="plat-direct" tabindex="0">
+          <span class="tab-name">Direct</span><span class="tab-note">files and streams</span>
+        </button>
+        <button class="tab" id="tab-video" type="button" role="tab" aria-selected="false" aria-controls="plat-video" tabindex="-1">
+          <span class="tab-name">Video</span><span class="tab-note">the big hosts</span>
+        </button>
+        <button class="tab" id="tab-social" type="button" role="tab" aria-selected="false" aria-controls="plat-social" tabindex="-1">
+          <span class="tab-name">Social</span><span class="tab-note">posts and clips</span>
+        </button>
+        <button class="tab" id="tab-music" type="button" role="tab" aria-selected="false" aria-controls="plat-music" tabindex="-1">
+          <span class="tab-name">Music</span><span class="tab-note">sets and tracks</span>
+        </button>
+        <button class="tab" id="tab-more" type="button" role="tab" aria-selected="false" aria-controls="plat-more" tabindex="-1">
+          <span class="tab-name">Everything else</span><span class="tab-note">the long tail</span>
+        </button>
+      </div>
+
+      <div class="plat-panels" data-reveal>
+        <div class="plat-panel is-active" id="plat-direct" role="tabpanel" aria-labelledby="tab-direct" tabindex="0">
+          <div class="band"><div class="band-inner">
+            <h3>Video files</h3>
+            <ul class="hosts"><li><span>mp4</span></li><li><span>webm</span></li><li><span>ogv</span></li><li><span>mov</span></li><li><span>m4v</span></li><li><span>mkv where the browser can decode it</span></li></ul>
+          </div></div>
+          <div class="band"><div class="band-inner">
+            <h3>Audio files</h3>
+            <ul class="hosts"><li><span>mp3</span></li><li><span>m4a</span></li><li><span>aac</span></li><li><span>ogg</span></li><li><span>opus</span></li><li><span>flac</span></li><li><span>wav</span></li></ul>
+          </div></div>
+          <div class="band"><div class="band-inner">
+            <h3>Streams</h3>
+            <ul class="hosts"><li><span>HLS playlists (.m3u8)</span></li><li><span>live HLS</span></li><li><span>separate audio and subtitle tracks</span></li><li><span>anything a local file input can open</span></li></ul>
+          </div></div>
+        </div>
+
+        <div class="plat-panel" id="plat-video" role="tabpanel" aria-labelledby="tab-video" tabindex="0">
+          <div class="band"><div class="band-inner">
+            <h3>Video</h3>
+            <ul class="hosts">
+              <li><a href="https://www.youtube.com">YouTube</a></li>
+              <li><a href="https://vimeo.com">Vimeo</a></li>
+              <li><a href="https://www.twitch.tv">Twitch</a></li>
+              <li><a href="https://www.dailymotion.com">Dailymotion</a></li>
+              <li><a href="https://rumble.com">Rumble</a></li>
+              <li><a href="https://odysee.com">Odysee</a></li>
+              <li><a href="https://www.bilibili.com">Bilibili</a></li>
+              <li><a href="https://archive.org">The Internet Archive</a></li>
+              <li><a href="https://joinpeertube.org">PeerTube instances</a></li>
+            </ul>
+          </div></div>
+          <div class="band"><div class="band-inner">
+            <h3>Also here</h3>
+            <ul class="hosts"><li><span>channels and playlists</span></li><li><span>premieres and live streams</span></li><li><span>subtitles the source publishes</span></li></ul>
+          </div></div>
+        </div>
+
+        <div class="plat-panel" id="plat-social" role="tabpanel" aria-labelledby="tab-social" tabindex="0">
+          <div class="band"><div class="band-inner">
+            <h3>Posts and clips</h3>
+            <ul class="hosts">
+              <li><a href="https://www.tiktok.com">TikTok</a></li>
+              <li><a href="https://x.com">X</a></li>
+              <li><a href="https://www.reddit.com">Reddit</a></li>
+              <li><a href="https://www.instagram.com">Instagram</a></li>
+              <li><a href="https://www.facebook.com">Facebook</a></li>
+              <li><a href="https://vk.com">VK</a></li>
+            </ul>
+          </div></div>
+          <div class="band"><div class="band-inner">
+            <h3>What it keeps</h3>
+            <ul class="hosts"><li><span>the video or audio file itself</span></li><li><span>not the comments or the profile</span></li></ul>
+          </div></div>
+        </div>
+
+        <div class="plat-panel" id="plat-music" role="tabpanel" aria-labelledby="tab-music" tabindex="0">
+          <div class="band"><div class="band-inner">
+            <h3>Sets and tracks</h3>
+            <ul class="hosts">
+              <li><a href="https://soundcloud.com">SoundCloud</a></li>
+              <li><a href="https://bandcamp.com">Bandcamp</a></li>
+              <li><a href="https://www.mixcloud.com">Mixcloud</a></li>
+              <li><a href="https://audius.co">Audius</a></li>
+            </ul>
+          </div></div>
+          <div class="band"><div class="band-inner">
+            <h3>And</h3>
+            <ul class="hosts"><li><span>public radio streams</span></li><li><span>podcast enclosures</span></li><li><span>anything yt-dlp recognizes as audio</span></li></ul>
+          </div></div>
+        </div>
+
+        <div class="plat-panel" id="plat-more" role="tabpanel" aria-labelledby="tab-more" tabindex="0">
+          <div class="band"><div class="band-inner">
+            <h3>The long tail</h3>
+            <p class="band-note">Newsrooms, lecture halls, public archives, conference sites, local stations, the occasional museum: all of them sit in the same extractor list. If a site is not there, the generic resolver tries the page's own markup before giving up.</p>
+            <ul class="hosts"><li><a href="https://github.com/james3124/video-viewer/blob/main/docs/yt-dlp-sites.txt">The full list of 1,755 extractors</a></li></ul>
+          </div></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================================================================= about -->
+  <section class="section about" id="about" aria-labelledby="aboutH">
+    <div class="wrap about-grid">
+      <div class="sheet" data-reveal>
+        <h2 id="aboutH">Why it exists</h2>
+        <p class="sheet-lead">Browsers play files and HLS. They do not play a YouTube page, and most sites will not hand a third-party page their stream. Viewer is the small, honest machine in between, and it <mark>says why</mark> when a link will not play.</p>
+        <p>It started as one paste box for lecture recordings and old concert tapes: the links that open in a browser but not in a player. Over time the edge cases became the product: the Referer check, the expiring signed URL, the CDN that wants a cookie in a header a page is not allowed to set.</p>
+        <p>There is no account and no feed. One link, one player, and a list of what actually works. When a stream fails, the player says what wall it hit, and the report goes to the issue queue with the link and the error, not a thumbs-down.</p>
+        <p class="sign-off"><b>james3124</b> <span>maintainer, Viewer</span></p>
+        <p class="tear"><a href="https://github.com/james3124/video-viewer">github.com/james3124/video-viewer <span aria-hidden="true">↗</span></a></p>
+      </div>
+      <figure class="tube" data-reveal>
+        <img src="assets/mini-star-416-cathode-ray-tube-with.jpg" width="1920" height="2347" loading="lazy" decoding="async"
+             alt="A small cathode-ray tube seen from behind, its glass neck and deflection coils still attached.">
+        <figcaption>A small cathode-ray tube, seen from the back: the box that started all of this.</figcaption>
+      </figure>
+    </div>
+  </section>
+
+  <!-- =================================================================== faq -->
+  <section class="section faq" id="faq" aria-labelledby="faqH">
+    <div class="wrap faq-grid">
+      <div class="faq-index" data-reveal>
+        <h2 id="faqH">Questions</h2>
+        <ol class="faq-list" role="list">
+          <li class="faq-item is-open">
+            <h3><button class="faq-q" type="button" aria-expanded="true" aria-controls="faqi1" id="faqb1"><span class="faq-dot" aria-hidden="true"></span>Do I need the backend?</button></h3>
+            <div class="faq-inline" id="faqi1" role="region" aria-labelledby="faqb1"><p>Only for links that hide their stream. Direct files and HLS play in the browser alone; YouTube, Vimeo, TikTok, Twitch, Reddit and the rest are resolved by the Python process.</p></div>
+          </li>
+          <li class="faq-item">
+            <h3><button class="faq-q" type="button" aria-expanded="false" aria-controls="faqi2" id="faqb2"><span class="faq-dot" aria-hidden="true"></span>Why does a stream stall with CORS?</button></h3>
+            <div class="faq-inline" id="faqi2" role="region" aria-labelledby="faqb2"><p>The CDN wants a Referer, a Cookie or a User-Agent that a browser cannot set on that request. The backend replays those headers and serves the bytes from one origin.</p></div>
+          </li>
+          <li class="faq-item">
+            <h3><button class="faq-q" type="button" aria-expanded="false" aria-controls="faqi3" id="faqb3"><span class="faq-dot" aria-hidden="true"></span>How do I pass cookies?</button></h3>
+            <div class="faq-inline" id="faqi3" role="region" aria-labelledby="faqb3"><p>Export cookies.txt from a logged-in browser and point YTDLP_COOKIES at it, or base64 the file into VIEWER_COOKIES_B64. The cookies stay on the server and are never sent to the page.</p></div>
+          </li>
+          <li class="faq-item">
+            <h3><button class="faq-q" type="button" aria-expanded="false" aria-controls="faqi4" id="faqb4"><span class="faq-dot" aria-hidden="true"></span>What about a paywall or a login?</button></h3>
+            <div class="faq-inline" id="faqi4" role="region" aria-labelledby="faqb4"><p>Viewer will not touch a paywall or a login. Use cookies exported from an account in the right region, or open the original page in a new tab and watch it there.</p></div>
+          </li>
+          <li class="faq-item">
+            <h3><button class="faq-q" type="button" aria-expanded="false" aria-controls="faqi5" id="faqb5"><span class="faq-dot" aria-hidden="true"></span>Where does my link go?</button></h3>
+            <div class="faq-inline" id="faqi5" role="region" aria-labelledby="faqb5"><p>A pasted link goes to the server you configured and to the site it names. Cookies you provide stay on the server; the browser's own cookies are never replayed to a third-party CDN.</p></div>
+          </li>
+          <li class="faq-item">
+            <h3><button class="faq-q" type="button" aria-expanded="false" aria-controls="faqi6" id="faqb6"><span class="faq-dot" aria-hidden="true"></span>Can I download?</button></h3>
+            <div class="faq-inline" id="faqi6" role="region" aria-labelledby="faqb6"><p>Yes. The download button saves the quality on screen through the backend, with the headers the CDN expects, and keeps the file's own name and extension.</p></div>
+          </li>
+          <li class="faq-item">
+            <h3><button class="faq-q" type="button" aria-expanded="false" aria-controls="faqi7" id="faqb7"><span class="faq-dot" aria-hidden="true"></span>Do I need an account?</button></h3>
+            <div class="faq-inline" id="faqi7" role="region" aria-labelledby="faqb7"><p>No account and no analytics. The home screen can carry one ad slot; hls.js is served with the page rather than from a CDN, so a DNS filter cannot stop playback.</p></div>
+          </li>
+          <li class="faq-item">
+            <h3><button class="faq-q" type="button" aria-expanded="false" aria-controls="faqi8" id="faqb8"><span class="faq-dot" aria-hidden="true"></span>How do I run my own copy?</button></h3>
+            <div class="faq-inline" id="faqi8" role="region" aria-labelledby="faqb8"><p>python3 server.py serves the page and the API on port 8080. The Render blueprint, the Vercel functions and the environment variables are laid out in the README.</p></div>
+          </li>
+        </ol>
+      </div>
+      <div class="faq-pane" aria-live="polite" data-reveal>
+        <p class="faq-answer" id="faqPane"></p>
+      </div>
+    </div>
+  </section>
+
+  <!-- =============================================================== privacy -->
+  <section class="section privacy" id="privacy" aria-labelledby="privH">
+    <div class="wrap">
+      <h2 id="privH">Privacy</h2>
+      <p class="lead">No account, no tracking, no history. Here is the whole thing, in three notes.</p>
+      <div class="priv-grid">
+        <p data-reveal><strong>No account, no analytics.</strong> Viewer asks for no email, sets no tracking cookie, and keeps no feed, history or recommendation. The screen shows the link you asked for and nothing else.</p>
+        <p data-reveal><strong>Cookies stay on the server.</strong> A cookies.txt you provide is read by the backend and never served to the page; the browser's own cookies are not replayed to a third-party CDN.</p>
+        <p data-reveal><strong>One log line, one ad slot.</strong> A failed playback posts its error text to /api/ui-log, rate-limited. AdSense is the page's only third-party script; the home screen can carry one ad slot.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- =============================================================== contact -->
+  <section class="section contact" id="contact" aria-labelledby="callH">
+    <div class="wrap contact-grid">
+      <div class="call-side" data-reveal>
+        <h2 id="callH"><span class="soft">A link that</span><br>would not play?</h2>
+        <p class="call-sentence">Send it to us. The form opens a GitHub issue draft with the link already in it, so no account is needed.</p>
+        <form class="call-form" action="https://github.com/james3124/video-viewer/issues/new" method="get" target="_blank" rel="noopener">
+          <input type="hidden" name="title" value="Playback report">
+          <label class="sr-only" for="callUrl">The link that would not play</label>
+          <input id="callUrl" name="body" type="text" inputmode="url" autocomplete="off" spellcheck="false"
+                 placeholder="https://…" aria-describedby="callNote" required>
+          <button type="submit" aria-label="Open a GitHub issue draft">
+            <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M5 12h14M13 5l7 7-7 7"/></svg>
+          </button>
+        </form>
+        <p class="call-note" id="callNote">The draft opens on GitHub; you press Submit there. Nothing is sent from this page.</p>
+      </div>
+      <dl class="call-rows" data-reveal>
+        <div><dt>Issues</dt><dd><a href="https://github.com/james3124/video-viewer/issues">github.com/james3124/video-viewer/issues <span aria-hidden="true">↗</span></a></dd></div>
+        <div><dt>Source</dt><dd><a href="https://github.com/james3124/video-viewer">github.com/james3124/video-viewer <span aria-hidden="true">↗</span></a></dd></div>
+        <div><dt>Docs</dt><dd><a href="https://github.com/james3124/video-viewer#readme">github.com/james3124/video-viewer#readme <span aria-hidden="true">↗</span></a></dd></div>
+        <div><dt>Health</dt><dd><a href="/api/health">/api/health</a></dd></div>
+      </dl>
+    </div>
+  </section>
+
 </main>
 
-<footer id="status">
-  <span id="meta">Ready.</span>
-  <span id="src" class="src"></span>
+<footer class="site-foot">
+  <div class="wrap">
+    <p class="foot-name" data-reveal>Viewer</p>
+    <div class="foot-line" data-reveal>
+      <p class="foot-tag">One page for any link. No account, no feed, no history.</p>
+      <ul class="foot-nav">
+        <li><a href="#how">How it works</a></li>
+        <li><a href="#platforms">Platforms</a></li>
+        <li><a href="#faq">FAQ</a></li>
+        <li><a href="#privacy">Privacy</a></li>
+        <li><a href="#contact">Contact</a></li>
+      </ul>
+      <p class="foot-copy">© 2026 Viewer</p>
+    </div>
+    <p class="credits" data-reveal><a href="https://commons.wikimedia.org/w/index.php?curid=154026491">Color print film strip 01 - negative</a> by LoMit, CC BY 4.0, via Wikimedia Commons · <a href="https://commons.wikimedia.org/w/index.php?curid=84867192">Mini Star 416 - cathode ray tube with deflection coils-2210</a> by Raimond Spekking, CC BY-SA 4.0, via Wikimedia Commons · Sample footage: Big Buck Bunny, Blender Foundation, <a href="https://creativecommons.org/licenses/by/3.0/">CC BY 3.0</a>.</p>
+  </div>
 </footer>
 
 <dialog id="help">
   <h3>Keyboard &amp; mouse</h3>
   <ul>
-    <li><kbd>Space</kbd> / <kbd>K</kbd> — play / pause</li>
-    <li><kbd>←</kbd> / <kbd>→</kbd> — seek 5 s · <kbd>J</kbd> / <kbd>L</kbd> — seek 10 s</li>
-    <li><kbd>↑</kbd> / <kbd>↓</kbd> — volume</li>
-    <li><kbd>M</kbd> — mute · <kbd>F</kbd> — fullscreen · <kbd>P</kbd> — picture-in-picture</li>
-    <li><kbd>N</kbd> — play next source in the playlist · <kbd>O</kbd> — open a new link</li>
-    <li><kbd>0</kbd>–<kbd>9</kbd> — jump to 0%–90% of the timeline</li>
-    <li><kbd>&gt;</kbd> / <kbd>&lt;</kbd> — playback speed · <kbd>C</kbd> — captions on/off</li>
+    <li><kbd>Space</kbd> / <kbd>K</kbd>: play / pause</li>
+    <li><kbd>←</kbd> / <kbd>→</kbd>: seek 5 s · <kbd>J</kbd> / <kbd>L</kbd>: seek 10 s</li>
+    <li><kbd>↑</kbd> / <kbd>↓</kbd>: volume</li>
+    <li><kbd>M</kbd>: mute · <kbd>F</kbd>: fullscreen · <kbd>P</kbd>: picture-in-picture</li>
+    <li><kbd>N</kbd>: play next source in the playlist · <kbd>O</kbd>: open a new link</li>
+    <li><kbd>0</kbd>–<kbd>9</kbd>: jump to 0%–90% of the timeline</li>
+    <li><kbd>&gt;</kbd> / <kbd>&lt;</kbd>: playback speed · <kbd>C</kbd>: captions on/off</li>
     <li>Click the video to pause/play · double&#8209;click for fullscreen</li>
   </ul>
-  <p class="muted">Streams blocked by CORS, or whose CDN demands a Referer/Cookie, are re-fetched by the backend — pick another quality or hit <em>Force proxy</em> if playback stalls. Playlists and channels show a clickable entry list.</p>
-  <p class="muted">Drag the bar to any point, hit <kbd>−10</kbd>/<kbd>+10</kbd>, or <strong>click the time</strong> and type <kbd>3:21</kbd> to jump straight there.</p>
+  <p class="dialog-note">Streams blocked by CORS, or whose CDN demands a Referer/Cookie, are re-fetched by the backend; pick another quality or hit <em>Force proxy</em> if playback stalls. Playlists and channels show a clickable entry list.</p>
+  <p class="dialog-note">Drag the bar to any point, hit <kbd>−10</kbd>/<kbd>+10</kbd>, or <strong>click the time</strong> and type <kbd>3:21</kbd> to jump straight there.</p>
   <button id="closeHelp">Close</button>
 </dialog>
 
@@ -158,6 +593,7 @@
 <script src="config.js"></script>
 <script src="app.js"></script>
 <script src="ytdlp.js"></script>
+<script src="page.js"></script>
 <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-3796591441323242"
      crossorigin="anonymous"></script>
 </body>

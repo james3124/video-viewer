@@ -18,4 +18,9 @@ viewer-subs/
 # re-downloads it locally when you want a standalone copy.
 bin/yt-dlp
 cookies.txt
+# Local assistant/editor state, not part of the site
+/.qoder/
+/.taste-skill/
+/.ua/
+/plan.txt
 
